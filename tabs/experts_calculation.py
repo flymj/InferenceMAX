@@ -54,6 +54,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             value=float(session_state.get("latency_budget_ms", 50.0)),
             step=1.0,
             help="在这时间窗口内，最多能把多少专家从 DDR 拉到 HBM（单卡/全集群）。",
+            key="experts_calc_latency_budget_ms",
         )
         pcie_cap_default = float(session_state.get("pcie_eff_GBs", 64.0))
         ddr_cap_default = float(session_state.get("ddr_eff_GBs", 150.0))
@@ -64,6 +65,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             value=pcie_cap_default,
             step=1.0,
             help="若与 Host I/O tab 中的 PCIe 不同，可在此覆盖。",
+            key="experts_calc_pcie_bandwidth_gbs",
         )
         ddr_cap_GBs = cZ.number_input(
             "Usable DDR read bandwidth (GB/s)",
@@ -72,6 +74,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             value=ddr_cap_default,
             step=5.0,
             help="DDR→CPU 有效读带宽；瓶颈按 min(PCIe, DDR)。",
+            key="experts_calc_ddr_bandwidth_gbs",
         )
 
         if per_expert_bytes_all_layers <= 0:
@@ -110,6 +113,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             max_value=100000,
             value=experts_loadable_per_gpu,
             step=1,
+            key="experts_calc_k_per_gpu",
         )
         time_needed_s = (int(k) * per_expert_bytes_all_layers) / max(1e-9, path_cap_Bps)
         st.write(

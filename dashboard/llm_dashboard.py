@@ -1687,6 +1687,8 @@ with tab_real_world_measurement:
         t_hbm_layer_d  = bytes_to_time_ms(hbm_per_layer_d, chip_spec_m.hbm_bw_GBs)
         t_theory_layer_d = combine_time(float(st.session_state.get("overlap", 0.0)), t_comp_layer_d, t_comm_layer_d, t_hbm_layer_d)
 
+        L_layers = int(getattr(model, "num_hidden_layers", 0) or 0)
+
         TTFT_ms_meas = (1.0 / max(1e-9, meas_seq_s)) * 1000.0 if meas_seq_s > 0 else t_theory_layer_p * max(1, L_layers)
         TPOT_ms_meas = (1.0 / max(1e-9, meas_tok_s)) * 1000.0 if (meas_tok_s and meas_tok_s>0) else t_theory_layer_d * 1.0
 
