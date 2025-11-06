@@ -1,13 +1,6 @@
-"""Component namespace for the dashboard app."""
+"""Component namespace for the dashboard shell."""
 
-from .header import HeaderRenderer, render_header, set_header_renderer
-from .sidebar import SidebarRenderer, render_sidebar, set_sidebar_renderer
+from .header import render_header
+from .sidebar import render_sidebar
 
-__all__ = [
-    "HeaderRenderer",
-    "SidebarRenderer",
-    "render_header",
-    "render_sidebar",
-    "set_header_renderer",
-    "set_sidebar_renderer",
-]
+__all__ = ["render_header", "render_sidebar"]

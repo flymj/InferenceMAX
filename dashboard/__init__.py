@@ -1,5 +1,5 @@
 """Dashboard package initialization."""
 
-from .app import DashboardLayout, main
+from .app import main
 
-__all__ = ["DashboardLayout", "main"]
+__all__ = ["main"]
