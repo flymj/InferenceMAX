@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, MutableMapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
 from .attention import (
     AttentionBreakdown,
@@ -236,4 +236,133 @@ def build_model_profile(
         }
     )
     return profile
+
+
+def _iter_cfg_mappings(cfg: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
+    if isinstance(cfg, Mapping):
+        yield cfg
+        for key in ("model", "text_config", "config"):
+            sub = cfg.get(key) if isinstance(cfg, Mapping) else None
+            if isinstance(sub, Mapping):
+                yield sub
+
+
+def _cfg_get(cfg: Mapping[str, Any], keys: Sequence[str], default: Any = None) -> Any:
+    for key in keys:
+        for mapping in _iter_cfg_mappings(cfg):
+            if key in mapping and mapping[key] is not None:
+                return mapping[key]
+    return default
+
+
+def geometry_from_config(
+    cfg: Mapping[str, Any],
+    *,
+    dtype_bytes: int = 2,
+    kv_dtype_bytes: Optional[int] = None,
+) -> ModelGeometry:
+    heads = int(_cfg_get(cfg, ["num_attention_heads", "n_heads", "num_heads"], 0) or 0)
+    hidden = int(_cfg_get(cfg, ["hidden_size", "d_model", "model_dim"], 0) or 0)
+    layers = int(_cfg_get(cfg, ["num_hidden_layers", "n_layers", "layers"], 0) or 0)
+    head_dim = int(_cfg_get(cfg, ["head_dim", "qk_head_dim", "kv_channels"], 0) or 0)
+    intermediate = int(_cfg_get(cfg, ["intermediate_size", "ffn_hidden_size"], 0) or 0)
+    ffn_mult = float(_cfg_get(cfg, ["ffn_mult", "mlp_ratio"], 0.0) or 0.0)
+    kv_heads = int(_cfg_get(cfg, ["num_key_value_heads", "kv_heads", "num_kv_heads", "n_kv_heads"], 0) or 0)
+
+    if head_dim <= 0 and hidden > 0 and heads > 0:
+        head_dim = hidden // max(1, heads)
+    if kv_heads <= 0:
+        kv_heads = heads
+    if ffn_mult <= 0 and intermediate > 0 and hidden > 0:
+        ffn_mult = intermediate / hidden
+
+    return ModelGeometry(
+        hidden_size=hidden,
+        head_dim=head_dim,
+        num_heads=heads,
+        num_kv_heads=kv_heads,
+        layers=layers,
+        ffn_mult=ffn_mult,
+        intermediate_size=intermediate or None,
+        dtype_bytes=dtype_bytes,
+        kv_dtype_bytes=kv_dtype_bytes or dtype_bytes,
+    )
+
+
+def moe_from_config(cfg: Mapping[str, Any]) -> Optional[MoEConfig]:
+    total = int(_cfg_get(cfg, ["num_experts", "n_routed_experts"], 0) or 0)
+    top_k = int(_cfg_get(cfg, ["num_experts_per_tok", "top_k"], 0) or 0)
+    cap = float(_cfg_get(cfg, ["capacity_factor", "moe_capacity_factor"], 1.0) or 1.0)
+    router = float(_cfg_get(cfg, ["router_aux_cost_pct", "router_aux_pct"], 0.0) or 0.0)
+    if total <= 1 or top_k <= 0:
+        return None
+    return MoEConfig(
+        enabled=True,
+        total_experts=total,
+        top_k=top_k,
+        capacity_factor=cap,
+        router_aux_pct=router,
+    )
+
+
+def _attention_from_config(
+    cfg: Mapping[str, Any],
+    geometry: ModelGeometry,
+    override: Optional[str] = None,
+) -> str:
+    if override:
+        name = override.strip().lower()
+        mapping = {
+            "gqa": "gqa",
+            "mla": "mla",
+            "linear": "linear",
+            "hybrid": "hybrid",
+            "standard": "standard",
+        }
+        return mapping.get(name, name)
+
+    impl = str(_cfg_get(cfg, ["attention_impl", "attention_type"], "") or "").lower()
+    mapping = {
+        "softmax": "standard",
+        "mha": "standard",
+        "mha/gqa": "standard",
+        "gqa": "gqa",
+        "group-query": "gqa",
+        "mla": "mla",
+        "linear": "linear",
+        "hybrid": "hybrid",
+    }
+    resolved = mapping.get(impl)
+    if resolved:
+        return resolved
+    if geometry.num_kv_heads < geometry.num_heads:
+        return "gqa"
+    return "standard"
+
+
+def build_profile_from_config(
+    cfg: Mapping[str, Any],
+    *,
+    prefill_tokens: int,
+    decode_tokens: int,
+    kv_seq_len: int,
+    kv_cache_hit: float,
+    mask_ratio: float,
+    dtype_bytes: int,
+    kv_dtype_bytes: Optional[int] = None,
+    attention_override: Optional[str] = None,
+) -> ModelProfile:
+    geometry = geometry_from_config(cfg, dtype_bytes=dtype_bytes, kv_dtype_bytes=kv_dtype_bytes)
+    features = ModelFeatures(
+        attention=_attention_from_config(cfg, geometry, override=attention_override),
+        moe=moe_from_config(cfg),
+    )
+    workload = ModelWorkload(
+        prefill_tokens=int(prefill_tokens),
+        decode_tokens=int(decode_tokens),
+        kv_seq_len=int(kv_seq_len),
+        kv_cache_hit=float(kv_cache_hit),
+        mask_ratio=float(mask_ratio),
+    )
+    return build_model_profile(geometry, workload, features)
 

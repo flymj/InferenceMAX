@@ -25,11 +25,9 @@ from tabs import (
     render_tab_group,
 )
 from features import (
-    ModelFeatures,
-    ModelGeometry,
-    ModelWorkload,
-    MoEConfig,
-    build_model_profile,
+    build_profile_from_config,
+    geometry_from_config,
+    moe_from_config,
     render_prefill_decode_controls,
 )
 from services.llm_calcs import (
@@ -913,56 +911,14 @@ with tab_scale_up_search:
     # ======================================================
     # Section 5 · 模型配置解析
     # ======================================================
-    def _cfg_get(cfg_obj, keys, default=None):
-        for k in keys:
-            if isinstance(cfg_obj, dict) and k in cfg_obj:
-                return cfg_obj[k]
-            v = getattr(cfg_obj, k, None)
-            if v is not None:
-                return v
-            if hasattr(cfg_obj, "model"):
-                m = getattr(cfg_obj, "model")
-                if isinstance(m, dict) and k in m:
-                    return m[k]
-                if hasattr(m, k):
-                    return getattr(m, k)
-        return default
-
-    def parse_model_spec(cfg):
-        H = int(_cfg_get(cfg, ["num_attention_heads", "n_heads", "num_heads"], 0) or 0)
-        D = int(_cfg_get(cfg, ["hidden_size", "d_model", "model_dim"], 0) or 0)
-        L = int(_cfg_get(cfg, ["num_hidden_layers", "n_layers", "layers"], 0) or 0)
-        head_dim = int(_cfg_get(cfg, ["head_dim", "qk_head_dim", "kv_channels"], 0) or 0)
-        inter_sz = int(_cfg_get(cfg, ["intermediate_size", "ffn_hidden_size"], 0) or 0)
-        ffn_mult = float(_cfg_get(cfg, ["ffn_mult", "mlp_ratio"], 0.0) or 0.0)
-        kv_heads = int(
-            _cfg_get(
-                cfg,
-                ["num_key_value_heads", "kv_heads", "num_kv_heads", "n_kv_heads"],
-                H,
-            )
-            or H
-        )
-        if D <= 0 and H > 0 and head_dim > 0:
-            D = H * head_dim
-        if ffn_mult <= 0 and inter_sz > 0 and D > 0:
-            ffn_mult = inter_sz / D
-        if head_dim <= 0 and D > 0 and H > 0:
-            head_dim = D // H
-        return H, D, L, head_dim, ffn_mult, inter_sz, kv_heads
-
-    def parse_moe_spec(cfg):
-        E_total = int(_cfg_get(cfg, ["num_experts", "n_experts", "moe_num_experts"], 1) or 1)
-        top_k = int(_cfg_get(cfg, ["top_k", "moe_top_k"], 0) or 0)
-        cap_f = float(_cfg_get(cfg, ["capacity_factor", "moe_capacity_factor"], 1.25) or 1.25)
-        router_aux_pct = float(_cfg_get(cfg, ["router_aux_cost_pct"], 0.05) or 0.05)
-        all2all_overhead_pct = float(_cfg_get(cfg, ["moe_all2all_overhead_pct"], 0.10) or 0.10)
-        moe_on = (E_total > 1 and top_k >= 1)
-        return dict(moe_on=moe_on, E_total=E_total, top_k=top_k, cap_f=cap_f,
-                    router_aux_pct=router_aux_pct, all2all_overhead_pct=all2all_overhead_pct)
-
-    H, D, L, head_dim, ffn_mult, inter_sz, kv_heads = parse_model_spec(cfg)
-    moe = parse_moe_spec(cfg)
+    geometry_hint = geometry_from_config(cfg, dtype_bytes=dtype_bytes, kv_dtype_bytes=dtype_bytes)
+    H = geometry_hint.num_heads
+    D = geometry_hint.hidden_size
+    L = geometry_hint.layers
+    head_dim = geometry_hint.head_dim
+    ffn_mult = geometry_hint.ffn_mult
+    inter_sz = geometry_hint.resolve_intermediate()
+    kv_heads = geometry_hint.num_kv_heads
 
     if H == 0 or D == 0 or L == 0:
         st.warning("⚠️ 无法从cfg解析模型参数，请确认已加载完整配置。")
@@ -1004,42 +960,32 @@ with tab_scale_up_search:
     # ======================================================
     if not df_search.empty:
         df = df_search.copy()
-        df["H"], df["D"], df["L"] = H, D, L
-        df["head_dim"] = head_dim
-        df["ffn_mult"] = ffn_mult
         df["avg_input"], df["avg_output"] = avg_input, avg_output
 
         # ---- Structured compute / memory breakdown
         mask_ratio = 0.5 if causal_mask else 1.0
-        geometry_spec = ModelGeometry(
-            hidden_size=D,
-            head_dim=head_dim,
-            num_heads=H,
-            num_kv_heads=kv_heads,
-            layers=L,
-            ffn_mult=ffn_mult,
-            intermediate_size=inter_sz if inter_sz > 0 else None,
-            dtype_bytes=dtype_bytes,
-            kv_dtype_bytes=dtype_bytes,
+        profile = build_profile_from_config(
+            cfg,
+            prefill_tokens=int(avg_input),
+            decode_tokens=int(avg_output),
+            kv_seq_len=int(seq_len_kv),
+            kv_cache_hit=float(kv_cache_hit),
+            mask_ratio=float(mask_ratio),
+            dtype_bytes=int(dtype_bytes),
+            kv_dtype_bytes=int(dtype_bytes),
+            attention_override=attn_impl,
         )
-        workload_spec = ModelWorkload(
-            prefill_tokens=avg_input,
-            decode_tokens=avg_output,
-            kv_seq_len=seq_len_kv,
-            kv_cache_hit=kv_cache_hit,
-            mask_ratio=mask_ratio,
-        )
-        moe_cfg = None
-        if moe.get("moe_on"):
-            moe_cfg = MoEConfig(
-                enabled=True,
-                total_experts=int(moe.get("E_total", 0)),
-                top_k=int(moe.get("top_k", 0)),
-                capacity_factor=float(moe.get("cap_f", 1.0)),
-                router_aux_pct=float(moe.get("router_aux_pct", 0.0)),
-            )
-        features_spec = ModelFeatures(attention=attn_impl, moe=moe_cfg)
-        profile = build_model_profile(geometry_spec, workload_spec, features_spec)
+        geometry_spec = profile.geometry
+        H = geometry_spec.num_heads
+        D = geometry_spec.hidden_size
+        L = geometry_spec.layers
+        head_dim = geometry_spec.head_dim
+        ffn_mult = geometry_spec.ffn_mult
+        inter_sz = geometry_spec.resolve_intermediate()
+        kv_heads = geometry_spec.num_kv_heads
+        df["H"], df["D"], df["L"] = H, D, L
+        df["head_dim"] = head_dim
+        df["ffn_mult"] = ffn_mult
         profile_df = profile.to_dataframe()
         if profile_df is not None:
             st.session_state["model_profile_records"] = profile_df

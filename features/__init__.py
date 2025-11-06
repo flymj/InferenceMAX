@@ -32,6 +32,9 @@ from .model_profile import (
     ModelWorkload,
     MoEConfig,
     build_model_profile,
+    build_profile_from_config,
+    geometry_from_config,
+    moe_from_config,
 )
 from .moe import (
     ExpertLatencyInputs,
@@ -68,6 +71,9 @@ __all__ = [
     "ModelProfile",
     "MoEConfig",
     "build_model_profile",
+    "build_profile_from_config",
+    "geometry_from_config",
+    "moe_from_config",
     "ExpertLatencyInputs",
     "ExpertLatencyStats",
     "ExpertModelSummary",
