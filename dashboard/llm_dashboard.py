@@ -9,6 +9,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from dashboard.app import main as dashboard_main
+
 from models import build_model
 from services.llm_calcs import (
     attn_family,
@@ -21,6 +23,8 @@ from services.llm_calcs import (
 from state.app_state import ensure_session_state_defaults
 
 st.set_page_config(page_title="LLM Dashboard", layout="wide")
+
+dashboard_main()
 
 def attn_component_flops_prefill_fa3(
     B:int, T:int, H:int, hd:int, L:int,
