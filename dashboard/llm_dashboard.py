@@ -9,10 +9,23 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from dashboard.app import main as dashboard_main
+
 from models import build_model
 from tabs import DashboardActions, DashboardState, get_registered_tabs
+from services.llm_calcs import (
+    attn_family,
+    combined_weight_flops_rows,
+    kv_capacity_tokens_per_gpu,
+    per_token_decode_hbm_bytes_per_layer_per_gpu,
+    per_token_kv_bytes_per_layer_per_gpu,
+    weights_bytes_per_gpu,
+)
+from state.app_state import ensure_session_state_defaults
 
 st.set_page_config(page_title="LLM Dashboard", layout="wide")
+
+dashboard_main()
 
 def attn_component_flops_prefill_fa3(
     B:int, T:int, H:int, hd:int, L:int,
@@ -59,25 +72,7 @@ def safe_rerun():
         # 老版本没有以上两个函数就什么也不做（或给个 warning）
         pass
 # ========= Session State Defaults =========
-def _ss_default(key, value):
-    if key not in st.session_state:
-        st.session_state[key] = value
-    return st.session_state[key]
-
-# keys used across the app
-_ss_default("refresh_token", 0)
-_ss_default("cfg_text", "")
-_ss_default("chip_tflops", 600.0)
-_ss_default("mfu", 0.40)
-_ss_default("hbm_bw", 3000.0)
-_ss_default("net_bw", 900.0)
-_ss_default("hbm_capacity_GB", 80.0)
-_ss_default("hbm_reserve_ratio", 0.10)
-_ss_default("weight_bytes", 2)   # bf16 weights ~ 2B per param
-_ss_default("kv_bytes", 2)       # bf16 kv
-_ss_default("overlap", 0.0)
-_ss_default("inc_scores", True)
-_ss_default("df_search", pd.DataFrame())
+ensure_session_state_defaults(st.session_state)
 
 # ========= Utils =========
 def human_bytes(n: int) -> str:
@@ -87,18 +82,6 @@ def human_bytes(n: int) -> str:
     if n >= 1024**2: return f"{n/(1024**2):.2f} MB"
     if n >= 1024:    return f"{n/1024:.2f} KB"
     return f"{n} B"
-
-def attn_family(model) -> str:
-    """
-    归一化注意力类型：
-      - 若 qwen.py 提供 attention_impl: 'softmax' | 'linear' | 'hybrid'
-      - 否则回退到 BaseModel.attention_type()：'MHA'/'GQA'/'MLA'...
-    """
-    impl = str(getattr(model, "attention_impl", "") or "").lower()
-    if impl in ("softmax", "linear", "hybrid"):
-        return {"softmax":"MHA/GQA", "linear":"Linear", "hybrid":"Hybrid"}[impl]
-    # 兼容旧模型
-    return str(getattr(model, "attention_type", lambda: "MHA")())
 
 def factor_pairs_pow2(n: int) -> List[Tuple[int,int]]:
     """Return all (tp, dp) such that tp*dp=n and both are powers of 2."""
@@ -183,177 +166,6 @@ def comm_formulas_infer(model) -> list[dict]:
     rows += [{"Parallelism":"合成","Phase":"任意","Bytes per layer per device":"t=(1-φ)∑t_i + φ·max(t_i)；φ=overlap∈[0,1]"}]
     return rows
 
-# ========= KV / Memory =========
-@dataclass
-class KVProfile:
-    kind: str                 # 'softmax' | 'linear' | 'hybrid'
-    k_per_head: int           # softmax: hd; linear: dk_lin（仅做参考）
-    v_per_head: int           # softmax: hd; linear: dv_lin（仅做参考）
-    heads_k_total: int        # softmax: H_kv；linear: H（key 分支头数，用于参考）
-    heads_v_total: int        # softmax: H_kv；linear: Hv_lin
-    r_feature: int            # linear 特征秩 r（= dk_lin）
-    notes: str = ""
-
-
-def _kv_profile_softmax(model) -> KVProfile:
-    H   = int(model.num_attention_heads)
-    Hkv = int(model.num_key_value_heads or H)
-    hd  = int(getattr(model, "head_dim", model.hidden_size // max(1, H)))
-    return KVProfile("softmax", k_per_head=hd, v_per_head=hd,
-                     heads_k_total=Hkv, heads_v_total=Hkv, r_feature=0)
-
-
-def _kv_profile_linear(model) -> KVProfile:
-    H  = int(model.num_attention_heads)
-    Hk = int(getattr(model, "linear_num_key_heads", 0) or 0)
-    Hv = int(getattr(model, "linear_num_value_heads", 0) or 0)
-    dk = int(getattr(model, "linear_key_head_dim", 0) or 0)
-    dv = int(getattr(model, "linear_value_head_dim", 0) or 0)
-    r  = int(getattr(model, "linear_feature_rank", dk) or dk)
-    return KVProfile("linear", k_per_head=dk, v_per_head=dv,
-                     heads_k_total=H, heads_v_total=Hv, r_feature=r)
-
-def kv_profile_from_model(model) -> KVProfile:
-    fam = attn_family(model)
-    if fam == "Linear":
-        return _kv_profile_linear(model)
-    if fam == "Hybrid":
-        # Hybrid 用 linear 配置做参考（实际加权在下面两个函数里完成）
-        kvp = _kv_profile_linear(model)
-        kvp.kind = "hybrid"
-        return kvp
-    if fam == "MLA":
-        # 你原本的 MLA 分支可以保留；此处简化为 softmax 近似或维持原实现
-        return _kv_profile_softmax(model)
-    return _kv_profile_softmax(model)
-
-def per_token_kv_bytes_per_layer_per_gpu(model, tp: int, dtype_bytes: int) -> int:
-    fam = attn_family(model)
-    tp = max(1, int(tp))
-    if fam in ("MHA/GQA", "MLA"):  # 原逻辑
-        kvp = _kv_profile_softmax(model)
-        heads_local = max(1, kvp.heads_v_total // tp)
-        return int((kvp.k_per_head + kvp.v_per_head) * heads_local * dtype_bytes)
-
-    if fam == "Linear":
-        # 每 token 不再扩展 KV（维护常量状态），写入≈0
-        return 0
-
-    if fam == "Hybrid":
-        # 按层数加权平均（Softmax 层有写，Linear 层无写）
-        full_idxs, lin_idxs = getattr(model, "split_attn_layers", lambda *_: (list(range(model.num_hidden_layers)), []))(model.num_hidden_layers)
-        L_full = len(full_idxs); L_lin = len(lin_idxs); L = max(1, L_full + L_lin)
-        kvp = _kv_profile_softmax(model)
-        heads_local = max(1, kvp.heads_v_total // tp)
-        val_full = (kvp.k_per_head + kvp.v_per_head) * heads_local * dtype_bytes
-        val_lin  = 0
-        return int((L_full * val_full + L_lin * val_lin) // L)
-
-    # fallback
-    kvp = _kv_profile_softmax(model)
-    heads_local = max(1, kvp.heads_v_total // tp)
-    return int((kvp.k_per_head + kvp.v_per_head) * heads_local * dtype_bytes)
-
-def per_token_decode_hbm_bytes_per_layer_per_gpu(model, tp: int, kv_len: int, dtype_bytes: int) -> int:
-    fam = attn_family(model)
-    tp = max(1, int(tp))
-
-    if fam in ("MHA/GQA", "MLA"):
-        kvp = _kv_profile_softmax(model)
-        heads_local = max(1, kvp.heads_v_total // tp)
-        k_read = heads_local * kvp.k_per_head * kv_len * dtype_bytes
-        v_read = heads_local * kvp.v_per_head * kv_len * dtype_bytes
-        k_write = heads_local * kvp.k_per_head * dtype_bytes
-        v_write = heads_local * kvp.v_per_head * dtype_bytes
-        return int(k_read + v_read + k_write + v_write)
-
-    if fam == "Linear":
-        kvp = _kv_profile_linear(model)
-        H = int(getattr(model, "num_attention_heads", 0) or 0)
-        Hv = int(getattr(model, "linear_num_value_heads", 0) or 0)
-        r, dv = int(kvp.r_feature), int(kvp.v_per_head)
-        # 每 token：读 S(H·r·dv) + 写回 S(H·r·dv)（实现上常量阶）
-        state_bytes = H * (r * dv) * dtype_bytes
-        return int(2 * state_bytes)
-
-    if fam == "Hybrid":
-        full_idxs, lin_idxs = getattr(model, "split_attn_layers", lambda *_: (list(range(model.num_hidden_layers)), []))(model.num_hidden_layers)
-        L_full = len(full_idxs); L_lin = len(lin_idxs); L = max(1, L_full + L_lin)
-
-        # Softmax per-layer
-        kvp_s = _kv_profile_softmax(model)
-        heads_local = max(1, kvp_s.heads_v_total // tp)
-        val_full = (
-            heads_local * kvp_s.k_per_head * kv_len * dtype_bytes +
-            heads_local * kvp_s.v_per_head * kv_len * dtype_bytes +
-            heads_local * (kvp_s.k_per_head + kvp_s.v_per_head) * dtype_bytes
-        )
-
-        # Linear per-layer
-        kvp_l = _kv_profile_linear(model)
-        H = int(getattr(model, "num_attention_heads", 0) or 0)
-        r, dv = int(kvp_l.r_feature), int(kvp_l.v_per_head)
-        val_lin = 2 * H * (r * dv) * dtype_bytes
-
-        return int((L_full * val_full + L_lin * val_lin) // L)
-
-    # fallback
-    kvp = _kv_profile_softmax(model)
-    heads_local = max(1, kvp.heads_v_total // tp)
-    k_read = heads_local * kvp.k_per_head * kv_len * dtype_bytes
-    v_read = heads_local * kvp.v_per_head * kv_len * dtype_bytes
-    k_write = heads_local * kvp.k_per_head * dtype_bytes
-    v_write = heads_local * kvp.v_per_head * dtype_bytes
-    return int(k_read + v_read + k_write + v_write)
-
-def weights_bytes_per_gpu(model, tp: int, ep_group: int, weight_dtype_bytes: int) -> int:
-    """
-    单卡权重：
-      - Dense/Shared/Router/Attn：按 TP 均分；
-      - MoE Experts：按 ep_group 平均（本项目约定 ep_group=EP=N=TP×DP；若 E<N 则复制，不增 per-GPU）；
-      - Embedding/LM Head：按 TP 均分（常见实现）。
-    """
-    wt = model.weights_totals(weight_dtype_bytes=weight_dtype_bytes)
-    total_bytes = int(wt["bytes_total"])
-    rows = model.weight_component_rows()
-    D = int(model.hidden_size)
-
-    dense_bytes = moe_bytes = router_bytes = attn_bytes = 0
-    emb_lm_bytes = (model.vocab_size * D + (0 if bool(model.cfg.get("tie_word_embeddings", False)) else model.vocab_size * D)) * weight_dtype_bytes
-
-    for r in rows:
-        b = int(r.get("Params_per_layer", 0)) * int(r.get("Layer_count", 0)) * weight_dtype_bytes
-        mod = r.get("Module", "")
-        sub = r.get("Submodule", "")
-        if "MoE" in mod and "Router" not in sub:
-            moe_bytes += b
-        elif "Router" in sub:
-            router_bytes += b
-        elif "Attention" in mod:
-            attn_bytes += b
-        else:
-            dense_bytes += b
-
-    tp = max(1, int(tp))
-    ep_group = max(1, int(ep_group))
-    per_gpu = 0
-    per_gpu += emb_lm_bytes // tp
-    per_gpu += attn_bytes // tp
-    per_gpu += dense_bytes // tp
-    per_gpu += router_bytes // tp
-    per_gpu += (moe_bytes // ep_group) if (moe_bytes > 0) else 0
-    per_gpu = min(per_gpu, total_bytes)
-    return int(per_gpu)
-
-def kv_capacity_tokens_per_gpu(model, tp: int, kv_dtype_bytes: int, hbm_total_bytes: int,
-                               reserve_ratio: float, weights_per_gpu_bytes: int) -> int:
-    avail = int(hbm_total_bytes * (1.0 - reserve_ratio)) - int(weights_per_gpu_bytes)
-    if avail <= 0:
-        return 0
-    per_tok_per_layer = per_token_kv_bytes_per_layer_per_gpu(model, tp, kv_dtype_bytes)
-    L = int(model.num_hidden_layers or 0)
-    denom = max(1, per_tok_per_layer * L)
-    return int(avail // denom)
 
 # ========= Time / Bandwidth =========
 @dataclass
@@ -911,38 +723,14 @@ st.subheader("Components — Weights & FLOPs (Prefill/Decode)")
 rows_w = model.weight_component_rows()
 df_w = pd.DataFrame(rows_w)
 
-rows_fp_p = model.flops_component_rows(mode="prefill", batch=1, seq_len=int(st.session_state.get("seq_len_in", 2048)), kv_len=int(st.session_state.get("seq_len_in", 2048)),
-                                       include_scores=bool(st.session_state.get("inc_scores", True)), top_k=None)
-rows_fp_d = model.flops_component_rows(mode="decode", batch=1, seq_len=1, kv_len=int(st.session_state.get("kv_len_in", 4096)),
-                                       include_scores=bool(st.session_state.get("inc_scores", True)), top_k=None)
-
-def _to_map(rows):
-    d = {}
-    for r in rows:
-        d[(r.get("Module",""), r.get("Submodule",""))] = r
-    return d
-wmap, pmap, dmap = _to_map(rows_w), _to_map(rows_fp_p), _to_map(rows_fp_d)
-
-combined = []
-L_layers = int(model.num_hidden_layers or 0)
 dtype_bytes_now = int(st.session_state.get("weight_bytes", 2))
-for key in sorted(set(list(wmap.keys()) + list(pmap.keys()) + list(dmap.keys()))):
-    mod, sub = key
-    prms = wmap.get(key, {}).get("Params_per_layer", None)
-    lyr  = wmap.get(key, {}).get("Layer_count", None)
-    dim  = wmap.get(key, {}).get("Dimension", "")
-    form = wmap.get(key, {}).get("Formula", "")
-    flops_p = pmap.get(key, {}).get("FLOPs_per_layer", None)
-    flops_d = dmap.get(key, {}).get("FLOPs_per_layer", None)
-    combined.append({
-        "Module": mod, "Submodule": sub,
-        "Dimension/Formula": dim or form,
-        "Params_per_layer": prms,
-        "Weight_bytes_per_layer": (int(prms)*int(dtype_bytes_now) if prms is not None else None),
-        "FLOPs_per_layer (Prefill,B=1)": flops_p,
-        "FLOPs_per_layer (Decode,B=1)": flops_d,
-        "Layer_count": lyr if lyr is not None else L_layers,
-    })
+combined = combined_weight_flops_rows(
+    model,
+    weight_dtype_bytes=dtype_bytes_now,
+    seq_len_in=int(st.session_state.get("seq_len_in", 2048)),
+    kv_len_in=int(st.session_state.get("kv_len_in", 4096)),
+    include_scores=bool(st.session_state.get("inc_scores", True)),
+)
 df_comb = pd.DataFrame(combined)
 st.dataframe(df_comb, use_container_width=True, height=320)
 
