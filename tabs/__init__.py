@@ -139,8 +139,7 @@ def render_tab_group(
 
 
 # Import built-in tabs so they register on module import.
-from . import quick_estimation  # noqa: E402,F401
-from . import detailed_attention  # noqa: E402,F401
-from . import quick_memory  # noqa: E402,F401
-from . import host_bandwidth  # noqa: E402,F401
-from . import experts_calculation  # noqa: E402,F401
+from . import scale_up_search  # noqa: E402,F401
+from . import regression_calibration  # noqa: E402,F401
+from . import inferencemax  # noqa: E402,F401
+from . import inferencemax_v2  # noqa: E402,F401

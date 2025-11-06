@@ -1,44 +1,99 @@
-#  InferenceMAX™, Open Source Inference Frequent Benchmarking
+# InferenceMAX Dashboard
 
-InferenceMAX™ runs our suite of benchmarks every night, continually re-benchmarking the world’s most popular open-source inference frameworks and models to track real performance in real time. As these software stacks improve, InferenceMAX™ captures that progress in near real-time, providing a live indicator of inference performance progress. A live dashboard is available for free publicly at https://inferencemax.ai/. 
+InferenceMAX 是一个围绕大模型推理性能剖析而构建的 Streamlit 仪表盘。最新的重构将核心算法集中到 `tabs/common`，并围绕四个面向场景的标签页组织功能：
 
+- **Scale Up Search** — 批量探索 TP/DP/Batch 组合，寻找满足延迟目标的配置。
+- **Regression Calibration** — 根据实测数据回归拟合算力/带宽折减，输出校准后的硬件假设。
+- **InferenceMax Overview** — 单场景多维拆解，展示 Prefill/Decode 的关键路径与吞吐估算。
+- **InferenceMax v2** — 多场景编排与对比，支持导出结果并观察瓶颈转移趋势。
 
-## Why?
+## 快速开始
 
-InferenceMAX™, an open-source, under Apache2 license, automated benchmark designed to move at the same rapid speed as the software ecosystem itself, is built to address this challenge.
+1. 安装依赖：
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. 运行仪表盘：
+   ```bash
+   streamlit run dashboard/app.py
+   ```
+3. 在浏览器中打开 Streamlit 提示的地址（默认 `http://localhost:8501`），选择需要的标签页即可开始分析。
 
-LLM Inference performance is driven by two pillars, hardware and software. While hardware innovation drives step jumps in performance every year through the release of new GPUs/XPUs and new systems, software evolves every single day, delivering continuous performance gains on top of these step jumps. Speed is the Moat 🚀
- 
-AI software like SGLang, vLLM, TensorRT-LLM, CUDA, ROCm and achieve this continuous improvement in performance through kernel-level optimizations, distributed inference strategies, and scheduling innovations that increase the pareto frontier of performance in incremental releases that can be just days apart.
- 
-This pace of software advancement creates a challenge: benchmarks conducted at a fixed point in time quickly go stale and do not represent the performance that can be achieved with the latest software packages.
+> 仪表盘依赖 `dashboard/app.py` 中提供的模型抽象与状态管理，确保本地环境能够访问模型配置与日志数据。
 
+## 项目结构
 
-## Acknowledgements & Supporters
-Thank you to Lisa Su and Anush Elangovan for providing the MI355X and CDNA3 GPUs for this free and open-source project. We want to recognize the many AMD contributors for their responsiveness and for debugging, optimizing, and validating performance across AMD GPUs. 
-We’re also grateful to Jensen Huang and Ian Buck for supporting this open source with access to a GB200 NVL72 rack (through OCI) and B200 GPUs. Thank you to the many NVIDIA contributors from the NVIDIA inference team, NVIDIA Dynamo team.
+```
+InferenceMAX/
+├── dashboard/         # Streamlit 入口与页面骨架
+├── runners/           # 各类任务/基准脚本
+├── services/          # 后端服务（采集、调度等）
+├── tabs/              # 四个标签页与公共逻辑
+│   ├── common/        # 共享的推理估算算法
+│   ├── inferencemax.py
+│   ├── inferencemax_v2.py
+│   ├── regression_calibration.py
+│   └── scale_up_search.py
+├── utils/             # 通用脚本与数据处理工具
+└── tests/             # 单元测试
+```
 
-We also want to recognize the SGLang, vLLM, and TensorRT-LLM maintainers for building a world-class software stack and open sourcing it to the entire world.
-Finally, we’re grateful to Crusoe, CoreWeave, Nebius, TensorWave, Oracle and TogetherAI for supporting open-source innovation through compute resources, enabling this.
+### `tabs/common`
 
-"As we build systems at unprecedented scale, it's critical for the ML community to have open, transparent benchmarks that reflect how inference really performs across hardware and software. InferenceMAX™'s head-to-head benchmarks cut through the noise and provide a living picture of token throughput, performance per dollar, and tokens per Megawatt. This kind of open source effort strengthens the entire ecosystem and helps everyone, from researchers to operators of frontier datacenters, make smarter decisions." - Peter Hoeschele, VP of Infrastructure and Industrial Compute, OpenAI Stargate
+公共模块将延迟估算所需的模型参数提取、HBM/通信开销计算和时间重叠策略集中管理：
 
-"The gap between theoretical peak and real-world inference throughput is often determined by systems software: inference engine, distributed strategies, and low-level kernels. InferenceMAX™ is valuable because it benchmarks the latest software showing how optimizations actually play out across various hardware. Open, reproducible results like these help the whole community move faster.” - Tri Dao, Chief Scientist of Together AI & Inventor of Flash Attention
+- `WorkloadConfig` 描述单个场景（TP/DP/Batch/序列长度等）。
+- `HardwareSpec` 描述硬件假设（Tensor TFLOPs、MFU、HBM/网络带宽、重叠系数等）。
+- `compute_estimate()` 返回 Prefill 与 Decode 的时间拆解，供多个标签页复用。
+- `generate_search_table()` 适用于批量参数搜索。
+- `parse_measurement_csv()` 为回归校准解析用户粘贴的 CSV 文本。
 
-“The industry needs many public, reproducible benchmarks of inference performance. We’re excited to collaborate with InferenceMAX™ from the vLLM team. More diverse workloads and scenarios that everyone can trust and reference will help the ecosystem move forward. Fair, transparent measurements drive progress across every layer of the stack, from model architectures to inference engines to hardware.” – Simon Mo, vLLM Project Co-Lead
+### 标签页速览
 
-## SemiAnalysis is Hiring
+| Tab | 主要功能 | 典型输入 | 输出 |
+| --- | --- | --- | --- |
+| Scale Up Search | 穷举 TP/DP/Batch/Seq/Decode 组合，快速筛选配置 | 硬件规格、候选参数列表 | 排序后的延迟表、Top-N 可视化 | 
+| Regression Calibration | 根据实测延迟进行线性回归，反推真实算力/带宽 | 硬件假设、测量 CSV | 校准系数、建议 MFU/BW、拟合质量表 |
+| InferenceMax Overview | 单场景延迟拆解与吞吐估计 | 单一场景设置 | Prefill/Decode 组件柱状图、Tokens/s 指标 |
+| InferenceMax v2 | 多场景编排与导出 | 多行场景表格、硬件假设 | 场景对比表、堆叠柱状图、CSV 导出 |
 
-We are looking for an engineer to join our special projects team. This is a unique opportunity to work on high-visibility special projects such as InferenceMAX™ with support from many industry leaders and CEOs. If you’re passionate about performance engineering, system reliability, and want to work at the intersection of hardware and software, this is a rare chance to make industry wide impact.
-What you’ll work on:
-- Building and running large-scale benchmarks across multiple vendors (AMD, NVIDIA, TPU, Trainium, etc.)
-- Designing reproducible CI/CD pipelines to automate benchmarking workflows
-- Ensuring reliability and scalability of systems used by industry partners
-  
-What we’re looking for:
-- Strong skills in Python
-- Background in Site Reliability Engineering (SRE) or systems-level problem solving
-- Experience with CI/CD pipelines and modern DevOps practices
-- Curiosity about GPUs, TPUs, Trainium, multi-cloud, and performance benchmarking
-Link to apply: https://app.dover.com/apply/SemiAnalysis/2a9c8da5-6d59-4ac8-8302-3877345dbce1
+## Regression Calibration 数据格式
 
+`Regression Calibration` 标签页要求至少包含下列列名的 CSV 数据（可粘贴 TSV，解析时自动兼容）：
+
+| 列名 | 说明 |
+| --- | --- |
+| `tp` | 张量并行度 (Tensor Parallelism) |
+| `dp` | 数据并行度 (Data Parallelism) |
+| `batch_per_gpu` | 每卡处理的 batch 数 |
+| `seq_len` | Prefill 阶段序列长度 |
+| `decode_tokens` | Decode 阶段生成 token 数 |
+| `grad_accum` | 梯度累积步数（推理时通常为 1） |
+| `measured_prefill_ms` | 实测 Prefill 延迟 (ms) |
+| `measured_decode_ms` | 实测 Decode 延迟 (ms) |
+
+缺失列会自动回退到当前 Session State 中的默认值。
+
+## 扩展指南
+
+1. **新增算法**：将公共逻辑写入 `tabs/common`，并在标签页中通过导入复用。
+2. **新增标签页**：在 `tabs/` 下创建新文件并使用 `@register_tab` 装饰器注册；更新内容将在 `tabs/__init__.py` 中自动导入。
+3. **模型适配**：确保模型实现了以下接口，才能从公共模块正确提取统计信息：
+   - `model.flops_component_rows(mode, batch, seq_len, kv_len, include_scores, top_k)`
+   - `model.weights_totals(weight_dtype_bytes)`
+   - `model.is_moe_enabled()`
+   - `model.cfg`（包含 `num_experts_per_tok` 等键）
+
+## 测试
+
+项目包含基础的单元测试，可在根目录执行：
+
+```bash
+pytest
+```
+
+> 某些测试依赖 GPU 或外部数据，需在具备相应环境时执行。
+
+## 许可证
+
+InferenceMAX 基于 [Apache License 2.0](LICENSE) 开源。
