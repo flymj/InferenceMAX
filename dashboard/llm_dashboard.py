@@ -26,8 +26,16 @@ from tabs import (
 )
 from services.llm_calcs import (
     attn_family,
+    chunked_prefill_overlap,
+    communication_breakdown,
     combined_weight_flops_rows,
+    concurrency_adjusted_times,
+    effective_compute_tflops,
+    effective_hbm_efficiency,
     kv_capacity_tokens_per_gpu,
+    kv_cache_memory_traffic,
+    ModelProfile,
+    prefill_decode_time_breakdown,
     per_token_decode_hbm_bytes_per_layer_per_gpu,
     per_token_kv_bytes_per_layer_per_gpu,
     weights_bytes_per_gpu,
@@ -331,10 +339,19 @@ def run_scaleup_search_fixedN(
             flops_rows_p = model.flops_component_rows("prefill", B, seq_len, seq_len, include_scores, top_k_override)
             flops_prefill = float(sum(r["FLOPs_per_layer"] for r in flops_rows_p)) * L
 
-            # TP 通信（近似 2 次 collective）
-            tp_bytes_p = int(2 * (max(1,tp)-1)/max(1,tp) * (B*seq_len) * D * int(dtype_bytes)) * 2 * L if tp>1 else 0
-            # EP 通信：组=全体 N；理想均衡
-            ep_bytes_p = int(2 * (B*seq_len) * D * tk * (1 - 1/max(1,N)) * int(dtype_bytes)) * L if (is_moe and tk>0 and N>1) else 0
+            comm = communication_breakdown(
+                tp=int(tp),
+                tokens_prefill=int(B * seq_len),
+                tokens_decode=int(B),
+                hidden_size=D,
+                dtype_bytes=int(dtype_bytes),
+                top_k=int(tk),
+                ep_group=int(N),
+                layers=int(L),
+                moe_enabled=bool(is_moe and tk > 0 and N > 1),
+            )
+            tp_bytes_p = comm.tp_prefill_bytes
+            ep_bytes_p = comm.ep_prefill_bytes
 
             t_comp_p = flops_to_time_ms(flops_prefill, chip)
             t_comm_p = bytes_to_time_ms(tp_bytes_p + ep_bytes_p, chip.net_bw_GBs)
@@ -344,8 +361,8 @@ def run_scaleup_search_fixedN(
             flops_rows_d = model.flops_component_rows("decode", B, 1, kv_len_decode, include_scores, top_k_override)
             flops_decode = float(sum(r["FLOPs_per_layer"] for r in flops_rows_d)) * L
 
-            tp_bytes_d = int(2 * (max(1,tp)-1)/max(1,tp) * (B) * D * int(dtype_bytes)) * 2 * L if tp>1 else 0
-            ep_bytes_d = int(2 * (B) * D * tk * (1 - 1/max(1,N)) * int(dtype_bytes)) * L if (is_moe and tk>0 and N>1) else 0
+            tp_bytes_d = comm.tp_decode_bytes
+            ep_bytes_d = comm.ep_decode_bytes
 
             hbm_bytes_per_token = per_token_decode_hbm_bytes_per_layer_per_gpu(
                 model, tp=int(tp), kv_len=int(kv_len_decode), dtype_bytes=int(kv_dtype_bytes)
@@ -989,93 +1006,80 @@ with tab_scale_up_search:
         df["ffn_mult"] = ffn_mult
         df["avg_input"], df["avg_output"] = avg_input, avg_output
 
+        profile = ModelProfile(
+            model,
+            weight_dtype_bytes=int(dtype_bytes),
+            kv_dtype_bytes=int(dtype_bytes),
+            seq_len_in=int(avg_input),
+            kv_len_in=int(seq_len_kv),
+            include_scores=True,
+            top_k=None,
+        )
+        comp_df = profile.component_dataframe()
+        if comp_df is not None:
+            st.session_state["model_profile_components"] = comp_df
+        st.session_state["attention_kv_variants"] = profile.kv_bytes_by_variant(tp=1)
+
         # ---- FLOPs 计算 (Attn+MLP+MoE)
-        # mask ratio: causal mask => 0.5；其他 => 1.0
-        mask_ratio = 0.5 if causal_mask else 1.0
-        if attn_impl == "linear":
-            # linear attention O(L)
-            flops_attn_tok_layer = 2 * H * head_dim * D * mask_ratio
-        elif attn_impl == "MLA":
-            flops_attn_tok_layer = 4 * D * head_dim * (H // 2) * mask_ratio
-        elif attn_impl == "GQA":
-            flops_attn_tok_layer = 4 * D * (head_dim * (H / 4)) * mask_ratio
-        else:
-            # standard
-            flops_attn_tok_layer = 4 * D * head_dim * H * mask_ratio
-
-        # Projection (Q/K/V/O)
-        flops_proj_layer = 4.0 * D * D * (1.0 if kv_cache_hit < 1.0 else 0.75)
-
-        # FFN / MoE
-        if moe["moe_on"]:
-            eff_expert_frac = (moe["top_k"] / moe["E_total"]) * moe["cap_f"]
-            flops_ffn_layer = 4.0 * D * D * ffn_mult * eff_expert_frac * (1.0 + moe["router_aux_pct"])
-        else:
-            flops_ffn_layer = 8.0 * D * D * ffn_mult
-
-        flops_tok_layer = flops_proj_layer + flops_attn_tok_layer + flops_ffn_layer
-        flops_tok_all_layers = L * flops_tok_layer
-
-        # Prefill FLOPs: O(L_in^2)
-        flops_prefill = flops_tok_all_layers * avg_input * mask_ratio
-        # Decode FLOPs: O(L_kv)
-        flops_decode = flops_tok_all_layers * avg_output
+        flops_prefill = profile.prefill_totals["total"]
+        flops_decode = profile.decode_totals["total"]
 
         df["flops_prefill_T"] = flops_prefill / 1e12
         df["flops_decode_G"] = flops_decode / 1e9
         # ======================================================
         # Section 8 · HBM Traffic (Weights / Activations / KV)
         # ======================================================
-        bytes_weight_layer = 4 * D * D + 2 * D * inter_sz
-        bytes_weight = bytes_weight_layer * L * dtype_bytes
-        bytes_activation_layer = 2 * D * dtype_bytes * avg_input
-        bytes_act_total = bytes_activation_layer * L
-        bytes_kv_prefill = avg_input * (head_dim * (H // 4)) * dtype_bytes * L * (2 if kv_cache_hit < 1.0 else 1.0)
-        bytes_kv_decode = seq_len_kv * (head_dim * (H // 4)) * dtype_bytes * L * 2 * (1.0 - kv_cache_hit)
+        memory = kv_cache_memory_traffic(
+            profile,
+            input_tokens=int(avg_input),
+            kv_len_decode=int(seq_len_kv),
+            kv_cache_hit=float(kv_cache_hit),
+            tp=1,
+        )
 
-        df["bytes_weight_GB"] = bytes_weight / 1e9
-        df["bytes_activation_GB"] = bytes_act_total / 1e9
-        df["bytes_kv_prefill_GB"] = bytes_kv_prefill / 1e9
-        df["bytes_kv_decode_GB"] = bytes_kv_decode / 1e9
+        df["bytes_weight_GB"] = memory.weight_bytes / 1e9
+        df["bytes_activation_GB"] = memory.activation_bytes / 1e9
+        df["bytes_kv_prefill_GB"] = memory.kv_prefill_bytes / 1e9
+        df["bytes_kv_decode_GB"] = memory.kv_decode_bytes / 1e9
 
         # Effective HBM带宽 (调整 overlap)
-        overlap_frac = np.clip(0.6 * chunked_prefill + 0.4 * decode_priority, 0.0, 1.0)
-        hbm_eff_eff = hbm_eff * (1.0 + 0.25 * overlap_frac)
-        eff_tflops = tflops * mfu
+        overlap_frac = chunked_prefill_overlap(chunked_prefill, decode_priority)
+        hbm_eff_eff = effective_hbm_efficiency(hbm_eff, overlap_frac)
+        eff_tflops = effective_compute_tflops(tflops, mfu)
 
         # ======================================================
         # Section 9 · Compute + Memory 时间估算
         # ======================================================
-        # Compute时间
-        T_comp_prefill_ms = 1000 * (flops_prefill / (eff_tflops * 1e12))
-        T_comp_decode_ms = 1000 * (flops_decode / (eff_tflops * 1e12))
+        times = prefill_decode_time_breakdown(
+            flops_prefill=flops_prefill,
+            flops_decode=flops_decode,
+            effective_tflops=eff_tflops,
+            memory=memory,
+            hbm_bw_GBs=float(hbm_bw),
+            hbm_eff=hbm_eff_eff,
+        )
 
-        # Memory时间
-        T_hbm_prefill_ms = 1000 * ((bytes_weight + bytes_act_total + bytes_kv_prefill) / (hbm_bw * 1e9 * hbm_eff_eff))
-        T_hbm_decode_ms = 1000 * ((bytes_weight + bytes_kv_decode + bytes_act_total) / (hbm_bw * 1e9 * hbm_eff_eff))
-
-        # Prefill和Decode理想时间
-        TTFT_theory_ms = max(T_comp_prefill_ms, T_hbm_prefill_ms)
-        TPOT_theory_ms = max(T_comp_decode_ms, T_hbm_decode_ms)
+        TTFT_theory_ms = times.ttft_theory_ms
+        TPOT_theory_ms = times.tpot_theory_ms
 
         df["TTFT_theory_ms"] = TTFT_theory_ms
         df["TPOT_theory_ms"] = TPOT_theory_ms
-        df["T_comp_prefill_ms"] = T_comp_prefill_ms
-        df["T_hbm_prefill_ms"] = T_hbm_prefill_ms
-        df["T_comp_decode_ms"] = T_comp_decode_ms
-        df["T_hbm_decode_ms"] = T_hbm_decode_ms
+        df["T_comp_prefill_ms"] = times.t_comp_prefill_ms
+        df["T_hbm_prefill_ms"] = times.t_hbm_prefill_ms
+        df["T_comp_decode_ms"] = times.t_comp_decode_ms
+        df["T_hbm_decode_ms"] = times.t_hbm_decode_ms
 
         # ======================================================
         # Section 10 · 并发修正模型 (η-prefill)
         # ======================================================
-        N_eq = T_hbm_decode_ms / max(T_comp_decode_ms, 1e-6)
-        eta = 1.0 / (1.0 + (N_eq / max(concurrency, 1)) ** alpha_conc)
-        TTFT_min_ms = TTFT_theory_ms / np.sqrt(max(concurrency, 1))
-        TTFT_eff_ms = TTFT_theory_ms * (1 - eta) + TTFT_min_ms * eta
-
-        eff_overlap = np.clip(concurrency / N_eq, 0.0, 1.0)
-        eff_overlap = 1.0 - np.exp(-eff_overlap)
-        TPOT_eff_ms = T_hbm_decode_ms * (1 - eff_overlap) + T_comp_decode_ms * eff_overlap
+        adj = concurrency_adjusted_times(
+            times=times,
+            concurrency=float(concurrency),
+            alpha=float(alpha_conc),
+        )
+        N_eq = adj.n_eq
+        TTFT_eff_ms = adj.ttft_eff_ms
+        TPOT_eff_ms = adj.tpot_eff_ms
 
         df["N_eq"] = N_eq
         df["TTFT_eff_ms"] = TTFT_eff_ms
@@ -1107,16 +1111,17 @@ with tab_scale_up_search:
             use_container_width=True)
 
         # Plot: TTFT/TPOT vs Concurrency
-        conc_range = np.linspace(1, N_eq * 4, 50)
-        eta_curve = 1.0 / (1.0 + (N_eq / np.maximum(conc_range, 1)) ** alpha_conc)
-        TTFT_curve = TTFT_theory_ms * (1 - eta_curve) + TTFT_theory_ms / np.sqrt(np.maximum(conc_range, 1)) * eta_curve
-        eff_ov = np.clip(conc_range / N_eq, 0.0, 1.0)
-        eff_ov = 1.0 - np.exp(-eff_ov)
-        TPOT_curve = T_hbm_decode_ms * (1 - eff_ov) + T_comp_decode_ms * eff_ov
+        conc_range = np.linspace(1, max(N_eq, 1.0) * 4, 50)
+        ttft_curve = []
+        tpot_curve = []
+        for c in conc_range:
+            curve_adj = concurrency_adjusted_times(times, concurrency=float(c), alpha=float(alpha_conc))
+            ttft_curve.append(curve_adj.ttft_eff_ms)
+            tpot_curve.append(curve_adj.tpot_eff_ms)
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=conc_range, y=TTFT_curve, mode='lines', name='TTFT修正'))
+        fig.add_trace(go.Scatter(x=conc_range, y=ttft_curve, mode='lines', name='TTFT修正'))
         fig.add_trace(go.Scatter(x=conc_range, y=[TTFT_theory_ms]*len(conc_range), name='TTFT理论', line=dict(dash='dot')))
-        fig.add_trace(go.Scatter(x=conc_range, y=TPOT_curve, mode='lines', name='TPOT修正'))
+        fig.add_trace(go.Scatter(x=conc_range, y=tpot_curve, mode='lines', name='TPOT修正'))
         fig.add_trace(go.Scatter(x=conc_range, y=[TPOT_theory_ms]*len(conc_range), name='TPOT理论', line=dict(dash='dot')))
         fig.add_vline(x=N_eq, line=dict(color="red", dash="dash"), annotation_text="N_eq")
         fig.update_layout(title="TTFT/TPOT vs Concurrency", xaxis_title="并发数", yaxis_title="ms", height=400)
