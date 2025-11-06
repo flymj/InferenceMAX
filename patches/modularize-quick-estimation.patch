@@ -1,25 +1,5 @@
-From 5fded72dd49712d8950b88ed1f3f6405af6c23bf Mon Sep 17 00:00:00 2001
-From: Codex <codex@openai.com>
-Date: Thu, 6 Nov 2025 06:47:44 +0000
-Subject: [PATCH] Modularize Quick Estimation tab
-
-## Summary
-- add a reusable `tabs` package with state/action containers and registration helpers
-- move the Quick Estimation tab UI and computations into `tabs/quick_estimation.py`
-- update `llm_dashboard.py` to render registered tabs before the legacy tab logic
-
-## Testing
-- python -m compileall dashboard tabs
----
- dashboard/llm_dashboard.py | 316 +++----------------------------
- tabs/__init__.py           |  55 ++++++
- tabs/quick_estimation.py   | 376 +++++++++++++++++++++++++++++++++++++
- 3 files changed, 453 insertions(+), 294 deletions(-)
- create mode 100644 tabs/__init__.py
- create mode 100644 tabs/quick_estimation.py
-
 diff --git a/dashboard/llm_dashboard.py b/dashboard/llm_dashboard.py
-index 11eb05a..82185d1 100644
+index 11eb05a..91313d3 100644
 --- a/dashboard/llm_dashboard.py
 +++ b/dashboard/llm_dashboard.py
 @@ -10,6 +10,7 @@ import plotly.graph_objects as go
@@ -30,18 +10,17 @@ index 11eb05a..82185d1 100644
  
  st.set_page_config(page_title="LLM Dashboard", layout="wide")
  
-@@ -945,8 +946,8 @@ for key in sorted(set(list(wmap.keys()) + list(pmap.keys()) + list(dmap.keys()))
+@@ -945,7 +946,8 @@ for key in sorted(set(list(wmap.keys()) + list(pmap.keys()) + list(dmap.keys()))
  df_comb = pd.DataFrame(combined)
  st.dataframe(df_comb, use_container_width=True, height=320)
  
 -tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
--    "Quick Estimation",
 +registered_tabs = get_registered_tabs()
-+legacy_tab_titles = [
++legacy_tab_titles_all = [
+     "Quick Estimation",
      "Detailed Attention versus HeadDim",
      "Quick per-GPU memory & KV capacity",
-     "Host Bandwidth Planner",
-@@ -956,302 +957,29 @@ tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+@@ -956,302 +958,58 @@ tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
      "Real-world Measurement",
      "InferenceMax",
      "InferenceMax V2",
@@ -316,6 +295,10 @@ index 11eb05a..82185d1 100644
 -        t_hbm_p = bytes_to_time_ms(int(hbm_bytes_prefill_total), float(hbm_bw_local))
 -        t_hbm_d = bytes_to_time_ms(int(hbm_bytes_per_token),     float(hbm_bw_local))
 +]
++registered_titles = {tab.title for tab in registered_tabs}
++legacy_tab_titles = [
++    title for title in legacy_tab_titles_all if title not in registered_titles
++]
 +all_tab_titles = [tab.title for tab in registered_tabs] + legacy_tab_titles
 +tab_widgets = st.tabs(all_tab_titles)
  
@@ -359,10 +342,529 @@ index 11eb05a..82185d1 100644
 -        st.info("Set local hardware params and click **Run estimate (Local HW)** above.")
 +legacy_tabs = tab_widgets[len(registered_tabs):]
  
-+(tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9) = legacy_tabs
++def _legacy_tab(title: str):
++    try:
++        idx = legacy_tab_titles.index(title)
++    except ValueError:
++        placeholder = st.container()
++        with placeholder:
++            st.warning(f"Legacy tab '{title}' is not defined in layout.")
++        return placeholder
++
++    if idx >= len(legacy_tabs):
++        placeholder = st.container()
++        with placeholder:
++            st.warning(f"Legacy tab '{title}' is missing from layout.")
++        return placeholder
++
++    return legacy_tabs[idx]
++
++tab_attention_vs_head_dim = _legacy_tab("Detailed Attention versus HeadDim")
++tab_quick_memory = _legacy_tab("Quick per-GPU memory & KV capacity")
++tab_host_bandwidth = _legacy_tab("Host Bandwidth Planner")
++tab_experts_calculation = _legacy_tab("Experts Calcuation")
++tab_scale_up_search = _legacy_tab("Scale-up Search")
++tab_regression_calibration = _legacy_tab("Regression & Calibration")
++tab_real_world_measurement = _legacy_tab("Real-world Measurement")
++tab_inferencemax = _legacy_tab("InferenceMax")
++tab_inferencemax_v2 = _legacy_tab("InferenceMax V2")
  
  def attn_component_flops_prefill(B:int, T:int, H:int, hd:int, L:int, causal:bool=True):
      """
+@@ -1282,7 +1040,7 @@ def attn_component_flops_prefill(B:int, T:int, H:int, hd:int, L:int, causal:bool
+         "GEMM_PV":  F_pv_layer * L,
+     }
+ 
+-with tab1:
++with tab_attention_vs_head_dim:
+     # ------------------ Attention component times vs head_dim ------------------
+     st.markdown("---")
+     st.subheader("Attention component times vs head_dim")
+@@ -1429,7 +1187,7 @@ with tab1:
+         c2.metric("Weights total bytes", human_bytes(wt["bytes_total"]))
+         c3.metric("Per-param dtype bytes", int(dtype_bytes_now))
+ 
+-with tab2:
++with tab_quick_memory:
+     # -- Quick per-GPU memory & KV capacity (TP/DP → EP=N) --
+     st.subheader("Per-GPU Memory & KV Cache Capacity (inspect)")
+     cI, cJ, cK = st.columns(3)
+@@ -1459,7 +1217,7 @@ with tab2:
+         f"- **KV capacity / GPU (tokens)**: **{kv_cap_tokens:,}** "
+         f"(dtype={kv_dtype_b}B, HBM={hbm_cap_GB}GB, reserve={hbm_reserve*100:.0f}%)"
+     )
+-with tab3:
++with tab_host_bandwidth:
+     # ================= Host Bandwidth Planner (CPU<->GPU, CPU<->DDR) =================
+     st.header("Host Bandwidth Planner — MoE Rebalance & KV Offload (CPU↔GPU, CPU↔DDR)")
+ 
+@@ -1696,7 +1454,7 @@ with tab3:
+     st.caption("注：以上以 Host 路径为基线（GPU→CPU→GPU），若采用 NVLink P2P/GPUDirect Storage，可将 PCIe/DDR 压力替换为相应通道的有效值进行评估。")
+ 
+ # ======== Reverse calc: how many experts can be loaded within a latency budget? ========
+-with tab4:
++with tab_experts_calculation:
+     with st.expander("How many experts can be loaded within a latency budget?", expanded=True):
+         cX, cY, cZ = st.columns(3)
+         latency_ms = cX.number_input("Latency budget (ms)", min_value=1.0, max_value=60000.0, value=50.0, step=1.0,
+@@ -1738,10 +1496,10 @@ with tab4:
+                     f"(= K × bytes_per_expert / min(PCIe, DDR))")
+ # ==============================================================
+ # tab5_scaleup_enhanced.py
+-# 完整可替换 llm_dashboard.py 内的 with tab5: 段
++# 完整可替换 llm_dashboard.py 内的 Scale-up Search tab 段
+ # ==============================================================
+ 
+-with tab5:
++with tab_scale_up_search:
+     # ======================================================
+     # Header
+     # ======================================================
+@@ -2132,7 +1890,7 @@ with tab5:
+ - 实测 TTFT 通常 < 理论值 ×10，因为系统采用 persistent kernel 与 pipeline overlap。
+             """)
+ 
+-with tab6:
++with tab_regression_calibration:
+     # ================= Regression / Calibration =================
+     st.header("Regression / Calibration")
+ 
+@@ -2444,7 +2202,7 @@ with tab6:
+             "**图意**：横轴越大（单位用户速率越高），对 Prefill 摊销要求越苛刻；短回答时（m 小），有效吞吐相对稳态上限下降更明显。"
+         )
+ 
+-with tab7:
++with tab_real_world_measurement:
+     # ================= Real Measurement → Efficiency Backsolve =================
+     st.header("Real-world Measurement → Efficiency Backsolve")
+     with st.expander("指定并行与长度，用实测吞吐回推效率 + HBM 容量检查 + 单层对比", expanded=True):
+@@ -2619,7 +2377,7 @@ with tab7:
+         st.caption("注：单层“实测均摊”=（实测 TTFT/TPOT）/ 层数，仅做粗对比；真实分布受内核/排布影响不均匀。")
+ 
+ # ======================= InferenceMAX-style Sweep (New Tab) =======================
+-with tab8:
++with tab_inferencemax:
+     st.header("InferenceMAX-style Sweep")
+ 
+     with st.expander("Sweep 配置（遵循 InferenceMAX 方法 + HBM 约束）", expanded=True):
+@@ -3087,7 +2845,7 @@ with tab8:
+                 "若某个 TP 在 B=1 都放不下，则整个 TP 曲线被剔除；每个点也逐一检查内存后再绘制。"
+             )
+ # ======================= Tab 8: PD 分离 · DP==EP 可选 · 显式KV公式 + KV Cache 命中率联动 =======================
+-with tab9:
++with tab_inferencemax_v2:
+     import pandas as pd
+     import plotly.graph_objects as go
+     from typing import Optional, Dict, Any
+diff --git a/patches/modularize-quick-estimation.patch b/patches/modularize-quick-estimation.patch
+new file mode 100644
+index 0000000..fa4a2c8
+--- /dev/null
++++ b/patches/modularize-quick-estimation.patch
+@@ -0,0 +1,402 @@
++diff --git a/dashboard/llm_dashboard.py b/dashboard/llm_dashboard.py
++index 11eb05a..91313d3 100644
++--- a/dashboard/llm_dashboard.py
+++++ b/dashboard/llm_dashboard.py
++@@ -10,6 +10,7 @@ import plotly.graph_objects as go
++ import streamlit as st
++ 
++ from models import build_model
+++from tabs import DashboardActions, DashboardState, get_registered_tabs
++ 
++ st.set_page_config(page_title="LLM Dashboard", layout="wide")
++ 
++@@ -945,7 +946,8 @@ for key in sorted(set(list(wmap.keys()) + list(pmap.keys()) + list(dmap.keys()))
++ df_comb = pd.DataFrame(combined)
++ st.dataframe(df_comb, use_container_width=True, height=320)
++ 
++-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+++registered_tabs = get_registered_tabs()
+++legacy_tab_titles_all = [
++     "Quick Estimation",
++     "Detailed Attention versus HeadDim",
++     "Quick per-GPU memory & KV capacity",
++@@ -956,302 +958,58 @@ tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
++     "Real-world Measurement",
++     "InferenceMax",
++     "InferenceMax V2",
++-])
++-with tab0:
++-# ==================== Quick runtime estimate (Local HW) ====================
++-    st.markdown("### Quick runtime estimate — local hardware only")
++-    # ---- Quick Estimate 本地硬件参数（仅本tab有效，覆盖全局）----
++-    with st.container():
++-        st.markdown("**Local hardware spec (Quick Estimate only)**")
++-        lc1, lc2, lc3, lc4, lc5 = st.columns(5)
++-        tensor_core_peak_local = lc1.number_input(
++-            "Tensor-core peak (TFLOPs, local)", min_value=1.0,
++-            value=float(st.session_state.get("chip_tflops", 600.0)), step=10.0,
++-            help="仅用于 Quick estimate 的 GEMM 计算时间。"
++-        )
++-        mfu_local = lc2.slider(
++-            "MFU (0~1, local)", 0.0, 1.0,
++-            float(st.session_state.get("mfu", 0.40)), 0.01,
++-            help="仅用于 Quick estimate 的有效算力折减。"
++-        )
++-        hbm_bw_local = lc3.number_input(
++-            "HBM BW (GB/s, local)", min_value=1.0,
++-            value=float(st.session_state.get("hbm_bw", 3200.0)), step=50.0,
++-            help="仅用于 Quick estimate 的 HBM 时间计算（字节/带宽）。"
++-        )
++-        net_bw_local = lc4.number_input(
++-            "Interconnect BW (GB/s, local)", min_value=1.0,
++-            value=float(st.session_state.get("net_bw", 640.0)), step=10.0,
++-            help="仅用于 Quick estimate 的网络时间计算（TP/EP字节/带宽）。"
++-        )
++-        overlap_ratio_local = lc5.slider(
++-            "Overlap φ (0~1, local)", 0.0, 1.0,
++-            float(st.session_state.get("overlap", 0.0)), 0.05,
++-            help="仅用于 Quick estimate 的时间合成参考线。"
++-        )
++-
++-    # （可选）把“解码每token是否计入整模权重读”也放在本地开关里
++-    include_weight_read_in_decode_hbm_local = st.checkbox(
++-        "Include full-model weight read in per-token Decode HBM (local)",
++-        value=True,
++-        help="解码一般 HBM-bound，默认勾上以计入每token一次读全模权重。只影响 Quick estimate。"
++-    )
++-
++-    # overlap 选择：多选，画多条有效时间参考线
++-    overlap_choices = st.multiselect(
++-        "Overlap φ (show multiple effective times)",
++-        options=[0.0, 0.25, 0.5, 0.75, 1.0],
++-        default=[0.0, 0.5, 1.0],
++-        format_func=lambda x: f"{int(x*100)}%"
++-    )
++-
++-    # —— 运行参数（仍与原“Quick”一致）：TP/DP/seq_len/out_len/B_per_gpu/grad_accum —— #
++-    cc1, cc2, cc3, cc4 = st.columns(4)
++-    tp_run = cc1.number_input("TP", 1, 4096, int(st.session_state.get("inspect_tp", 8)), 1)
++-    dp_run = cc2.number_input("DP", 1, 4096, int(st.session_state.get("inspect_dp", 8)), 1)
++-    seq_len_run = cc3.number_input("Sequence length (prefill)", 1, 1_000_000,
++-                                   int(st.session_state.get("seq_len_in", 2048)), 1)
++-    out_len_run = cc4.number_input("Output length (decode tokens)", 1, 1_000_000, 512, 1)
++-
++-    bb1, bb2 = st.columns(2)
++-    B_per_gpu = bb1.number_input("Per-GPU batch (B)", 1, 1_000_000,
++-                                 int(st.session_state.get("meas_bref", 1)), 1)
++-    grad_accum = bb2.number_input("Grad-accum steps", 1, 10000,
++-                                  int(st.session_state.get("grad_accum", 1)), 1,
++-                                  help="推理用 1；训练可>1（影响并发）")
++-
++-    run_now_local = st.button("Run estimate (Local HW)", type="primary")
++-
++-    # —— 估算 + 表格 —— #
++-    if run_now_local:
++-        # 计算 bytes（和你原逻辑一致），注意：只在时间换算时用本 tab 的带宽
++-        L = int(model.num_hidden_layers or 0)
++-        D = int(model.hidden_size or 0)
++-        N = int(tp_run) * int(dp_run)
++-        is_moe = model.is_moe_enabled()
++-        tk = int(model.cfg.get("num_experts_per_tok", 0))
++-        dtype_b = int(st.session_state.get("weight_bytes", 2))
++-        kv_dtype_b = int(st.session_state.get("kv_bytes", 2))
++-        kv_len_for_decode = int(st.session_state.get("kv_len_in", 4096))
++-
++-        # FLOPs（按你现有函数）
++-        B_run = max(1, int(B_per_gpu))
++-        rows_pref_p = model.flops_component_rows(
++-            mode="prefill", batch=B_run, seq_len=int(seq_len_run), kv_len=int(seq_len_run),
++-            include_scores=bool(st.session_state.get("inc_scores", True)), top_k=None
++-        )
++-        rows_pref_d = model.flops_component_rows(
++-            mode="decode", batch=1, seq_len=1, kv_len=kv_len_for_decode,
++-            include_scores=bool(st.session_state.get("inc_scores", True)), top_k=None
++-        )
++-        flops_prefill_per_layer = float(sum(r.get("FLOPs_per_layer", 0) for r in rows_pref_p))
++-        flops_decode_per_layer  = float(sum(r.get("FLOPs_per_layer", 0) for r in rows_pref_d))
++-        flops_prefill_total = flops_prefill_per_layer * L
++-        flops_decode_total  = flops_decode_per_layer  * L  # per-token 的 decode 步
++-        # ---- 权重总字节（一次取出，供 prefill/decoding HBM 计算复用）----
++-        weights_total_bytes = model.weights_totals(
++-            weight_dtype_bytes=int(st.session_state.get("weight_bytes", 2))
++-        )["bytes_total"]
++-
++-        # ---- per-layer per-token KV 字节（本卡，随 TP 缩放），供 prefill/decoding 使用 ----
++-        kv_dtype_b = int(st.session_state.get("kv_bytes", 2))
++-        per_tok_kv_layer_bytes = per_token_kv_bytes_per_layer_per_gpu(
++-            model, tp=int(tp_run), dtype_bytes=kv_dtype_b
++-        )
++-        L_layers = int(getattr(model, "num_hidden_layers", 0) or L)
++-
++-        # ================= Prefill 的 HBM 字节（一次性）=================
++-        # 1) 读全模型权重一次（常见推理实现会在 prefill 阶段把所有层权重流过一次）
++-        hbm_bytes_prefill_weights = int(weights_total_bytes)
++-
++-        # 2) 写入所有 token 的 KV：每 token 的 (per-layer KV) × 层数 × token 数量（本卡）
++-        tokens_prefill_per_device = int(B_per_gpu) * int(seq_len_run)
++-        hbm_bytes_prefill_kv_write = int(per_tok_kv_layer_bytes) * int(L_layers) * int(tokens_prefill_per_device)
++-
++-        # 3) Prefill HBM 总字节
++-        hbm_bytes_prefill_total = hbm_bytes_prefill_weights + hbm_bytes_prefill_kv_write
++-
++-        # ================= Decode 的 HBM 字节（每 token）=================
++-        # 你已有：读历史 KV + 写新 KV
++-        hbm_bytes_per_token = per_token_decode_hbm_bytes_per_layer_per_gpu(
++-            model, tp=int(tp_run), kv_len=int(st.session_state.get("kv_len_in", 4096)),
++-            dtype_bytes=int(st.session_state.get("kv_bytes", 2))
++-        ) * L_layers
++-
++-        # 默认把“每 token 读全模型权重”也计入（解码一般是 HBM bound）
++-        include_weight_read_in_decode_hbm = True
++-        if include_weight_read_in_decode_hbm:
++-            hbm_bytes_per_token += int(weights_total_bytes)
++-
++-
++-        # 网络 bytes（与原表一致）
++-        tp_bytes_prefill = int(2 * (max(1,tp_run)-1)/max(1,tp_run) * (B_run*seq_len_run) * D * dtype_b) * 2 * L if tp_run>1 else 0
++-        ep_bytes_prefill = int(2 * (B_run*seq_len_run) * D * tk * (1 - 1/max(1, N)) * dtype_b) * L if (is_moe and tk>0 and N>1) else 0
++-        tp_bytes_decode  = int(2 * (max(1,tp_run)-1)/max(1,tp_run) * (1) * D * dtype_b) * 2 * L if tp_run>1 else 0
++-        ep_bytes_decode  = int(2 * (1) * D * tk * (1 - 1/max(1, N)) * dtype_b) * L if (is_moe and tk>0 and N>1) else 0
++-
++-        # HBM per-token（decode）
++-        hbm_bytes_per_token = per_token_decode_hbm_bytes_per_layer_per_gpu(
++-            model, tp=int(tp_run), kv_len=int(st.session_state.get("kv_len_in", 4096)),
++-            dtype_bytes=int(st.session_state.get("kv_bytes", 2))
++-        ) * L
++-
++-        if include_weight_read_in_decode_hbm:
++-            # 加上每 token 的全模型权重读成本
++-            weights_total = model.weights_totals(
++-                weight_dtype_bytes=int(st.session_state.get("weight_bytes", 2))
++-            )
++-            hbm_bytes_per_token += weights_total["bytes_total"]
++-
++-        # ==== 原有结果表 ====
++-        est_table = [
++-            {"Phase":"Prefill", "B_per_gpu": B_run, "Concurrency": B_run * dp_run * grad_accum,
++-             "TP_bytes_net": tp_bytes_prefill, "EP_bytes_net": ep_bytes_prefill,
++-             "FLOPs_per_layer": flops_prefill_per_layer, "FLOPs_total": flops_prefill_total},
++-            {"Phase":"Decode",  "B_per_gpu": 1,     "Concurrency": dp_run * grad_accum,
++-             "TP_bytes_net": tp_bytes_decode, "EP_bytes_net": ep_bytes_decode,
++-             "FLOPs_per_layer": flops_decode_per_layer, "FLOPs_total": flops_decode_total},
++-        ]
++-        def human_flops(n: float) -> str:
++-            if n is None: return "-"
++-            n = float(n)
++-            if n >= 1e12: return f"{n/1e12:.3f} TFLOPs"
++-            if n >= 1e9:  return f"{n/1e9:.3f} GFLOPs"
++-            if n >= 1e6:  return f"{n/1e6:.3f} MFLOPs"
++-            return f"{n:.0f} FLOPs"
++-
++-        df_est = pd.DataFrame(est_table)
++-        df_est_display = df_est.copy()
++-        df_est_display["TP_bytes_per_device"] = df_est_display["TP_bytes_net"].apply(lambda x: human_bytes(int(x)))
++-        df_est_display["EP_bytes_per_device"] = df_est_display["EP_bytes_net"].apply(lambda x: human_bytes(int(x)))
++-        df_est_display["FLOPs_per_layer (per_device)"] = df_est_display["FLOPs_per_layer"].apply(human_flops)
++-        df_est_display["FLOPs_total_per_device"] = df_est_display["FLOPs_total"].apply(human_flops)
++-
++-        N_cluster = int(tp_run) * int(dp_run)
++-        df_est_display["TP_bytes_cluster"] = df_est["TP_bytes_net"].apply(lambda x: human_bytes(int(x * N_cluster)))
++-        df_est_display["EP_bytes_cluster"] = df_est["EP_bytes_net"].apply(lambda x: human_bytes(int(x * N_cluster)))
++-        df_est_display["FLOPs_total_cluster"] = df_est["FLOPs_total"].apply(lambda x: human_flops(x * N_cluster))
++-
++-        hbm_list_dev = ["-", human_bytes(int(hbm_bytes_per_token))]
++-        hbm_list_cluster = ["-", human_bytes(int(hbm_bytes_per_token * N_cluster))]
++-        df_est_display["HBM_per_token_per_device"] = hbm_list_dev[:len(df_est_display)]
++-        df_est_display["HBM_per_token_cluster"] = hbm_list_cluster[:len(df_est_display)]
++-        st.dataframe(
++-            df_est_display[["Phase","B_per_gpu","Concurrency","FLOPs_per_layer (per_device)","FLOPs_total_per_device",
++-                            "FLOPs_total_cluster","TP_bytes_per_device","TP_bytes_cluster",
++-                            "EP_bytes_per_device","EP_bytes_cluster","HBM_per_token_per_device","HBM_per_token_cluster"]],
++-            use_container_width=True
++-        )
++-
++-        # ==== 时间轴（timeline）：以“时间（毫秒）”衡量各成分，并显示不同 φ 的有效总时间 ====
++-        # Compute：把 Prefill/Decode 的 FLOPs_total 按本 tab 的 TFLOPs*mfu 转成时间
++-        def t_from_flops_ms(flops, peak_tflops, mfu):
++-            eff = max(1e-9, peak_tflops * 1e12 * max(0.0, min(1.0, mfu)))
++-            return (float(flops) / eff) * 1e3
++-
++-        # Network/HBM：bytes / bandwidth (+ latency)
++-        def t_from_bytes_ms(nbytes, bw_GBs, latency_ms=0.0):
++-            t = (float(nbytes) / max(1e-9, bw_GBs*1e9)) * 1e3
++-            return t + float(latency_ms)
++-
++-        # Prefill：Compute + Network（无 HBM）
++-        bytes_net_prefill = tp_bytes_prefill + ep_bytes_prefill
++-        t_comp_p = t_from_flops_ms(flops_prefill_total, tensor_core_peak_local, mfu_local)
++-        t_net_p  = t_from_bytes_ms(bytes_net_prefill, net_bw_local, 0.0)
++-        # Decode：Compute + Network + HBM（per-token）
++-        bytes_net_decode = tp_bytes_decode + ep_bytes_decode
++-        t_comp_d = t_from_flops_ms(flops_decode_total, tensor_core_peak_local, mfu_local)
++-        t_net_d  = t_from_bytes_ms(bytes_net_decode, net_bw_local, 0.0)
++-        t_hbm_d  = t_from_bytes_ms(hbm_bytes_per_token, hbm_bw_local, 0.0)
++-
++-        t_hbm_p = bytes_to_time_ms(int(hbm_bytes_prefill_total), float(hbm_bw_local))  # Prefill 一次性
++-        t_hbm_d = bytes_to_time_ms(int(hbm_bytes_per_token), float(hbm_bw_local))      # Decode 每 token
++-
++-        # ---------- Timeline 图（条更细，跟你之前的plot_timeline一致风格） ----------
++-        def plot_timeline(title, comps_dict, overlaps):
++-            import plotly.graph_objects as go
++-            labels = list(comps_dict.keys())
++-            times  = [float(comps_dict[k]) for k in labels]
++-            fig = go.Figure()
++-            cum = 0.0
++-            colors = {
++-                "Compute": "#64B5F6",
++-                "Network": "#81C784",
++-                "HBM": "#FFB74D",
++-                "HBM (weights+KV)": "#FF8A65",
++-            }
++-            for k in labels:
++-                v = float(comps_dict[k])
++-                fig.add_trace(go.Bar(
++-                    x=[v], y=[""], name=k, orientation="h",
++-                    base=cum, width=0.3,
++-                    marker_color=colors.get(k, None),
++-                    hovertemplate=f"{k}: %{{x:.3f}} ms<extra></extra>"
++-                ))
++-                cum += v
++-            sum_t = sum(times)
++-            max_t = max(times) if times else 0.0
++-            for phi in overlaps:
++-                t_eff = (1.0 - float(phi)) * sum_t + float(phi) * max_t
++-                fig.add_vline(
++-                    x=t_eff, line_dash="dash", line_color="#424242",
++-                    annotation_text=f"φ={phi:.2f} → {t_eff:.2f} ms",
++-                    annotation_font=dict(size=10),
++-                    annotation_position="top left"
++-                )
++-            fig.update_layout(
++-                title=title, barmode="stack", height=100,
++-                xaxis_title="Time (ms)", showlegend=True,
++-                legend=dict(orientation="h", y=-0.3, x=0.0),
++-                margin=dict(l=40, r=20, t=40, b=20),
++-                xaxis=dict(showgrid=True, gridwidth=0.3, gridcolor="#E0E0E0"),
++-                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
++-            )
++-            return fig
++-
++-        # ---------- 依据本地硬件输入计算三个分量 ----------
++-        # Compute 时间：从 FLOPs 与 tensor core 峰值（乘本地 MFU）得到
++-        def flops_to_time_ms_local(flops_total, tflops_peak, mfu):
++-            eff_flops = max(1e-9, float(tflops_peak) * 1e12 * float(mfu))
++-            return float(flops_total) / eff_flops * 1e3
++-
++-        # 计算 Compute 时间（使用 local 峰值与 MFU）
++-        t_comp_p = flops_to_time_ms_local(flops_prefill_total, float(tensor_core_peak_local), float(mfu_local))
++-        t_comp_d = flops_to_time_ms_local(flops_decode_total,  float(tensor_core_peak_local), float(mfu_local))
++-
++-        # 计算 Network 时间（使用 local 互联带宽）
++-        t_net_p = bytes_to_time_ms(int(tp_bytes_prefill + ep_bytes_prefill), float(net_bw_local))
++-        t_net_d = bytes_to_time_ms(int(tp_bytes_decode  + ep_bytes_decode),  float(net_bw_local))
++-
++-        # 计算 HBM 时间（使用 local HBM 带宽）
++-        t_hbm_p = bytes_to_time_ms(int(hbm_bytes_prefill_total), float(hbm_bw_local))
++-        t_hbm_d = bytes_to_time_ms(int(hbm_bytes_per_token),     float(hbm_bw_local))
+++]
+++registered_titles = {tab.title for tab in registered_tabs}
+++legacy_tab_titles = [
+++    title for title in legacy_tab_titles_all if title not in registered_titles
+++]
+++all_tab_titles = [tab.title for tab in registered_tabs] + legacy_tab_titles
+++tab_widgets = st.tabs(all_tab_titles)
++ 
++-        # 重叠参考线
++-        overlap_choices = [0.0, float(overlap_ratio_local), 1.0]
+++state = DashboardState(
+++    st=st,
+++    session_state=st.session_state,
+++    model=model,
+++)
+++actions = DashboardActions(
+++    human_bytes=human_bytes,
+++    per_token_kv_bytes_per_layer_per_gpu=per_token_kv_bytes_per_layer_per_gpu,
+++    per_token_decode_hbm_bytes_per_layer_per_gpu=per_token_decode_hbm_bytes_per_layer_per_gpu,
+++    bytes_to_time_ms=bytes_to_time_ms,
+++)
++ 
++-        # ---------- Prefill timeline（一次性：Compute + Network + HBM(权重读 + KV写)）----------
++-        st.plotly_chart(
++-            plot_timeline(
++-                "Prefill timeline (per device)",
++-                {"Compute": t_comp_p, "Network": t_net_p, "HBM (weights+KV)": t_hbm_p},
++-                overlap_choices
++-            ),
++-            use_container_width=True
++-        )
+++for idx, tab_def in enumerate(registered_tabs):
+++    with tab_widgets[idx]:
+++        tab_def.render(state, actions)
++ 
++-        # ---------- Decode timeline（每 token：Compute + Network + HBM(权重+KV)）----------
++-        st.plotly_chart(
++-            plot_timeline(
++-                "Decode timeline per token (per device)",
++-                {"Compute": t_comp_d, "Network": t_net_d, "HBM (weights+KV)": t_hbm_d},
++-                overlap_choices
++-            ),
++-            use_container_width=True
++-        )
++-    else:
++-        st.info("Set local hardware params and click **Run estimate (Local HW)** above.")
+++legacy_tabs = tab_widgets[len(registered_tabs):]
++ 
+++def _legacy_tab(title: str):
+++    try:
+++        idx = legacy_tab_titles.index(title)
+++    except ValueError:
+++        placeholder = st.container()
+++        with placeholder:
+++            st.warning(f"Legacy tab '{title}' is not defined in layout.")
+++        return placeholder
+++
+++    if idx >= len(legacy_tabs):
+++        placeholder = st.container()
+++        with placeholder:
+++            st.warning(f"Legacy tab '{title}' is missing from layout.")
+++        return placeholder
+++
+++    return legacy_tabs[idx]
+++
+++tab_attention_vs_head_dim = _legacy_tab("Detailed Attention versus HeadDim")
+++tab_quick_memory = _legacy_tab("Quick per-GPU memory & KV capacity")
+++tab_host_bandwidth = _legacy_tab("Host Bandwidth Planner")
+++tab_experts_calculation = _legacy_tab("Experts Calcuation")
+++tab_scale_up_search = _legacy_tab("Scale-up Search")
+++tab_regression_calibration = _legacy_tab("Regression & Calibration")
+++tab_real_world_measurement = _legacy_tab("Real-world Measurement")
+++tab_inferencemax = _legacy_tab("InferenceMax")
+++tab_inferencemax_v2 = _legacy_tab("InferenceMax V2")
++ 
++ def attn_component_flops_prefill(B:int, T:int, H:int, hd:int, L:int, causal:bool=True):
++     """
++@@ -1282,7 +1040,7 @@ def attn_component_flops_prefill(B:int, T:int, H:int, hd:int, L:int, causal:bool
++         "GEMM_PV":  F_pv_layer * L,
++     }
++ 
++-with tab1:
+++with tab_attention_vs_head_dim:
++     # ------------------ Attention component times vs head_dim ------------------
++     st.markdown("---")
++     st.subheader("Attention component times vs head_dim")
++@@ -1429,7 +1187,7 @@ with tab1:
++         c2.metric("Weights total bytes", human_bytes(wt["bytes_total"]))
++         c3.metric("Per-param dtype bytes", int(dtype_bytes_now))
++ 
++-with tab2:
+++with tab_quick_memory:
++     # -- Quick per-GPU memory & KV capacity (TP/DP → EP=N) --
++     st.subheader("Per-GPU Memory & KV Cache Capacity (inspect)")
++     cI, cJ, cK = st.columns(3)
++@@ -1459,7 +1217,7 @@ with tab2:
++         f"- **KV capacity / GPU (tokens)**: **{kv_cap_tokens:,}** "
++         f"(dtype={kv_dtype_b}B, HBM={hbm_cap_GB}GB, reserve={hbm_reserve*100:.0f}%)"
++     )
++-with tab3:
+++with tab_host_bandwidth:
++     # ================= Host Bandwidth Planner (CPU<->GPU, CPU<->DDR) =================
++     st.header("Host Bandwidth Planner — MoE Rebalance & KV Offload (CPU↔GPU, CPU↔DDR)")
++ 
++@@ -1696,7 +1454,7 @@ with tab3:
++     st.caption("注：以上以 Host 路径为基线
+\ No newline at end of file
 diff --git a/tabs/__init__.py b/tabs/__init__.py
 new file mode 100644
 index 0000000..5948b0f
@@ -806,6 +1308,4 @@ index 0000000..5e42586
 +        )
 +    else:
 +        st.info("Set local hardware params and click **Run estimate (Local HW)** above.")
--- 
-2.43.0
 

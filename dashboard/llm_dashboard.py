@@ -984,7 +984,32 @@ for idx, tab_def in enumerate(registered_tabs):
 
 legacy_tabs = tab_widgets[len(registered_tabs):]
 
-(tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9) = legacy_tabs
+def _legacy_tab(title: str):
+    try:
+        idx = legacy_tab_titles.index(title)
+    except ValueError:
+        placeholder = st.container()
+        with placeholder:
+            st.warning(f"Legacy tab '{title}' is not defined in layout.")
+        return placeholder
+
+    if idx >= len(legacy_tabs):
+        placeholder = st.container()
+        with placeholder:
+            st.warning(f"Legacy tab '{title}' is missing from layout.")
+        return placeholder
+
+    return legacy_tabs[idx]
+
+tab_attention_vs_head_dim = _legacy_tab("Detailed Attention versus HeadDim")
+tab_quick_memory = _legacy_tab("Quick per-GPU memory & KV capacity")
+tab_host_bandwidth = _legacy_tab("Host Bandwidth Planner")
+tab_experts_calculation = _legacy_tab("Experts Calcuation")
+tab_scale_up_search = _legacy_tab("Scale-up Search")
+tab_regression_calibration = _legacy_tab("Regression & Calibration")
+tab_real_world_measurement = _legacy_tab("Real-world Measurement")
+tab_inferencemax = _legacy_tab("InferenceMax")
+tab_inferencemax_v2 = _legacy_tab("InferenceMax V2")
 
 def attn_component_flops_prefill(B:int, T:int, H:int, hd:int, L:int, causal:bool=True):
     """
@@ -1015,7 +1040,7 @@ def attn_component_flops_prefill(B:int, T:int, H:int, hd:int, L:int, causal:bool
         "GEMM_PV":  F_pv_layer * L,
     }
 
-with tab1:
+with tab_attention_vs_head_dim:
     # ------------------ Attention component times vs head_dim ------------------
     st.markdown("---")
     st.subheader("Attention component times vs head_dim")
@@ -1162,7 +1187,7 @@ with tab1:
         c2.metric("Weights total bytes", human_bytes(wt["bytes_total"]))
         c3.metric("Per-param dtype bytes", int(dtype_bytes_now))
 
-with tab2:
+with tab_quick_memory:
     # -- Quick per-GPU memory & KV capacity (TP/DP → EP=N) --
     st.subheader("Per-GPU Memory & KV Cache Capacity (inspect)")
     cI, cJ, cK = st.columns(3)
@@ -1192,7 +1217,7 @@ with tab2:
         f"- **KV capacity / GPU (tokens)**: **{kv_cap_tokens:,}** "
         f"(dtype={kv_dtype_b}B, HBM={hbm_cap_GB}GB, reserve={hbm_reserve*100:.0f}%)"
     )
-with tab3:
+with tab_host_bandwidth:
     # ================= Host Bandwidth Planner (CPU<->GPU, CPU<->DDR) =================
     st.header("Host Bandwidth Planner — MoE Rebalance & KV Offload (CPU↔GPU, CPU↔DDR)")
 
@@ -1429,7 +1454,7 @@ with tab3:
     st.caption("注：以上以 Host 路径为基线（GPU→CPU→GPU），若采用 NVLink P2P/GPUDirect Storage，可将 PCIe/DDR 压力替换为相应通道的有效值进行评估。")
 
 # ======== Reverse calc: how many experts can be loaded within a latency budget? ========
-with tab4:
+with tab_experts_calculation:
     with st.expander("How many experts can be loaded within a latency budget?", expanded=True):
         cX, cY, cZ = st.columns(3)
         latency_ms = cX.number_input("Latency budget (ms)", min_value=1.0, max_value=60000.0, value=50.0, step=1.0,
@@ -1471,10 +1496,10 @@ with tab4:
                     f"(= K × bytes_per_expert / min(PCIe, DDR))")
 # ==============================================================
 # tab5_scaleup_enhanced.py
-# 完整可替换 llm_dashboard.py 内的 with tab5: 段
+# 完整可替换 llm_dashboard.py 内的 Scale-up Search tab 段
 # ==============================================================
 
-with tab5:
+with tab_scale_up_search:
     # ======================================================
     # Header
     # ======================================================
@@ -1865,7 +1890,7 @@ with tab5:
 - 实测 TTFT 通常 < 理论值 ×10，因为系统采用 persistent kernel 与 pipeline overlap。
             """)
 
-with tab6:
+with tab_regression_calibration:
     # ================= Regression / Calibration =================
     st.header("Regression / Calibration")
 
@@ -2177,7 +2202,7 @@ with tab6:
             "**图意**：横轴越大（单位用户速率越高），对 Prefill 摊销要求越苛刻；短回答时（m 小），有效吞吐相对稳态上限下降更明显。"
         )
 
-with tab7:
+with tab_real_world_measurement:
     # ================= Real Measurement → Efficiency Backsolve =================
     st.header("Real-world Measurement → Efficiency Backsolve")
     with st.expander("指定并行与长度，用实测吞吐回推效率 + HBM 容量检查 + 单层对比", expanded=True):
@@ -2352,7 +2377,7 @@ with tab7:
         st.caption("注：单层“实测均摊”=（实测 TTFT/TPOT）/ 层数，仅做粗对比；真实分布受内核/排布影响不均匀。")
 
 # ======================= InferenceMAX-style Sweep (New Tab) =======================
-with tab8:
+with tab_inferencemax:
     st.header("InferenceMAX-style Sweep")
 
     with st.expander("Sweep 配置（遵循 InferenceMAX 方法 + HBM 约束）", expanded=True):
@@ -2820,7 +2845,7 @@ with tab8:
                 "若某个 TP 在 B=1 都放不下，则整个 TP 曲线被剔除；每个点也逐一检查内存后再绘制。"
             )
 # ======================= Tab 8: PD 分离 · DP==EP 可选 · 显式KV公式 + KV Cache 命中率联动 =======================
-with tab9:
+with tab_inferencemax_v2:
     import pandas as pd
     import plotly.graph_objects as go
     from typing import Optional, Dict, Any
