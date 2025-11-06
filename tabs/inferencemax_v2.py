@@ -25,6 +25,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             min_value=1.0,
             value=float(session_state.get("chip_tflops", 600.0)),
             step=10.0,
+            key="inferencemax_v2_tensor_tflops",
         )
         mfu = c2.slider(
             "MFU (0~1)",
@@ -48,14 +49,20 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             min_value=10.0,
             value=float(session_state.get("hbm_bw", 3200.0)),
             step=20.0,
+            key="inferencemax_v2_hbm_bw",
         )
         net_bw = c5.number_input(
             "Interconnect BW (GB/s)",
             min_value=1.0,
             value=float(session_state.get("net_bw", 640.0)),
             step=10.0,
+            key="inferencemax_v2_net_bw",
         )
-        include_weights = st.checkbox("Decode includes weight reads", value=True)
+        include_weights = st.checkbox(
+            "Decode includes weight reads",
+            value=True,
+            key="inferencemax_v2_include_weights",
+        )
 
     default_rows = pd.DataFrame(
         [
