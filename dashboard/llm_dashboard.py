@@ -947,7 +947,8 @@ df_comb = pd.DataFrame(combined)
 st.dataframe(df_comb, use_container_width=True, height=320)
 
 registered_tabs = get_registered_tabs()
-legacy_tab_titles = [
+legacy_tab_titles_all = [
+    "Quick Estimation",
     "Detailed Attention versus HeadDim",
     "Quick per-GPU memory & KV capacity",
     "Host Bandwidth Planner",
@@ -957,6 +958,10 @@ legacy_tab_titles = [
     "Real-world Measurement",
     "InferenceMax",
     "InferenceMax V2",
+]
+registered_titles = {tab.title for tab in registered_tabs}
+legacy_tab_titles = [
+    title for title in legacy_tab_titles_all if title not in registered_titles
 ]
 all_tab_titles = [tab.title for tab in registered_tabs] + legacy_tab_titles
 tab_widgets = st.tabs(all_tab_titles)
