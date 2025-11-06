@@ -32,6 +32,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             1.0,
             float(session_state.get("mfu", 0.45)),
             0.01,
+            key="inferencemax_v2_mfu",
         )
         overlap = c3.slider(
             "Overlap φ",
@@ -39,6 +40,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             1.0,
             float(session_state.get("overlap", 0.25)),
             0.05,
+            key="inferencemax_v2_overlap",
         )
         c4, c5 = st.columns(2)
         hbm_bw = c4.number_input(
