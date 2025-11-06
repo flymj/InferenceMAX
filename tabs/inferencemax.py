@@ -17,18 +17,39 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
     with st.expander("Workload configuration", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
-        tp = c1.number_input("TP", 1, 4096, int(session_state.get("inspect_tp", 8)), 1)
-        dp = c2.number_input("DP", 1, 4096, int(session_state.get("inspect_dp", 8)), 1)
-        batch = c3.number_input("Batch per GPU", 1, 65536, int(session_state.get("meas_bref", 1)), 1)
-        grad = c4.number_input("Grad accumulation", 1, 1024, int(session_state.get("grad_accum", 1)), 1)
+        tp = c1.number_input(
+            "TP", 1, 4096, int(session_state.get("inspect_tp", 8)), 1, key="inferencemax_tp"
+        )
+        dp = c2.number_input(
+            "DP", 1, 4096, int(session_state.get("inspect_dp", 8)), 1, key="inferencemax_dp"
+        )
+        batch = c3.number_input(
+            "Batch per GPU",
+            1,
+            65536,
+            int(session_state.get("meas_bref", 1)),
+            1,
+            key="inferencemax_batch",
+        )
+        grad = c4.number_input(
+            "Grad accumulation",
+            1,
+            1024,
+            int(session_state.get("grad_accum", 1)),
+            1,
+            key="inferencemax_grad",
+        )
         seq_len = st.number_input(
             "Prefill seq length",
             1,
             1_000_000,
             int(session_state.get("seq_len_in", 2048)),
             1,
+            key="inferencemax_seq_len",
         )
-        decode_tokens = st.number_input("Decode tokens", 1, 1_000_000, 512, 1)
+        decode_tokens = st.number_input(
+            "Decode tokens", 1, 1_000_000, 512, 1, key="inferencemax_decode_tokens"
+        )
 
     with st.expander("Hardware profile", expanded=True):
         c5, c6, c7 = st.columns(3)
@@ -37,6 +58,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             min_value=1.0,
             value=float(session_state.get("chip_tflops", 600.0)),
             step=10.0,
+            key="inferencemax_tensor_tflops",
         )
         mfu = c6.slider(
             "MFU (0~1)",
@@ -60,12 +82,14 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             min_value=10.0,
             value=float(session_state.get("hbm_bw", 3200.0)),
             step=20.0,
+            key="inferencemax_hbm_bw",
         )
         net_bw = c9.number_input(
             "Interconnect BW (GB/s)",
             min_value=1.0,
             value=float(session_state.get("net_bw", 640.0)),
             step=10.0,
+            key="inferencemax_net_bw",
         )
         include_weights = st.checkbox("Decode includes full weight reads", value=True)
 
