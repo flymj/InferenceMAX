@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
+from features import AttentionGeometry, kv_state_bytes_per_token_layer, resolve_attention_variant
+
 
 @dataclass
 class KVProfile:
@@ -65,69 +67,92 @@ def kv_profile_from_model(model: Any) -> KVProfile:
 
 def per_token_kv_bytes_per_layer_per_gpu(model: Any, tp: int, dtype_bytes: int) -> int:
     fam = attn_family(model)
+    variant = resolve_attention_variant(fam)
     tp = max(1, int(tp))
+    dtype_bytes = int(dtype_bytes)
 
-    if fam in ("MHA/GQA", "MLA"):
-        kvp = _kv_profile_softmax(model)
-        heads_local = max(1, kvp.heads_v_total // tp)
-        return int((kvp.k_per_head + kvp.v_per_head) * heads_local * dtype_bytes)
-
-    if fam == "Linear":
+    if variant.name == "linear":
         return 0
 
-    if fam == "Hybrid":
-        full_idxs, lin_idxs = getattr(model, "split_attn_layers",
-                                      lambda *_: (list(range(int(getattr(model, "num_hidden_layers", 0) or 0))), []))(
-                                          int(getattr(model, "num_hidden_layers", 0) or 0))
+    H = int(getattr(model, "num_attention_heads", 0) or 0)
+    D = int(getattr(model, "hidden_size", 0) or 0)
+    head_dim = int(getattr(model, "head_dim", getattr(model, "hidden_size", 0) // max(1, H)))
+    kv_heads = int(getattr(model, "num_key_value_heads", H) or H)
+    geom = AttentionGeometry(
+        hidden_size=D,
+        head_dim=head_dim,
+        num_heads=H,
+        num_kv_heads=kv_heads,
+        layers=1,
+    )
+
+    if variant.name == "hybrid":
+        full_idxs, lin_idxs = getattr(
+            model,
+            "split_attn_layers",
+            lambda *_: (list(range(int(getattr(model, "num_hidden_layers", 0) or 0))), []),
+        )(int(getattr(model, "num_hidden_layers", 0) or 0))
         L_full = len(full_idxs)
         L_lin = len(lin_idxs)
         L = max(1, L_full + L_lin)
-        kvp = _kv_profile_softmax(model)
-        heads_local = max(1, kvp.heads_v_total // tp)
-        val_full = (kvp.k_per_head + kvp.v_per_head) * heads_local * dtype_bytes
-        val_lin = 0
-        return int((L_full * val_full + L_lin * val_lin) // L)
+        soft_variant = resolve_attention_variant("standard")
+        soft_geom = geom
+        soft_base = kv_state_bytes_per_token_layer(soft_variant.name, soft_geom, dtype_bytes)
+        total_heads = soft_geom.effective_kv_heads(soft_variant)
+        heads_local = max(1, total_heads // tp)
+        per_gpu_soft = soft_base * (heads_local / max(1, total_heads))
+        return int((L_full * per_gpu_soft) // L)
 
-    kvp = _kv_profile_softmax(model)
-    heads_local = max(1, kvp.heads_v_total // tp)
-    return int((kvp.k_per_head + kvp.v_per_head) * heads_local * dtype_bytes)
+    base = kv_state_bytes_per_token_layer(variant.name, geom, dtype_bytes)
+    total_heads = geom.effective_kv_heads(variant)
+    if total_heads <= 0:
+        return 0
+    heads_local = max(1, total_heads // tp)
+    return int(base * (heads_local / max(1, total_heads)))
 
 
 def per_token_decode_hbm_bytes_per_layer_per_gpu(model: Any, tp: int, kv_len: int, dtype_bytes: int) -> int:
     fam = attn_family(model)
+    variant = resolve_attention_variant(fam)
     tp = max(1, int(tp))
+    kv_len = int(kv_len)
+    dtype_bytes = int(dtype_bytes)
 
-    if fam in ("MHA/GQA", "MLA"):
-        kvp = _kv_profile_softmax(model)
-        heads_local = max(1, kvp.heads_v_total // tp)
-        k_read = heads_local * kvp.k_per_head * kv_len * dtype_bytes
-        v_read = heads_local * kvp.v_per_head * kv_len * dtype_bytes
-        k_write = heads_local * kvp.k_per_head * dtype_bytes
-        v_write = heads_local * kvp.v_per_head * dtype_bytes
-        return int(k_read + v_read + k_write + v_write)
-
-    if fam == "Linear":
+    if variant.name == "linear":
         kvp = _kv_profile_linear(model)
         H = int(getattr(model, "num_attention_heads", 0) or 0)
         r, dv = int(kvp.r_feature), int(kvp.v_per_head)
         state_bytes = H * (r * dv) * dtype_bytes
         return int(2 * state_bytes)
 
-    if fam == "Hybrid":
-        full_idxs, lin_idxs = getattr(model, "split_attn_layers",
-                                      lambda *_: (list(range(int(getattr(model, "num_hidden_layers", 0) or 0))), []))(
-                                          int(getattr(model, "num_hidden_layers", 0) or 0))
+    H = int(getattr(model, "num_attention_heads", 0) or 0)
+    D = int(getattr(model, "hidden_size", 0) or 0)
+    head_dim = int(getattr(model, "head_dim", getattr(model, "hidden_size", 0) // max(1, H)))
+    kv_heads = int(getattr(model, "num_key_value_heads", H) or H)
+    geom = AttentionGeometry(
+        hidden_size=D,
+        head_dim=head_dim,
+        num_heads=H,
+        num_kv_heads=kv_heads,
+        layers=1,
+    )
+
+    if variant.name == "hybrid":
+        full_idxs, lin_idxs = getattr(
+            model,
+            "split_attn_layers",
+            lambda *_: (list(range(int(getattr(model, "num_hidden_layers", 0) or 0))), []),
+        )(int(getattr(model, "num_hidden_layers", 0) or 0))
         L_full = len(full_idxs)
         L_lin = len(lin_idxs)
         L = max(1, L_full + L_lin)
 
-        kvp_s = _kv_profile_softmax(model)
-        heads_local = max(1, kvp_s.heads_v_total // tp)
-        val_full = (
-            heads_local * kvp_s.k_per_head * kv_len * dtype_bytes
-            + heads_local * kvp_s.v_per_head * kv_len * dtype_bytes
-            + heads_local * (kvp_s.k_per_head + kvp_s.v_per_head) * dtype_bytes
-        )
+        soft_variant = resolve_attention_variant("standard")
+        soft_base = kv_state_bytes_per_token_layer(soft_variant.name, geom, dtype_bytes)
+        total_heads = geom.effective_kv_heads(soft_variant)
+        heads_local = max(1, total_heads // tp)
+        per_gpu_soft = soft_base * (heads_local / max(1, total_heads))
+        val_full = per_gpu_soft * (kv_len + 1)
 
         kvp_l = _kv_profile_linear(model)
         H = int(getattr(model, "num_attention_heads", 0) or 0)
@@ -136,13 +161,13 @@ def per_token_decode_hbm_bytes_per_layer_per_gpu(model: Any, tp: int, kv_len: in
 
         return int((L_full * val_full + L_lin * val_lin) // L)
 
-    kvp = _kv_profile_softmax(model)
-    heads_local = max(1, kvp.heads_v_total // tp)
-    k_read = heads_local * kvp.k_per_head * kv_len * dtype_bytes
-    v_read = heads_local * kvp.v_per_head * kv_len * dtype_bytes
-    k_write = heads_local * kvp.k_per_head * dtype_bytes
-    v_write = heads_local * kvp.v_per_head * dtype_bytes
-    return int(k_read + v_read + k_write + v_write)
+    base = kv_state_bytes_per_token_layer(variant.name, geom, dtype_bytes)
+    total_heads = geom.effective_kv_heads(variant)
+    if total_heads <= 0:
+        return 0
+    heads_local = max(1, total_heads // tp)
+    per_gpu = base * (heads_local / max(1, total_heads))
+    return int(per_gpu * (kv_len + 1))
 
 
 def weights_bytes_per_gpu(model: Any, tp: int, ep_group: int, weight_dtype_bytes: int) -> int:

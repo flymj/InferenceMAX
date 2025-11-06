@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
+
+from features import (
+    KvOffloadDefaults,
+    compute_kv_offload_traffic,
+    kv_layer_breakdown_dataframe,
+    render_expert_latency_section,
+    render_kv_offload_controls,
+    summarize_moe_model,
+)
 
 from . import DashboardActions, DashboardState, register_tab
 
@@ -54,8 +62,6 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
     L = int(getattr(model, "num_hidden_layers", 0) or 0)
     D = int(getattr(model, "hidden_size", 0) or 0)
-    E_all = int(getattr(model, "n_routed_experts", getattr(model, "num_experts", 0)) or 0)
-    is_moe = model.is_moe_enabled()
     dtype_bytes_now = int(session_state.get("weight_bytes", 2))
     TP_fix = int(session_state.get("inspect_tp", 8))
     DP_fix = int(session_state.get("inspect_dp", 8))
@@ -104,26 +110,13 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             help="若专家少于卡数时允许复制，不增加单卡权重。此项只影响展示和提示。",
         )
 
-    rows_w = model.weight_component_rows()
-    moe_params_total_per_layer = 0
-    moe_layers = 0
-    for r in rows_w:
-        if "MoE" in r.get("Module", "") and "Router" not in r.get("Submodule", ""):
-            moe_params_total_per_layer += int(r.get("Params_per_layer", 0))
-            moe_layers = max(moe_layers, int(r.get("Layer_count", L) or L))
-
-    if moe_params_total_per_layer == 0 and is_moe:
-        d_ff_m = int(model.cfg.get("moe_intermediate_size", 0) or 0)
-        moe_params_total_per_layer = 2 * D * d_ff_m * max(1, E_all)
-
-    per_expert_params_per_layer = (
-        moe_params_total_per_layer // max(1, E_all)
-    ) if (is_moe and E_all > 0) else 0
-    per_expert_bytes_all_layers = (
-        per_expert_params_per_layer
-        * dtype_bytes_now
-        * max(1, moe_layers if moe_layers > 0 else L)
-    )
+    moe_summary = summarize_moe_model(model, dtype_bytes_now)
+    moe_params_total_per_layer = moe_summary.params_per_layer
+    moe_layers = moe_summary.moe_layers if moe_summary.moe_layers > 0 else L
+    per_expert_params_per_layer = moe_summary.params_per_expert_per_layer
+    per_expert_bytes_all_layers = moe_summary.bytes_per_expert_all_layers
+    E_all = moe_summary.total_experts
+    is_moe = moe_summary.is_moe
 
     experts_per_gpu = (E_all // max(1, N_moe)) if (E_all >= N_moe) else 1
 
@@ -222,46 +215,22 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     st.subheader("Scenario 2 — Long-context KV Offload (history to DDR, keep window in HBM)")
 
     with st.expander("Controls (offload policy)", expanded=True):
-        c0, c1, c2, c3 = st.columns(4)
-        kv_len_ctx = c0.number_input(
-            "Current KV length (tokens)",
-            1,
-            5_000_000,
-            int(session_state.get("kv_len_in", 4096)),
-            16,
+        kv_defaults = KvOffloadDefaults(
+            kv_length_tokens=int(session_state.get("kv_len_in", 4096)),
+            window_tokens=int(session_state.get("kv_window", 8192)),
+            fetch_ratio=float(session_state.get("kv_fetch_ratio", 0.20)),
+            tokens_per_s=float(session_state.get("tok_per_s", 200.0)),
+            keep_write_steady=True,
+            show_all_layers=False,
         )
-        win_tokens = c1.number_input(
-            "HBM window tokens (keep in HBM)",
-            1,
-            5_000_000,
-            int(session_state.get("kv_window", 8192)),
-            16,
-            help="窗口内 KV 常驻 HBM；窗口之外的历史放 DDR。",
+        kv_controls = render_kv_offload_controls(
+            st,
+            session_state,
+            key_prefix="kv_offload",
+            defaults=kv_defaults,
         )
-        fetch_ratio = c2.slider(
-            "Per-token reuse from offloaded (fraction)",
-            0.0,
-            1.0,
-            float(session_state.get("kv_fetch_ratio", 0.20)),
-            0.01,
-            help="每个新 token 需要访问的“已下放到 DDR 的历史 KV”比例。",
-        )
-        tok_per_s = c3.number_input(
-            "Decode tokens/s per GPU (target)",
-            0.1,
-            20000.0,
-            float(session_state.get("tok_per_s", 200.0)),
-            10.0,
-            help="用来把每 token 的字节换算成 GB/s。",
-        )
-
-        c4, c5 = st.columns(2)
-        keep_write_steady = c4.checkbox(
-            "Steady-state (one-in one-out) KV paging",
-            True,
-            help="达到窗口后，每生成1个新 token 就下放1个旧 token 到 DDR。",
-        )
-        show_all_layers = c5.checkbox("Show per-layer breakdown", False)
+        kv_config = kv_controls.config
+        show_all_layers = kv_controls.show_all_layers
 
     kv_dtype_b = int(session_state.get("kv_bytes", 2))
     per_tok_kv_layer_bytes = actions.per_token_kv_bytes_per_layer_per_gpu(
@@ -271,27 +240,22 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     )
     L_layers = int(getattr(model, "num_hidden_layers", 0) or L)
 
-    off_tokens = max(0, int(kv_len_ctx) - int(win_tokens))
-    off_frac = (off_tokens / float(max(1, int(kv_len_ctx)))) if kv_len_ctx > 0 else 0.0
-
-    bytes_fetch_per_token_per_gpu = (
-        per_tok_kv_layer_bytes * L_layers * off_frac * float(fetch_ratio)
-    )
-    bytes_write_per_token_per_gpu = (
-        (per_tok_kv_layer_bytes * L_layers)
-        if keep_write_steady and (kv_len_ctx >= win_tokens)
-        else 0
+    traffic = compute_kv_offload_traffic(
+        per_token_kv_layer_bytes=per_tok_kv_layer_bytes,
+        num_layers=L_layers,
+        config=kv_config,
+        n_moe=int(N_moe),
     )
 
-    bw_pcie_read_GBs_per_gpu = (bytes_fetch_per_token_per_gpu * tok_per_s) / 1e9
-    bw_pcie_write_GBs_per_gpu = (bytes_write_per_token_per_gpu * tok_per_s) / 1e9
-    bw_ddr_read_GBs_per_gpu = bw_pcie_read_GBs_per_gpu
-    bw_ddr_write_GBs_per_gpu = bw_pcie_write_GBs_per_gpu
+    bw_pcie_read_GBs_per_gpu = traffic.bw_pcie_read_GBs_per_gpu
+    bw_pcie_write_GBs_per_gpu = traffic.bw_pcie_write_GBs_per_gpu
+    bw_ddr_read_GBs_per_gpu = traffic.bw_ddr_read_GBs_per_gpu
+    bw_ddr_write_GBs_per_gpu = traffic.bw_ddr_write_GBs_per_gpu
 
-    bw_pcie_read_GBs_cluster = bw_pcie_read_GBs_per_gpu * N_moe
-    bw_pcie_write_GBs_cluster = bw_pcie_write_GBs_per_gpu * N_moe
-    bw_ddr_read_GBs_cluster = bw_ddr_read_GBs_per_gpu * N_moe
-    bw_ddr_write_GBs_cluster = bw_ddr_write_GBs_per_gpu * N_moe
+    bw_pcie_read_GBs_cluster = traffic.bw_pcie_read_GBs_cluster
+    bw_pcie_write_GBs_cluster = traffic.bw_pcie_write_GBs_cluster
+    bw_ddr_read_GBs_cluster = traffic.bw_ddr_read_GBs_cluster
+    bw_ddr_write_GBs_cluster = traffic.bw_ddr_write_GBs_cluster
 
     st.plotly_chart(
         go.Figure(
@@ -346,21 +310,10 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     )
 
     if show_all_layers:
-        df_kv_layers = pd.DataFrame(
-            {
-                "Layer": list(range(1, L_layers + 1)),
-                "per_token_KV_bytes": [per_tok_kv_layer_bytes] * L_layers,
-                "fetch_per_token_bytes": [
-                    per_tok_kv_layer_bytes * off_frac * float(fetch_ratio)
-                ]
-                * L_layers,
-                "write_per_token_bytes": [
-                    per_tok_kv_layer_bytes
-                    if (keep_write_steady and kv_len_ctx >= win_tokens)
-                    else 0
-                ]
-                * L_layers,
-            }
+        df_kv_layers = kv_layer_breakdown_dataframe(
+            per_token_kv_layer_bytes=per_tok_kv_layer_bytes,
+            num_layers=L_layers,
+            traffic=traffic,
         )
         st.dataframe(df_kv_layers, use_container_width=True, height=240)
 
@@ -371,73 +324,17 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     with st.expander(
         "How many experts can be loaded within a latency budget?", expanded=True
     ):
-        cX, cY, cZ = st.columns(3)
-        latency_ms = cX.number_input(
-            "Latency budget (ms)",
-            min_value=1.0,
-            max_value=60000.0,
-            value=float(session_state.get("latency_budget_ms", 50.0)),
-            step=1.0,
-            help="在这时间窗口内，最多能把多少专家从 DDR 拉到 HBM（单卡/全集群）。",
+        render_expert_latency_section(
+            st,
+            session_state,
+            model=model,
+            human_bytes=actions.human_bytes,
+            tp=TP_moe,
+            dp=DP_moe,
+            dtype_bytes=dtype_bytes_now,
+            key_prefix="host_expert_latency",
+            default_latency_ms=float(session_state.get("latency_budget_ms", 50.0)),
+            default_pcie_GBs=float(pcie_eff_GBs),
+            default_ddr_GBs=float(ddr_eff_GBs),
         )
-        pcie_cap_GBs = cY.number_input(
-            "Usable PCIe bandwidth (GB/s)",
-            min_value=1.0,
-            max_value=200.0,
-            value=float(pcie_eff_GBs),
-            step=1.0,
-            help="若与上面 Host I/O 的PCIe不同，可在此覆盖。",
-        )
-        ddr_cap_GBs = cZ.number_input(
-            "Usable DDR read bandwidth (GB/s)",
-            min_value=5.0,
-            max_value=800.0,
-            value=float(ddr_eff_GBs),
-            step=5.0,
-            help="DDR→CPU 有效读带宽；瓶颈按 min(PCIe, DDR)。",
-        )
-
-        if per_expert_bytes_all_layers <= 0:
-            st.warning("Per-expert bytes 未能解析（模型未启用 MoE 或专家参数未识别）。")
-        else:
-            latency_s = float(latency_ms) / 1000.0
-            path_cap_Bps = min(float(pcie_cap_GBs), float(ddr_cap_GBs)) * 1e9
-            bytes_movable_per_gpu = path_cap_Bps * latency_s
-            experts_loadable_per_gpu = int(
-                bytes_movable_per_gpu // per_expert_bytes_all_layers
-            )
-            experts_loadable_cluster = experts_loadable_per_gpu * int(N_moe)
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric(
-                "Movable bytes / GPU",
-                actions.human_bytes(int(bytes_movable_per_gpu)),
-            )
-            c2.metric(
-                "Experts loadable / GPU",
-                f"{experts_loadable_per_gpu}",
-            )
-            c3.metric(
-                "Experts loadable / Cluster",
-                f"{experts_loadable_cluster}",
-            )
-
-            st.caption(
-                f"瓶颈通道：min(PCIe={pcie_cap_GBs:.1f} GB/s, DDR={ddr_cap_GBs:.1f} GB/s)；"
-                f"Per-expert size ≈ {actions.human_bytes(int(per_expert_bytes_all_layers))}。"
-            )
-
-            st.markdown("**Inverse: time needed to load K experts**")
-            k = st.number_input(
-                "K experts (per GPU)",
-                min_value=0,
-                max_value=100000,
-                value=experts_loadable_per_gpu,
-                step=1,
-            )
-            time_needed_s = (int(k) * per_expert_bytes_all_layers) / max(1e-9, path_cap_Bps)
-            st.write(
-                f"- 需要时间（单卡）：**{time_needed_s*1000.0:.1f} ms**  "
-                f"(= K × bytes_per_expert / min(PCIe, DDR))"
-            )
 

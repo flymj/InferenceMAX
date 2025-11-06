@@ -24,6 +24,14 @@ from tabs import (
     get_registered_tabs,
     render_tab_group,
 )
+from features import (
+    ModelFeatures,
+    ModelGeometry,
+    ModelWorkload,
+    MoEConfig,
+    build_model_profile,
+    render_prefill_decode_controls,
+)
 from services.llm_calcs import (
     attn_family,
     combined_weight_flops_rows,
@@ -879,10 +887,14 @@ with tab_scale_up_search:
     # Section 3 · Prefill / Decode 调度参数
     # ======================================================
     with st.expander("Prefill / Decode 调度参数", expanded=True):
-        c10, c11, c12 = st.columns(3)
-        chunked_prefill = c10.slider("Chunked Prefill 强度", 0.0, 1.0, 0.5, 0.05)
-        decode_priority = c11.slider("Decode 优先级", 0.0, 1.0, 0.7, 0.05)
-        kv_cache_hit = c12.slider("KV Cache 命中率", 0.0, 1.0, 0.9, 0.05)
+        optimizations = render_prefill_decode_controls(
+            st,
+            session_state=st.session_state,
+            key_prefix="scaleup_prefill",
+        )
+        chunked_prefill = optimizations.chunked_prefill
+        decode_priority = optimizations.decode_priority
+        kv_cache_hit = optimizations.kv_cache_hit
 
         c13, c14, c15 = st.columns(3)
         causal_mask = c13.checkbox("使用 Causal Mask", value=True)
@@ -923,13 +935,21 @@ with tab_scale_up_search:
         head_dim = int(_cfg_get(cfg, ["head_dim", "qk_head_dim", "kv_channels"], 0) or 0)
         inter_sz = int(_cfg_get(cfg, ["intermediate_size", "ffn_hidden_size"], 0) or 0)
         ffn_mult = float(_cfg_get(cfg, ["ffn_mult", "mlp_ratio"], 0.0) or 0.0)
+        kv_heads = int(
+            _cfg_get(
+                cfg,
+                ["num_key_value_heads", "kv_heads", "num_kv_heads", "n_kv_heads"],
+                H,
+            )
+            or H
+        )
         if D <= 0 and H > 0 and head_dim > 0:
             D = H * head_dim
         if ffn_mult <= 0 and inter_sz > 0 and D > 0:
             ffn_mult = inter_sz / D
         if head_dim <= 0 and D > 0 and H > 0:
             head_dim = D // H
-        return H, D, L, head_dim, ffn_mult, inter_sz
+        return H, D, L, head_dim, ffn_mult, inter_sz, kv_heads
 
     def parse_moe_spec(cfg):
         E_total = int(_cfg_get(cfg, ["num_experts", "n_experts", "moe_num_experts"], 1) or 1)
@@ -941,7 +961,7 @@ with tab_scale_up_search:
         return dict(moe_on=moe_on, E_total=E_total, top_k=top_k, cap_f=cap_f,
                     router_aux_pct=router_aux_pct, all2all_overhead_pct=all2all_overhead_pct)
 
-    H, D, L, head_dim, ffn_mult, inter_sz = parse_model_spec(cfg)
+    H, D, L, head_dim, ffn_mult, inter_sz, kv_heads = parse_model_spec(cfg)
     moe = parse_moe_spec(cfg)
 
     if H == 0 or D == 0 or L == 0:
@@ -989,52 +1009,53 @@ with tab_scale_up_search:
         df["ffn_mult"] = ffn_mult
         df["avg_input"], df["avg_output"] = avg_input, avg_output
 
-        # ---- FLOPs 计算 (Attn+MLP+MoE)
-        # mask ratio: causal mask => 0.5；其他 => 1.0
+        # ---- Structured compute / memory breakdown
         mask_ratio = 0.5 if causal_mask else 1.0
-        if attn_impl == "linear":
-            # linear attention O(L)
-            flops_attn_tok_layer = 2 * H * head_dim * D * mask_ratio
-        elif attn_impl == "MLA":
-            flops_attn_tok_layer = 4 * D * head_dim * (H // 2) * mask_ratio
-        elif attn_impl == "GQA":
-            flops_attn_tok_layer = 4 * D * (head_dim * (H / 4)) * mask_ratio
-        else:
-            # standard
-            flops_attn_tok_layer = 4 * D * head_dim * H * mask_ratio
+        geometry_spec = ModelGeometry(
+            hidden_size=D,
+            head_dim=head_dim,
+            num_heads=H,
+            num_kv_heads=kv_heads,
+            layers=L,
+            ffn_mult=ffn_mult,
+            intermediate_size=inter_sz if inter_sz > 0 else None,
+            dtype_bytes=dtype_bytes,
+            kv_dtype_bytes=dtype_bytes,
+        )
+        workload_spec = ModelWorkload(
+            prefill_tokens=avg_input,
+            decode_tokens=avg_output,
+            kv_seq_len=seq_len_kv,
+            kv_cache_hit=kv_cache_hit,
+            mask_ratio=mask_ratio,
+        )
+        moe_cfg = None
+        if moe.get("moe_on"):
+            moe_cfg = MoEConfig(
+                enabled=True,
+                total_experts=int(moe.get("E_total", 0)),
+                top_k=int(moe.get("top_k", 0)),
+                capacity_factor=float(moe.get("cap_f", 1.0)),
+                router_aux_pct=float(moe.get("router_aux_pct", 0.0)),
+            )
+        features_spec = ModelFeatures(attention=attn_impl, moe=moe_cfg)
+        profile = build_model_profile(geometry_spec, workload_spec, features_spec)
+        profile_df = profile.to_dataframe()
+        if profile_df is not None:
+            st.session_state["model_profile_records"] = profile_df
 
-        # Projection (Q/K/V/O)
-        flops_proj_layer = 4.0 * D * D * (1.0 if kv_cache_hit < 1.0 else 0.75)
-
-        # FFN / MoE
-        if moe["moe_on"]:
-            eff_expert_frac = (moe["top_k"] / moe["E_total"]) * moe["cap_f"]
-            flops_ffn_layer = 4.0 * D * D * ffn_mult * eff_expert_frac * (1.0 + moe["router_aux_pct"])
-        else:
-            flops_ffn_layer = 8.0 * D * D * ffn_mult
-
-        flops_tok_layer = flops_proj_layer + flops_attn_tok_layer + flops_ffn_layer
-        flops_tok_all_layers = L * flops_tok_layer
-
-        # Prefill FLOPs: O(L_in^2)
-        flops_prefill = flops_tok_all_layers * avg_input * mask_ratio
-        # Decode FLOPs: O(L_kv)
-        flops_decode = flops_tok_all_layers * avg_output
+        flops_prefill = profile.totals["flops_prefill"]
+        flops_decode = profile.totals["flops_decode"]
+        bytes_weight = profile.aggregate("bytes", phase="static", component="weights")
+        bytes_act_prefill = profile.aggregate("bytes", phase="prefill", component="activations")
+        bytes_act_decode = profile.aggregate("bytes", phase="decode", component="activations")
+        bytes_kv_prefill = profile.aggregate("bytes", phase="prefill", component="kv_cache")
+        bytes_kv_decode = profile.aggregate("bytes", phase="decode", component="kv_cache")
 
         df["flops_prefill_T"] = flops_prefill / 1e12
         df["flops_decode_G"] = flops_decode / 1e9
-        # ======================================================
-        # Section 8 · HBM Traffic (Weights / Activations / KV)
-        # ======================================================
-        bytes_weight_layer = 4 * D * D + 2 * D * inter_sz
-        bytes_weight = bytes_weight_layer * L * dtype_bytes
-        bytes_activation_layer = 2 * D * dtype_bytes * avg_input
-        bytes_act_total = bytes_activation_layer * L
-        bytes_kv_prefill = avg_input * (head_dim * (H // 4)) * dtype_bytes * L * (2 if kv_cache_hit < 1.0 else 1.0)
-        bytes_kv_decode = seq_len_kv * (head_dim * (H // 4)) * dtype_bytes * L * 2 * (1.0 - kv_cache_hit)
-
         df["bytes_weight_GB"] = bytes_weight / 1e9
-        df["bytes_activation_GB"] = bytes_act_total / 1e9
+        df["bytes_activation_GB"] = bytes_act_prefill / 1e9
         df["bytes_kv_prefill_GB"] = bytes_kv_prefill / 1e9
         df["bytes_kv_decode_GB"] = bytes_kv_decode / 1e9
 
@@ -1051,8 +1072,14 @@ with tab_scale_up_search:
         T_comp_decode_ms = 1000 * (flops_decode / (eff_tflops * 1e12))
 
         # Memory时间
-        T_hbm_prefill_ms = 1000 * ((bytes_weight + bytes_act_total + bytes_kv_prefill) / (hbm_bw * 1e9 * hbm_eff_eff))
-        T_hbm_decode_ms = 1000 * ((bytes_weight + bytes_kv_decode + bytes_act_total) / (hbm_bw * 1e9 * hbm_eff_eff))
+        T_hbm_prefill_ms = 1000 * (
+            (bytes_weight + bytes_act_prefill + bytes_kv_prefill)
+            / (hbm_bw * 1e9 * hbm_eff_eff)
+        )
+        T_hbm_decode_ms = 1000 * (
+            (bytes_weight + bytes_kv_decode + bytes_act_decode)
+            / (hbm_bw * 1e9 * hbm_eff_eff)
+        )
 
         # Prefill和Decode理想时间
         TTFT_theory_ms = max(T_comp_prefill_ms, T_hbm_prefill_ms)
@@ -1686,6 +1713,8 @@ with tab_real_world_measurement:
         t_comm_layer_d = bytes_to_time_ms(tp_bytes_layer_d + ep_bytes_layer_d, chip_spec_m.net_bw_GBs)
         t_hbm_layer_d  = bytes_to_time_ms(hbm_per_layer_d, chip_spec_m.hbm_bw_GBs)
         t_theory_layer_d = combine_time(float(st.session_state.get("overlap", 0.0)), t_comp_layer_d, t_comm_layer_d, t_hbm_layer_d)
+
+        L_layers = int(getattr(model, "num_hidden_layers", 0) or 0)
 
         TTFT_ms_meas = (1.0 / max(1e-9, meas_seq_s)) * 1000.0 if meas_seq_s > 0 else t_theory_layer_p * max(1, L_layers)
         TPOT_ms_meas = (1.0 / max(1e-9, meas_tok_s)) * 1000.0 if (meas_tok_s and meas_tok_s>0) else t_theory_layer_d * 1.0

@@ -1,0 +1,77 @@
+"""Reusable optimisation components shared across dashboard tabs."""
+
+from .prefill_decode import (
+    PrefillDecodeOptimizations,
+    PrefillDecodeSliderConfig,
+    render_prefill_decode_controls,
+)
+from .kv_cache import (
+    KvOffloadConfig,
+    KvOffloadDefaults,
+    KvOffloadTraffic,
+    KvOffloadControlResult,
+    compute_kv_offload_traffic,
+    kv_layer_breakdown_dataframe,
+    render_kv_offload_controls,
+)
+from .attention import (
+    AttentionBreakdown,
+    AttentionComponentRecord,
+    AttentionGeometry,
+    AttentionVariant,
+    AttentionWorkload,
+    ModelAttentionRegistry,
+    compute_attention_breakdown,
+    kv_state_bytes_per_token_layer,
+    resolve_attention_variant,
+)
+from .model_profile import (
+    ModelFeatures,
+    ModelGeometry,
+    ModelProfile,
+    ModelWorkload,
+    MoEConfig,
+    build_model_profile,
+)
+from .moe import (
+    ExpertLatencyInputs,
+    ExpertLatencyStats,
+    ExpertModelSummary,
+    compute_expert_latency_capacity,
+    render_expert_latency_section,
+    summarize_moe_model,
+)
+
+__all__ = [
+    "PrefillDecodeOptimizations",
+    "PrefillDecodeSliderConfig",
+    "render_prefill_decode_controls",
+    "KvOffloadConfig",
+    "KvOffloadDefaults",
+    "KvOffloadTraffic",
+    "KvOffloadControlResult",
+    "compute_kv_offload_traffic",
+    "kv_layer_breakdown_dataframe",
+    "render_kv_offload_controls",
+    "AttentionBreakdown",
+    "AttentionComponentRecord",
+    "AttentionGeometry",
+    "AttentionVariant",
+    "AttentionWorkload",
+    "ModelAttentionRegistry",
+    "compute_attention_breakdown",
+    "kv_state_bytes_per_token_layer",
+    "resolve_attention_variant",
+    "ModelGeometry",
+    "ModelWorkload",
+    "ModelFeatures",
+    "ModelProfile",
+    "MoEConfig",
+    "build_model_profile",
+    "ExpertLatencyInputs",
+    "ExpertLatencyStats",
+    "ExpertModelSummary",
+    "compute_expert_latency_capacity",
+    "render_expert_latency_section",
+    "summarize_moe_model",
+]
