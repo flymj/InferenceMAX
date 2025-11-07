@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Mapping
+from pathlib import Path
+from typing import Any, Dict, List, Mapping
+
+import json
+import sys
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from dashboard.components.header import render_header
 from dashboard.components.sidebar import render_sidebar
@@ -48,42 +56,6 @@ class ModelConfig:
         }
 
 
-DEFAULT_MODELS: List[ModelConfig] = [
-    ModelConfig(
-        name="Llama 3 8B",
-        params_b=8.0,
-        num_layers=32,
-        hidden_size=4096,
-        attention_heads=32,
-        ffn_multiplier=3.6,
-        prompt_tokens=4096,
-        generation_tokens=512,
-    ),
-    ModelConfig(
-        name="Llama 3 70B",
-        params_b=70.0,
-        num_layers=80,
-        hidden_size=8192,
-        attention_heads=64,
-        ffn_multiplier=3.2,
-        prompt_tokens=4096,
-        generation_tokens=512,
-        prompt_batch_size=2,
-    ),
-    ModelConfig(
-        name="DeepSeek-V2 236B",
-        params_b=236.0,
-        num_layers=64,
-        hidden_size=14336,
-        attention_heads=128,
-        ffn_multiplier=2.6,
-        prompt_tokens=8192,
-        generation_tokens=1024,
-        prompt_batch_size=2,
-    ),
-]
-
-
 DTYPE_BYTES = {
     "FP32": 4,
     "FP16": 2,
@@ -95,19 +67,153 @@ DTYPE_BYTES = {
 
 def _get_model_state() -> List[Dict[str, object]]:
     if "model_rows" not in st.session_state:
-        st.session_state["model_rows"] = [m.as_dict() for m in DEFAULT_MODELS]
+        st.session_state["model_rows"] = []
     return st.session_state["model_rows"]
-
-
-def _add_model_row() -> None:
-    models = _get_model_state()
-    models.append(ModelConfig().as_dict())
 
 
 def _remove_model_row(index: int) -> None:
     models = _get_model_state()
     if 0 <= index < len(models):
         models.pop(index)
+
+
+def _safe_rerun() -> None:
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+
+
+def _first(config: Mapping[str, Any], keys: List[str], default: Any = None) -> Any:
+    for key in keys:
+        if key in config and config[key] is not None:
+            return config[key]
+    return default
+
+
+def _model_from_json_config(config: Mapping[str, Any], name_override: str | None = None) -> Dict[str, object]:
+    model = ModelConfig().as_dict()
+
+    name = name_override or _first(
+        config,
+        [
+            "name",
+            "model_name",
+            "model_type",
+            "architectures",
+        ],
+    )
+    if isinstance(name, list):
+        name = name[0] if name else None
+    if name:
+        model["name"] = str(name)
+
+    params = _first(
+        config,
+        [
+            "num_params",
+            "n_parameters",
+            "n_params",
+            "model_size",
+            "model_size_in_billions",
+        ],
+    )
+    if params is not None:
+        try:
+            params_value = float(params)
+            if params_value > 1e6:
+                params_value /= 1e9
+            model["params_b"] = params_value
+        except (TypeError, ValueError):
+            pass
+
+    num_layers = _first(config, ["num_hidden_layers", "n_layers", "num_layers"])
+    if num_layers is not None:
+        try:
+            model["num_layers"] = int(num_layers)
+        except (TypeError, ValueError):
+            pass
+
+    hidden_size = _first(config, ["hidden_size", "d_model", "model_dim", "n_embd"])
+    if hidden_size is not None:
+        try:
+            model["hidden_size"] = int(hidden_size)
+        except (TypeError, ValueError):
+            pass
+
+    heads = _first(
+        config,
+        ["num_attention_heads", "n_head", "num_heads", "attention_heads"],
+    )
+    if heads is not None:
+        try:
+            model["attention_heads"] = int(heads)
+        except (TypeError, ValueError):
+            pass
+
+    intermediate = _first(
+        config,
+        [
+            "intermediate_size",
+            "ffn_dim",
+            "ffn_hidden_size",
+            "mlp_dim",
+        ],
+    )
+    ratio_value = _first(config, ["ffn_multiplier", "mlp_ratio", "moe_intermediate_scale"])
+    try:
+        hidden = float(model["hidden_size"])
+        if intermediate is not None and hidden:
+            intermediate_val = float(intermediate)
+            if intermediate_val > 0:
+                model["ffn_multiplier"] = intermediate_val / hidden
+        elif ratio_value is not None:
+            ratio_val = float(ratio_value)
+            if ratio_val > 0:
+                model["ffn_multiplier"] = ratio_val
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+
+    default_prompt = _first(config, ["max_position_embeddings", "max_sequence_length"]) or model["prompt_tokens"]
+    try:
+        model["prompt_tokens"] = int(default_prompt)
+    except (TypeError, ValueError):
+        pass
+
+    dtype = _first(config, ["torch_dtype", "dtype", "weight_dtype"])
+    if isinstance(dtype, str):
+        upper_dtype = dtype.upper()
+        if upper_dtype in DTYPE_BYTES:
+            model["weight_dtype"] = upper_dtype
+
+    activation_dtype = _first(config, ["activation_dtype", "activation_checkpoint_dtype"])
+    if isinstance(activation_dtype, str):
+        upper_dtype = activation_dtype.upper()
+        if upper_dtype in DTYPE_BYTES:
+            model["activation_dtype"] = upper_dtype
+
+    return model
+
+
+def _add_model_from_json(json_text: str, name_override: str | None = None) -> bool:
+    if not json_text.strip():
+        st.warning("请先粘贴模型的 JSON 配置内容。")
+        return False
+
+    try:
+        config = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        st.error(f"无法解析 JSON：{exc}")
+        return False
+
+    if not isinstance(config, Mapping):
+        st.error("JSON 顶层需要是对象（key-value）。")
+        return False
+
+    model_dict = _model_from_json_config(config, name_override=name_override)
+    models = _get_model_state()
+    models.append(model_dict)
+    return True
 
 
 def _dtype_bytes(dtype: str | None, fallback: int) -> int:
@@ -198,7 +304,32 @@ def _render_model_forms(models: List[Dict[str, object]], hardware: Mapping[str, 
     st.subheader("Model Configurations")
     st.caption("Adjust the parameters for each candidate model and compare the resulting performance estimates.")
 
-    st.button("Add model", on_click=_add_model_row, type="primary")
+    json_key = "model_json_input"
+    name_key = "model_json_name"
+    reset_flag = "model_json_reset"
+
+    if st.session_state.get(reset_flag):
+        st.session_state.pop(reset_flag, None)
+        st.session_state[json_key] = ""
+        st.session_state[name_key] = ""
+
+    st.session_state.setdefault(json_key, "")
+    st.session_state.setdefault(name_key, "")
+
+    st.markdown("#### 从 JSON 导入")
+    st.caption("从 Hugging Face 等来源粘贴模型配置 JSON，自动填充主要参数。")
+    st.text_area("模型 JSON", key=json_key, height=200)
+    st.text_input("模型名称 (可选)", key=name_key)
+
+    if st.button("添加模型", type="primary"):
+        json_text = st.session_state.get(json_key, "")
+        name_override = st.session_state.get(name_key) or None
+        if _add_model_from_json(json_text, name_override=name_override):
+            st.session_state[reset_flag] = True
+            _safe_rerun()
+
+    if not models:
+        st.info("当前没有模型，请先导入 JSON。")
 
     for idx, model in enumerate(models):
         with st.expander(model.get("name", f"Model {idx + 1}"), expanded=False):
@@ -266,7 +397,8 @@ def _render_summary(metrics: List[Dict[str, float]]) -> None:
 
     df = pd.DataFrame(metrics)
     st.subheader("Summary")
-    st.dataframe(df, use_container_width=True)
+    vertical_df = df.set_index("Model").T
+    st.dataframe(vertical_df, use_container_width=True)
 
     fig_perf = go.Figure()
     fig_perf.add_trace(
