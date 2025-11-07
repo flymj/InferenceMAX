@@ -306,6 +306,11 @@ def _render_model_forms(models: List[Dict[str, object]], hardware: Mapping[str, 
 
     json_key = "model_json_input"
     name_key = "model_json_name"
+    if st.session_state.get("_reset_model_form"):
+        st.session_state[json_key] = ""
+        st.session_state[name_key] = ""
+        st.session_state["_reset_model_form"] = False
+
     st.markdown("#### 从 JSON 导入")
     st.caption("从 Hugging Face 等来源粘贴模型配置 JSON，自动填充主要参数。")
     st.text_area("模型 JSON", key=json_key, height=200)
@@ -315,8 +320,7 @@ def _render_model_forms(models: List[Dict[str, object]], hardware: Mapping[str, 
         json_text = st.session_state.get(json_key, "")
         name_override = st.session_state.get(name_key) or None
         if _add_model_from_json(json_text, name_override=name_override):
-            st.session_state[json_key] = ""
-            st.session_state[name_key] = ""
+            st.session_state["_reset_model_form"] = True
             _safe_rerun()
 
     if not models:
