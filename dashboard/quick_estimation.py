@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .tab_registry import DashboardActions, DashboardState, register_tab
+from .app_context import DashboardActions, DashboardState, bootstrap
 
 
-@register_tab("quick_estimation", "Quick Estimation")
 def render(state: DashboardState, actions: DashboardActions) -> None:
     """Render the legacy quick estimation view."""
 
@@ -377,4 +376,13 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         ),
         use_container_width=True,
     )
+
+
+def main() -> None:
+    state, actions = bootstrap("Quick Estimation")
+    render(state, actions)
+
+
+if __name__ == "__main__":
+    main()
 

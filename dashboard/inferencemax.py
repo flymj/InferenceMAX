@@ -6,11 +6,10 @@ ensure_repo_root_on_path()
 
 import plotly.graph_objects as go
 
+from .app_context import DashboardActions, DashboardState, bootstrap
 from .page_common import HardwareSpec, WorkloadConfig, compute_estimate
-from .tab_registry import DashboardActions, DashboardState, register_tab
 
 
-@register_tab("inferencemax", "InferenceMax Overview")
 def render(state: DashboardState, actions: DashboardActions) -> None:
     st = state.st
     session_state = state.session_state
@@ -145,6 +144,15 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         height=420,
     )
     st.plotly_chart(fig, use_container_width=True)
+
+
+def main() -> None:
+    state, actions = bootstrap("InferenceMax Overview")
+    render(state, actions)
+
+
+if __name__ == "__main__":
+    main()
 
     st.subheader("Aggregated view")
     metrics = breakdown.aggregate

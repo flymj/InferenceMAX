@@ -6,10 +6,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from .tab_registry import DashboardActions, DashboardState, register_tab
+from .app_context import DashboardActions, DashboardState, bootstrap
 
 
-@register_tab("host_bandwidth", "Host Bandwidth Planner")
 def render(state: DashboardState, actions: DashboardActions) -> None:
     st = state.st
     session_state = state.session_state
@@ -314,4 +313,13 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     st.caption(
         "注：以上以 Host 路径为基线（GPU→CPU→GPU），若采用 NVLink P2P/GPUDirect Storage，可将 PCIe/DDR 压力替换为相应通道的有效值进行评估。"
     )
+
+
+def main() -> None:
+    state, actions = bootstrap("Host Bandwidth Planner")
+    render(state, actions)
+
+
+if __name__ == "__main__":
+    main()
 

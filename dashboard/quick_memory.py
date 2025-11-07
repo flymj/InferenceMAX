@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from services.llm_calcs import kv_capacity_tokens_per_gpu, weights_bytes_per_gpu
 
-from .tab_registry import DashboardActions, DashboardState, register_tab
+from .app_context import DashboardActions, DashboardState, bootstrap
 
 
-@register_tab("quick_memory", "Quick per-GPU memory & KV capacity")
 def render(state: DashboardState, actions: DashboardActions) -> None:
     st = state.st
     session_state = state.session_state
@@ -72,4 +71,13 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         f"- **KV capacity / GPU (tokens)**: **{kv_cap_tokens:,}** "
         f"(dtype={kv_dtype_b}B, HBM={hbm_cap_gb}GB, reserve={hbm_reserve * 100:.0f}%)"
     )
+
+
+def main() -> None:
+    state, actions = bootstrap("Quick per-GPU memory & KV capacity")
+    render(state, actions)
+
+
+if __name__ == "__main__":
+    main()
 

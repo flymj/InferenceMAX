@@ -9,11 +9,10 @@ from typing import List
 import pandas as pd
 import plotly.graph_objects as go
 
+from .app_context import DashboardActions, DashboardState, bootstrap
 from .page_common import HardwareSpec, WorkloadConfig, compute_estimate
-from .tab_registry import DashboardActions, DashboardState, register_tab
 
 
-@register_tab("inferencemax_v2", "InferenceMax v2")
 def render(state: DashboardState, actions: DashboardActions) -> None:
     st = state.st
     session_state = state.session_state
@@ -189,3 +188,12 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         height=480,
     )
     st.plotly_chart(fig, use_container_width=True)
+
+
+def main() -> None:
+    state, actions = bootstrap("InferenceMax v2")
+    render(state, actions)
+
+
+if __name__ == "__main__":
+    main()

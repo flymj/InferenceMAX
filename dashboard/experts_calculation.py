@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from .tab_registry import DashboardActions, DashboardState, register_tab
+from .app_context import DashboardActions, DashboardState, bootstrap
 
 
-@register_tab("experts_calculation", "Experts Calcuation")
 def render(state: DashboardState, actions: DashboardActions) -> None:
     st = state.st
     session_state = state.session_state
@@ -114,4 +113,13 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         f"- 需要时间（单卡）：**{time_needed_s * 1000.0:.1f} ms**  "
         f"(= K × bytes_per_expert / min(PCIe, DDR))"
     )
+
+
+def main() -> None:
+    state, actions = bootstrap("Experts Calcuation")
+    render(state, actions)
+
+
+if __name__ == "__main__":
+    main()
 
