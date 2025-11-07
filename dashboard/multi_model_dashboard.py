@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
-import json
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 import sys
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -19,7 +20,15 @@ if str(_REPO_ROOT) not in sys.path:
 
 from dashboard.components.header import render_header
 from dashboard.components.sidebar import render_sidebar
-from dashboard.features.hardware import ChipSpec, flops_to_time_ms
+from dashboard.features import ChunkedPrefill, KvCacheTraffic
+from dashboard.models import build_model
+from services.llm_calcs import (
+    ModelProfile,
+    concurrency_adjusted_times,
+    effective_compute_tflops,
+    prefill_decode_time_breakdown,
+    weights_bytes_per_gpu,
+)
 
 
 @dataclass
@@ -38,9 +47,10 @@ class ModelConfig:
     tensor_parallel: int | None = None
     weight_dtype: str | None = None
     activation_dtype: str = "FP16"
+    raw_config: Mapping[str, Any] | None = None
 
     def as_dict(self) -> Dict[str, object]:
-        return {
+        data: Dict[str, object] = {
             "name": self.name,
             "params_b": self.params_b,
             "num_layers": self.num_layers,
@@ -54,6 +64,9 @@ class ModelConfig:
             "weight_dtype": self.weight_dtype,
             "activation_dtype": self.activation_dtype,
         }
+        if self.raw_config is not None:
+            data["raw_config"] = dict(self.raw_config)
+        return data
 
 
 DTYPE_BYTES = {
@@ -93,6 +106,7 @@ def _first(config: Mapping[str, Any], keys: List[str], default: Any = None) -> A
 
 def _model_from_json_config(config: Mapping[str, Any], name_override: str | None = None) -> Dict[str, object]:
     model = ModelConfig().as_dict()
+    model["raw_config"] = dict(config)
 
     name = name_override or _first(
         config,
@@ -216,88 +230,285 @@ def _add_model_from_json(json_text: str, name_override: str | None = None) -> bo
     return True
 
 
-def _dtype_bytes(dtype: str | None, fallback: int) -> int:
+def _dtype_bytes(dtype: Optional[str], fallback: int) -> int:
     if dtype and dtype in DTYPE_BYTES:
         return DTYPE_BYTES[dtype]
     return fallback
 
 
-def _kv_cache_bytes_per_token(model: Mapping[str, object], dtype_bytes: int) -> float:
-    heads = max(1, int(model["attention_heads"]))
-    hidden = max(1, int(model["hidden_size"]))
-    layers = max(1, int(model["num_layers"]))
-    return float(layers * heads * hidden * dtype_bytes * 2)
+@dataclass(frozen=True)
+class WorkloadSettings:
+    """Global workload assumptions shared across model comparisons."""
+
+    baseline_concurrency: float
+    max_concurrency: float
+    curve_points: int
+    chunked_prefill: ChunkedPrefill
+    kv_cache_hit: float
+    base_hbm_efficiency: float
+    alpha: float
 
 
-def _estimate_decode_flops_per_token(model: Mapping[str, object]) -> float:
-    layers = max(1, int(model["num_layers"]))
-    hidden = max(1, int(model["hidden_size"]))
-    multiplier = max(1.0, float(model["ffn_multiplier"]))
-    attn = 4.0 * hidden * hidden
-    ffn = 2.0 * hidden * hidden * multiplier
-    return layers * (attn + ffn)
+def _render_workload_controls() -> WorkloadSettings:
+    st.subheader("Workload & Scheduling")
+    col0, col1, col2 = st.columns(3)
+    baseline_conc = float(col0.number_input("Baseline concurrency / GPU", min_value=1, max_value=4096, value=16))
+    curve_max_default = max(int(baseline_conc * 4), int(baseline_conc))
+    max_conc = float(
+        col1.number_input(
+            "Max concurrency for curve",
+            min_value=1,
+            max_value=8192,
+            value=min(8192, curve_max_default),
+        )
+    )
+    if max_conc < baseline_conc:
+        max_conc = baseline_conc
+    curve_points = int(col2.slider("Curve resolution", min_value=5, max_value=100, value=30, step=1))
+
+    col3, col4, col5 = st.columns(3)
+    chunked_prefill_intensity = float(col3.slider("Chunked prefill intensity", 0.0, 1.0, 0.5, 0.05))
+    decode_priority = float(col4.slider("Decode priority", 0.0, 1.0, 0.7, 0.05))
+    kv_cache_hit = float(col5.slider("KV cache hit rate", 0.0, 1.0, 0.9, 0.05))
+
+    col6, col7 = st.columns(2)
+    base_hbm_eff = float(col6.slider("Base HBM efficiency", 0.1, 1.0, 0.6, 0.05))
+    alpha = float(col7.slider("Concurrency smoothing α", 1.0, 3.0, 1.7, 0.1))
+
+    return WorkloadSettings(
+        baseline_concurrency=baseline_conc,
+        max_concurrency=max_conc,
+        curve_points=curve_points,
+        chunked_prefill=ChunkedPrefill(chunked_prefill_intensity, decode_priority),
+        kv_cache_hit=kv_cache_hit,
+        base_hbm_efficiency=base_hbm_eff,
+        alpha=alpha,
+    )
 
 
-def _estimate_prefill_flops(model: Mapping[str, object]) -> float:
-    decode = _estimate_decode_flops_per_token(model)
-    prompt_tokens = max(1, int(model["prompt_tokens"]))
-    batch = max(1, int(model["prompt_batch_size"]))
-    return decode * prompt_tokens * batch
+def _merge_model_config(model: Mapping[str, Any]) -> Dict[str, Any]:
+    """Combine UI overrides with the original JSON configuration."""
+
+    cfg: Dict[str, Any] = dict(model.get("raw_config") or {})
+    cfg.setdefault("model_type", str(cfg.get("model_type") or "llama"))
+    cfg["hidden_size"] = int(model.get("hidden_size") or cfg.get("hidden_size") or 0)
+    cfg["num_hidden_layers"] = int(model.get("num_layers") or cfg.get("num_hidden_layers") or 0)
+    cfg["num_attention_heads"] = int(model.get("attention_heads") or cfg.get("num_attention_heads") or 0)
+    cfg.setdefault("num_key_value_heads", int(cfg.get("num_key_value_heads") or cfg["num_attention_heads"]))
+
+    intermediate = cfg.get("intermediate_size")
+    if not intermediate:
+        hidden = cfg["hidden_size"]
+        multiplier = float(model.get("ffn_multiplier") or cfg.get("ffn_multiplier") or 0.0)
+        if multiplier <= 0 and hidden > 0:
+            multiplier = 4.0
+        cfg["intermediate_size"] = int(max(hidden, 1) * max(multiplier, 1.0))
+    cfg.setdefault("vocab_size", int(cfg.get("vocab_size") or 32000))
+    return cfg
 
 
-def _model_metrics(model: Mapping[str, object], hardware: Mapping[str, object]) -> Dict[str, float]:
-    params_b = max(0.0, float(model.get("params_b", 0.0)))
-    params = params_b * 1e9
-    tensor_parallel = int(model.get("tensor_parallel") or hardware["tensor_parallel"])
-    weight_dtype = model.get("weight_dtype") or hardware["default_weight_dtype"]
+def _infer_ep_group(cfg: Mapping[str, Any], tensor_parallel: int, data_parallel: int) -> int:
+    """Best-effort inference of the expert-parallel group size for MoE models."""
+
+    for key in ("expert_parallel_size", "ep_size", "moe_ep_size", "ep_group_size", "ep_world_size"):
+        value = cfg.get(key)
+        if value:
+            try:
+                return max(1, int(value))
+            except (TypeError, ValueError):
+                continue
+    if cfg.get("num_experts") or cfg.get("n_routed_experts"):
+        return max(1, tensor_parallel * data_parallel)
+    return max(1, tensor_parallel)
+
+
+def _build_profile(
+    model_entry: Mapping[str, Any],
+    hardware: Mapping[str, Any],
+    workload: WorkloadSettings,
+) -> Tuple[Optional[ModelProfile], Dict[str, Any], Dict[str, Any]]:
+    cfg = _merge_model_config(model_entry)
+    try:
+        model_obj = build_model(cfg)
+    except Exception as exc:  # pragma: no cover - defensive against malformed configs
+        st.warning(f"无法构建模型 {model_entry.get('name')}: {exc}")
+        return None, cfg, {}
+
+    tensor_parallel = int(model_entry.get("tensor_parallel") or hardware["tensor_parallel"])
+    data_parallel = int(hardware.get("data_parallel", 1))
+
+    weight_dtype = str(model_entry.get("weight_dtype") or hardware["default_weight_dtype"])
+    activation_dtype = str(model_entry.get("activation_dtype") or "FP16")
     weight_bytes = _dtype_bytes(weight_dtype, hardware["default_weight_bytes"])
-    activation_bytes = _dtype_bytes(model.get("activation_dtype"), 2)
+    kv_bytes = _dtype_bytes(activation_dtype, 2)
 
-    weights_total_bytes = params * weight_bytes
-    weights_per_gpu = weights_total_bytes / max(1, tensor_parallel)
+    prompt_tokens = max(1, int(model_entry.get("prompt_tokens") or 1))
+    generation_tokens = max(1, int(model_entry.get("generation_tokens") or 1))
+    prompt_batch = max(1, int(model_entry.get("prompt_batch_size") or 1))
+    kv_len_decode = prompt_tokens + generation_tokens
 
-    kv_per_token_bytes = _kv_cache_bytes_per_token(model, activation_bytes)
-    prompt_tokens = max(1, int(model["prompt_tokens"]))
-    generation_tokens = max(1, int(model.get("generation_tokens", 1)))
-    prompt_batch = max(1, int(model["prompt_batch_size"]))
-    kv_tokens_total = prompt_tokens + generation_tokens
-    kv_cache_total = kv_per_token_bytes * kv_tokens_total * prompt_batch
-    kv_cache_per_gpu = kv_cache_total / max(1, tensor_parallel)
+    profile = ModelProfile(
+        model_obj,
+        weight_dtype_bytes=weight_bytes,
+        kv_dtype_bytes=kv_bytes,
+        seq_len_in=prompt_tokens,
+        kv_len_in=kv_len_decode,
+        include_scores=True,
+        top_k=None,
+    )
 
-    hbm_total_per_gpu = (weights_per_gpu + kv_cache_per_gpu) / (1024**3)
-    weights_per_gpu_gb = weights_per_gpu / (1024**3)
-    kv_cache_per_gpu_gb = kv_cache_per_gpu / (1024**3)
-    hbm_headroom = hardware["hbm_per_gpu_gb"] - hbm_total_per_gpu
+    weights_per_gpu_bytes = weights_bytes_per_gpu(
+        model_obj,
+        tp=tensor_parallel,
+        ep_group=_infer_ep_group(cfg, tensor_parallel, data_parallel),
+        weight_dtype_bytes=weight_bytes,
+    )
 
-    chip: ChipSpec = hardware["chip_spec"]
-    decode_flops_per_token = _estimate_decode_flops_per_token(model)
-    prefill_flops_total = _estimate_prefill_flops(model)
+    kv_traffic = KvCacheTraffic(profile)
+    memory = kv_traffic.estimate(
+        input_tokens=prompt_tokens * prompt_batch,
+        kv_len_decode=kv_len_decode,
+        kv_cache_hit=workload.kv_cache_hit,
+        tp=tensor_parallel,
+    )
 
-    decode_time_ms = flops_to_time_ms(decode_flops_per_token, chip) / max(1, int(hardware["num_gpus"]))
-    prefill_time_ms = flops_to_time_ms(prefill_flops_total, chip) / max(1, int(hardware["num_gpus"]))
-    decode_tokens_per_s = 1000.0 / max(1e-6, decode_time_ms)
-    prefill_batches_per_s = 1000.0 / max(1e-6, prefill_time_ms)
-    prefill_seqs_per_s = prefill_batches_per_s * prompt_batch
-
-    kv_bandwidth_gbs = (kv_per_token_bytes / max(1, tensor_parallel) * decode_tokens_per_s) / (1024**3)
-
-    return {
-        "Model": str(model["name"]),
-        "Params (B)": params_b,
-        "Weights / GPU (GB)": weights_per_gpu_gb,
-        "KV Cache / GPU (GB)": kv_cache_per_gpu_gb,
-        "Total HBM / GPU (GB)": hbm_total_per_gpu,
-        "HBM Headroom (GB)": hbm_headroom,
-        "Prefill FLOPs (T)": prefill_flops_total / 1e12,
-        "Prefill seq/s": prefill_seqs_per_s,
-        "Decode FLOPs/token (G)": decode_flops_per_token / 1e9,
-        "Decode tokens/s": decode_tokens_per_s,
-        "Decode time/token (ms)": decode_time_ms,
-        "KV BW demand (GB/s)": kv_bandwidth_gbs,
-        "Weight dtype": weight_dtype,
-        "Activation dtype": str(model.get("activation_dtype")),
-        "Tensor parallel": float(tensor_parallel),
+    extras = {
+        "weights_per_gpu_bytes": weights_per_gpu_bytes,
+        "weight_dtype": weight_dtype,
+        "activation_dtype": activation_dtype,
+        "prompt_tokens": prompt_tokens,
+        "generation_tokens": generation_tokens,
+        "prompt_batch": prompt_batch,
+        "tensor_parallel": tensor_parallel,
+        "data_parallel": data_parallel,
+        "memory": memory,
     }
+
+    return profile, cfg, extras
+
+
+def _concurrency_curve(
+    times,
+    generation_tokens: int,
+    workload: WorkloadSettings,
+) -> pd.DataFrame:
+    values = np.linspace(1.0, workload.max_concurrency, workload.curve_points)
+    values = np.unique(np.maximum(1, values.astype(int)))
+    if workload.baseline_concurrency not in values:
+        values = np.unique(np.append(values, int(workload.baseline_concurrency)))
+    if len(values) == 0:
+        values = np.array([1], dtype=int)
+
+    rows: List[Dict[str, float]] = []
+    for conc in values:
+        adj = concurrency_adjusted_times(times=times, concurrency=float(conc), alpha=float(workload.alpha))
+        seq_time_ms = adj.ttft_eff_ms + generation_tokens * adj.tpot_eff_ms
+        if seq_time_ms <= 0:
+            seq_per_s = 0.0
+        else:
+            seq_per_s = float(conc) / (seq_time_ms / 1000.0)
+        tokens_per_s = seq_per_s * generation_tokens
+        rows.append(
+            {
+                "concurrency": float(conc),
+                "seq_per_s": seq_per_s,
+                "tokens_per_s": tokens_per_s,
+                "ttft_ms": adj.ttft_eff_ms,
+                "tpot_ms": adj.tpot_eff_ms,
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("concurrency")
+
+
+def _model_metrics(
+    model: Mapping[str, Any],
+    hardware: Mapping[str, Any],
+    workload: WorkloadSettings,
+) -> Tuple[Optional[Dict[str, Any]], Optional[pd.DataFrame]]:
+    profile, cfg, extras = _build_profile(model, hardware, workload)
+    if profile is None:
+        return None, None
+
+    memory = extras["memory"]
+    tensor_parallel = extras["tensor_parallel"]
+    data_parallel = extras["data_parallel"]
+    prompt_tokens = extras["prompt_tokens"]
+    generation_tokens = extras["generation_tokens"]
+    prompt_batch = extras["prompt_batch"]
+    weight_dtype = extras["weight_dtype"]
+    activation_dtype = extras["activation_dtype"]
+    weights_per_gpu_bytes = extras["weights_per_gpu_bytes"]
+
+    chip = hardware["chip_spec"]
+    eff_tflops = effective_compute_tflops(chip.tflops, chip.mfu)
+    hbm_eff = workload.chunked_prefill.adjust_hbm_efficiency(workload.base_hbm_efficiency)
+
+    flops_prefill = float(profile.prefill_totals.get("total", 0.0))
+    flops_decode = float(profile.decode_totals.get("total", 0.0))
+
+    times = prefill_decode_time_breakdown(
+        flops_prefill=flops_prefill,
+        flops_decode=flops_decode,
+        effective_tflops=eff_tflops,
+        memory=memory,
+        hbm_bw_GBs=float(chip.hbm_bw_GBs),
+        hbm_eff=float(hbm_eff),
+    )
+
+    curve = _concurrency_curve(times, generation_tokens, workload)
+    baseline_conc = float(workload.baseline_concurrency)
+    baseline_row = curve.loc[(curve["concurrency"] - baseline_conc).abs().idxmin()]
+    baseline_tokens_per_s = float(baseline_row["tokens_per_s"])
+    baseline_seq_per_s = float(baseline_row["seq_per_s"])
+
+    kv_state_tokens = (prompt_tokens + generation_tokens) * max(1, int(math.ceil(baseline_conc)))
+    kv_state_bytes = profile.kv_write_bytes(tokens=int(kv_state_tokens), tp=tensor_parallel)
+    steady_hbm_bytes = weights_per_gpu_bytes + kv_state_bytes
+
+    prefill_hbm_gb = memory.prefill_total_bytes / 1e9
+    decode_hbm_gb = memory.decode_total_bytes / 1e9
+    steady_hbm_gb = steady_hbm_bytes / 1e9
+    headroom_gb = hardware["hbm_per_gpu_gb"] - steady_hbm_gb
+
+    decode_flops_per_token = flops_decode
+    kv_decode_bytes_per_token = profile.kv_decode_bytes(tp=tensor_parallel, kv_len=prompt_tokens + generation_tokens)
+    kv_bw_gbs = (baseline_tokens_per_s * kv_decode_bytes_per_token) / 1e9 if baseline_tokens_per_s > 0 else 0.0
+
+    params_total = profile.weights_total_bytes / max(1, _dtype_bytes(weight_dtype, hardware["default_weight_bytes"]))
+    params_b = params_total / 1e9
+
+    record = {
+        "Model": str(model.get("name", "Model")),
+        "Params (B)": params_b,
+        "Weights / GPU (GB)": weights_per_gpu_bytes / 1e9,
+        "Activation / GPU (GB)": memory.activation_bytes / 1e9,
+        "KV Prefill / GPU (GB)": memory.kv_prefill_bytes / 1e9,
+        "KV Decode / GPU (GB)": memory.kv_decode_bytes / 1e9,
+        "Prefill HBM / GPU (GB)": prefill_hbm_gb,
+        "Decode HBM / GPU (GB)": decode_hbm_gb,
+        "Steady KV state / GPU (GB)": kv_state_bytes / 1e9,
+        "Total Steady HBM / GPU (GB)": steady_hbm_gb,
+        "HBM Headroom (GB)": headroom_gb,
+        "HBM Capacity (GB)": hardware["hbm_per_gpu_gb"],
+        "Prefill FLOPs (T)": flops_prefill / 1e12,
+        "Decode FLOPs/token (G)": decode_flops_per_token / 1e9,
+        "TTFT (ms)": times.ttft_theory_ms,
+        "TTFT adj (ms)": baseline_row["ttft_ms"],
+        "TPOT (ms/token)": times.tpot_theory_ms,
+        "TPOT adj (ms/token)": baseline_row["tpot_ms"],
+        "Seq/s per GPU @ baseline": baseline_seq_per_s,
+        "Tokens/s per GPU @ baseline": baseline_tokens_per_s,
+        "KV BW @ baseline (GB/s)": kv_bw_gbs,
+        "Baseline concurrency": baseline_conc,
+        "Tensor parallel": float(tensor_parallel),
+        "Data parallel": float(data_parallel),
+        "Total GPUs": float(hardware.get("num_gpus", tensor_parallel * data_parallel)),
+        "Weight dtype": weight_dtype,
+        "Activation dtype": activation_dtype,
+    }
+
+    return record, curve
 
 
 def _render_model_forms(models: List[Dict[str, object]], hardware: Mapping[str, object]) -> None:
@@ -385,87 +596,112 @@ def _render_model_forms(models: List[Dict[str, object]], hardware: Mapping[str, 
             st.button("Remove", key=f"remove_{idx}", on_click=_remove_model_row, args=(idx,))
 
 
-def _render_summary(metrics: List[Dict[str, float]]) -> None:
-    if not metrics:
+def _render_summary(
+    records: List[Dict[str, Any]],
+    curves: List[Tuple[str, pd.DataFrame]],
+    workload: WorkloadSettings,
+) -> None:
+    if not records:
         st.info("Add at least one model to see the comparison summary.")
         return
 
-    df = pd.DataFrame(metrics)
     st.subheader("Summary")
-    vertical_df = df.set_index("Model").T
-    st.dataframe(vertical_df, use_container_width=True)
+    df = pd.DataFrame(records)
+    cols = [
+        "Model",
+        "Params (B)",
+        "Weights / GPU (GB)",
+        "Steady KV state / GPU (GB)",
+        "Total Steady HBM / GPU (GB)",
+        "HBM Headroom (GB)",
+        "Seq/s per GPU @ baseline",
+        "Tokens/s per GPU @ baseline",
+        "KV BW @ baseline (GB/s)",
+        "TTFT adj (ms)",
+        "TPOT adj (ms/token)",
+        "Baseline concurrency",
+        "Tensor parallel",
+        "Data parallel",
+        "Weight dtype",
+        "Activation dtype",
+    ]
+    available_cols = [c for c in cols if c in df.columns]
+    st.dataframe(df[available_cols], use_container_width=True)
 
-    fig_perf = go.Figure()
-    fig_perf.add_trace(
-        go.Bar(
-            x=df["Model"],
-            y=df["Decode tokens/s"],
-            name="Decode tokens/s",
-            marker_color="#636EFA",
-        )
+    st.caption(
+        "Baseline concurrency per GPU: "
+        f"{workload.baseline_concurrency:.0f}; curve spans up to {workload.max_concurrency:.0f}."
     )
-    fig_perf.add_trace(
-        go.Bar(
-            x=df["Model"],
-            y=df["Prefill seq/s"],
-            name="Prefill seq/s",
-            marker_color="#EF553B",
-        )
-    )
-    fig_perf.update_layout(barmode="group", title="Throughput Comparison", yaxis_title="Sequences / Tokens per second")
-    st.plotly_chart(fig_perf, use_container_width=True)
 
-    fig_memory = go.Figure()
-    fig_memory.add_trace(
-        go.Bar(
-            x=df["Model"],
-            y=df["Weights / GPU (GB)"],
-            name="Weights",
-            marker_color="#00CC96",
-        )
-    )
-    fig_memory.add_trace(
-        go.Bar(
-            x=df["Model"],
-            y=df["KV Cache / GPU (GB)"],
-            name="KV Cache",
-            marker_color="#AB63FA",
-        )
-    )
-    fig_memory.update_layout(barmode="stack", title="HBM Footprint per GPU", yaxis_title="GB")
-    st.plotly_chart(fig_memory, use_container_width=True)
-
-    fig_scatter = go.Figure(
-        data=[
-            go.Scatter(
-                x=df["Decode tokens/s"],
-                y=df["Total HBM / GPU (GB)"],
-                mode="markers+text",
-                text=df["Model"],
-                textposition="top center",
+    if curves:
+        fig = go.Figure()
+        for name, curve in curves:
+            if curve.empty:
+                continue
+            custom = np.stack([curve["seq_per_s"].to_numpy()], axis=-1)
+            fig.add_trace(
+                go.Scatter(
+                    x=curve["concurrency"],
+                    y=curve["tokens_per_s"],
+                    mode="lines",
+                    name=name,
+                    customdata=custom,
+                    hovertemplate=(
+                        "Concurrency=%{x:.0f}<br>Tokens/s=%{y:.2f}<br>Seq/s=%{customdata[0]:.2f}" "<extra>%{fullData.name}</extra>"
+                    ),
+                )
             )
-        ]
+        fig.update_layout(
+            title="Throughput per GPU vs Concurrency",
+            xaxis_title="Concurrency per GPU",
+            yaxis_title="Tokens per second per GPU",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    fig_hbm = go.Figure()
+    for record in records:
+        fig_hbm.add_trace(
+            go.Scatter(
+                x=[record.get("Tokens/s per GPU @ baseline", 0.0)],
+                y=[record.get("Total Steady HBM / GPU (GB)", 0.0)],
+                mode="markers+text",
+                text=[record.get("Model", "Model")],
+                textposition="top center",
+                name=str(record.get("Model", "Model")),
+            )
+        )
+    fig_hbm.update_layout(
+        title="Steady-state HBM vs Throughput", xaxis_title="Tokens/s per GPU", yaxis_title="Steady HBM / GPU (GB)"
     )
-    fig_scatter.update_layout(title="HBM vs Decode Throughput", xaxis_title="Decode tokens/s", yaxis_title="Total HBM / GPU (GB)")
-    st.plotly_chart(fig_scatter, use_container_width=True)
+    st.plotly_chart(fig_hbm, use_container_width=True)
 
 
 def main() -> None:
     st.set_page_config(page_title="Model Comparison Dashboard", layout="wide")
     hardware = render_sidebar()
 
+    workload = _render_workload_controls()
+
     hardware_summary = {
         "Effective TFLOPs": (hardware["chip_spec"].effective_tflops * hardware["num_gpus"] / 1e12, " T"),
         "HBM per GPU": (hardware["hbm_per_gpu_gb"], " GB"),
         "Tensor parallel": (float(hardware["tensor_parallel"]), "x"),
+        "Data parallel": (float(hardware.get("data_parallel", 1)), "x"),
     }
     render_header(hardware_summary)
 
     models = _get_model_state()
     _render_model_forms(models, hardware)
 
-    metrics = [_model_metrics(model, hardware) for model in models]
-    _render_summary(metrics)
+    records: List[Dict[str, Any]] = []
+    curves: List[Tuple[str, pd.DataFrame]] = []
+    for model in models:
+        record, curve = _model_metrics(model, hardware, workload)
+        if record:
+            records.append(record)
+            if curve is not None:
+                curves.append((record["Model"], curve))
+    _render_summary(records, curves, workload)
 
 
 if __name__ == "__main__":
