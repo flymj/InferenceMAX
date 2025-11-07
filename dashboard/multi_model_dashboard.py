@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
-
 import json
 import sys
 
@@ -306,16 +306,6 @@ def _render_model_forms(models: List[Dict[str, object]], hardware: Mapping[str, 
 
     json_key = "model_json_input"
     name_key = "model_json_name"
-    reset_flag = "model_json_reset"
-
-    if st.session_state.get(reset_flag):
-        st.session_state.pop(reset_flag, None)
-        st.session_state[json_key] = ""
-        st.session_state[name_key] = ""
-
-    st.session_state.setdefault(json_key, "")
-    st.session_state.setdefault(name_key, "")
-
     st.markdown("#### 从 JSON 导入")
     st.caption("从 Hugging Face 等来源粘贴模型配置 JSON，自动填充主要参数。")
     st.text_area("模型 JSON", key=json_key, height=200)
@@ -325,7 +315,8 @@ def _render_model_forms(models: List[Dict[str, object]], hardware: Mapping[str, 
         json_text = st.session_state.get(json_key, "")
         name_override = st.session_state.get(name_key) or None
         if _add_model_from_json(json_text, name_override=name_override):
-            st.session_state[reset_flag] = True
+            st.session_state[json_key] = ""
+            st.session_state[name_key] = ""
             _safe_rerun()
 
     if not models:
