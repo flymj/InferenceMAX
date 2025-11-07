@@ -28,6 +28,7 @@ from services.llm_calcs import (
     ModelProfile,
     concurrency_adjusted_times,
     effective_compute_tflops,
+    kv_cache_memory_traffic,
     prefill_decode_time_breakdown,
 )
 
@@ -51,6 +52,17 @@ class _SearchConfig:
     spec_speedup: float
     causal_mask: bool
     attn_impl: str
+
+
+@dataclass(frozen=True)
+class _ConcurrencySummary:
+    """Helper container for UI-friendly concurrency metrics."""
+
+    ttft_ms: float
+    tpot_ms: float
+    throughput_tps: float
+    n_eq: float
+    overlap_effective: float
 
 
 def render(state: DashboardState, actions: DashboardActions) -> None:
@@ -211,19 +223,56 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     st.dataframe(df, use_container_width=True)
 
     st.subheader("算力/带宽 利用率")
-    conc_times = concurrency_adjusted_times(
-        df,
-        concurrency=search_cfg.concurrency,
-        alpha=search_cfg.alpha_conc,
-        spec_speedup=search_cfg.spec_speedup,
+    best_idx = None
+    if "throughput_seq_per_s" in df.columns and not df["throughput_seq_per_s"].isna().all():
+        best_idx = df["throughput_seq_per_s"].astype(float).idxmax()
+    elif "TTFT_ms" in df.columns:
+        best_idx = df["TTFT_ms"].astype(float).idxmin()
+    if best_idx is None:
+        best_row = df.iloc[0]
+    else:
+        best_row = df.loc[best_idx]
+
+    tp_eff = int(best_row.get("TP", 1))
+
+    memory = kv_cache_memory_traffic(
+        profile,
+        input_tokens=int(search_cfg.avg_input),
+        kv_len_decode=int(search_cfg.seq_len_kv),
+        kv_cache_hit=float(search_cfg.kv_cache_hit),
+        tp=int(tp_eff),
     )
 
-    eff_compute = effective_compute_tflops(
-        tflops=float(tflops),
-        mfu=float(mfu),
-        concurrency=search_cfg.concurrency,
-        alpha=search_cfg.alpha_conc,
-        spec_speedup=search_cfg.spec_speedup,
+    eff_compute = effective_compute_tflops(float(tflops), float(mfu))
+    hbm_eff_adj = search_cfg.chunked_prefill.adjust_hbm_efficiency(float(hbm_eff))
+
+    times = prefill_decode_time_breakdown(
+        flops_prefill=float(profile.prefill_totals.get("total", 0.0)),
+        flops_decode=float(profile.decode_totals.get("total", 0.0)),
+        effective_tflops=float(eff_compute),
+        memory=memory,
+        hbm_bw_GBs=float(hbm_bw),
+        hbm_eff=float(hbm_eff_adj),
+    )
+
+    conc_adjusted = concurrency_adjusted_times(
+        times,
+        concurrency=float(search_cfg.concurrency),
+        alpha=float(search_cfg.alpha_conc),
+    )
+
+    spec_speedup = max(1.0, float(search_cfg.spec_speedup))
+    tpot_spec_ms = float(conc_adjusted.tpot_eff_ms) / spec_speedup
+    throughput_tps = (
+        float(search_cfg.concurrency) * 1000.0 / tpot_spec_ms if tpot_spec_ms > 0 else 0.0
+    )
+
+    conc_times = _ConcurrencySummary(
+        ttft_ms=float(conc_adjusted.ttft_eff_ms),
+        tpot_ms=tpot_spec_ms,
+        throughput_tps=throughput_tps,
+        n_eq=float(conc_adjusted.n_eq),
+        overlap_effective=float(conc_adjusted.overlap_effective),
     )
 
     c19, c20 = st.columns(2)
@@ -239,7 +288,16 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     st.plotly_chart(fig_tpot, use_container_width=True)
 
     st.subheader("Prefill/Decode Breakdown")
-    breakdown_df = prefill_decode_time_breakdown(df, comp_df, search_cfg.avg_input, search_cfg.avg_output)
+    breakdown_df = pd.DataFrame(
+        {
+            "Stage": ["Prefill", "Decode"],
+            "Compute (ms)": [times.t_comp_prefill_ms, times.t_comp_decode_ms],
+            "HBM (ms)": [times.t_hbm_prefill_ms, times.t_hbm_decode_ms],
+            "Theoretical (ms)": [times.ttft_theory_ms, times.tpot_theory_ms],
+            "After concurrency (ms)": [conc_adjusted.ttft_eff_ms, conc_adjusted.tpot_eff_ms],
+            "After speculative (ms)": [conc_times.ttft_ms, conc_times.tpot_ms],
+        }
+    )
     st.dataframe(breakdown_df, use_container_width=True)
 
     st.subheader("KV Cache Traffic")
