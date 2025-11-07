@@ -42,8 +42,9 @@ def render_sidebar() -> Dict[str, object]:
             mfu = st.slider("Target MFU", min_value=0.1, max_value=0.95, value=float(preset.mfu), step=0.01)
             net_bw = st.number_input("Network Bandwidth (GB/s)", value=float(preset.net_bw_GBs), min_value=10.0)
 
-        num_gpus = int(st.number_input("GPU Count", min_value=1, value=8))
+        num_gpus = int(st.number_input("Total GPU Count", min_value=1, value=8))
         tensor_parallel = int(st.number_input("Tensor Parallelism", min_value=1, value=1))
+        data_parallel = int(st.number_input("Data Parallelism", min_value=1, value=1))
         hbm_capacity = st.number_input("HBM per GPU (GB)", min_value=10.0, value=80.0)
         dtype = st.selectbox("Default Model Weight DType", list(_DTYPE_BYTES.keys()), index=1)
 
@@ -59,6 +60,7 @@ def render_sidebar() -> Dict[str, object]:
         "chip_spec": chip,
         "num_gpus": num_gpus,
         "tensor_parallel": tensor_parallel,
+        "data_parallel": data_parallel,
         "hbm_per_gpu_gb": hbm_capacity,
         "default_weight_dtype": dtype,
         "default_weight_bytes": _DTYPE_BYTES[dtype],
