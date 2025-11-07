@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+if __package__ is None or __package__ == "":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from dashboard._paths import ensure_repo_root_on_path
+
+ensure_repo_root_on_path()
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
