@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+if __package__ is None or __package__ == "":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from dashboard._paths import ensure_repo_root_on_path
+
+ensure_repo_root_on_path()
+
 import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
-import sys
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 from dashboard.components.header import render_header
 from dashboard.components.sidebar import render_sidebar
