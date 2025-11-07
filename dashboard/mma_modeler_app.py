@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Dict, List
 
 import numpy as np
@@ -13,16 +14,16 @@ import streamlit as st
 EPSILON = 1e-9
 
 
-def compute_bandwidth(bytes_amount: float, t_comp: float) -> float:
-    """Convert a byte count and compute time into bandwidth in GB/s."""
+def compute_bytes_per_cycle(bytes_amount: float, cycles: float) -> float:
+    """Return the average bytes-per-cycle requirement for a transfer."""
 
-    if t_comp <= EPSILON:
+    if cycles <= EPSILON:
         return 0.0
-    return (bytes_amount / t_comp) / 1e9
+    return bytes_amount / cycles
 
 
 def calc_tile_metrics(params: Dict[str, float]) -> Dict[str, object]:
-    """Compute tile metrics for MMA/GMMA kernels."""
+    """Compute single-SM tile metrics for MMA/GMMA kernels."""
 
     Mt = int(params.get("Mt", 128))
     Nt = int(params.get("Nt", 128))
@@ -38,70 +39,93 @@ def calc_tile_metrics(params: Dict[str, float]) -> Dict[str, object]:
     gmma_variant = params.get("gmma_variant", "RS")
     a_through_smem = bool(params.get("a_through_smem", False))
 
-    C_peak_TF = float(params.get("C_peak_TF", 100.0))
-    MFU_target = float(np.clip(params.get("MFU_target", 0.8), 0.0, 1.0))
+    cycles_per_tile = float(params.get("cycles_per_tile", 16.0))
+    sm_clock_GHz = float(max(params.get("sm_clock_GHz", 1.5), EPSILON))
+    C_peak_TF = float(params.get("C_peak_TF", 1.0))
+
+    l1_hit_rate = float(np.clip(params.get("l1_hit_rate", 0.7), 0.0, 1.0))
+    l2_hit_rate = float(np.clip(params.get("l2_hit_rate", 0.5), 0.0, 1.0))
+    smem_reload_factor = float(max(params.get("smem_reload_factor", 0.0), 0.0))
+
+    problem_M = int(params.get("problem_M", Mt))
+    problem_N = int(params.get("problem_N", Nt))
+    problem_K = int(params.get("problem_K", Kt))
 
     B_caps = {
-        "HBM_read": float(max(params.get("B_HBM_read_cap", 0.0), 0.0)),
-        "HBM_write": float(max(params.get("B_HBM_write_cap", 0.0), 0.0)),
-        "L2": float(max(params.get("B_L2_cap", 0.0), 0.0)),
-        "SMEM": float(max(params.get("B_SMEM_cap", 0.0), 0.0)),
+        "HBM_read": float(max(params.get("B_HBM_read_cap_cycle", 0.0), 0.0)),
+        "HBM_write": float(max(params.get("B_HBM_write_cap_cycle", 0.0), 0.0)),
+        "L2": float(max(params.get("B_L2_cap_cycle", 0.0), 0.0)),
+        "L1": float(max(params.get("B_L1_cap_cycle", 0.0), 0.0)),
+        "SMEM": float(max(params.get("B_SMEM_cap_cycle", 0.0), 0.0)),
     }
 
-    peak_flops = C_peak_TF * 1e12
-    C_eff = peak_flops * MFU_target
-    F_t = 2.0 * Mt * Nt * Kt
-    t_comp = F_t / max(C_eff, EPSILON)
+    a_bytes = Mt * Kt * sA
+    b_bytes = Kt * Nt * sB
+    d_bytes = Mt * Nt * sD
+    d_read_bytes = gamma * d_bytes
 
-    if mode == "MMA":
-        bytes_read = (Mt * Kt * sA + Kt * Nt * sB) + gamma * Mt * Nt * sD
-        bytes_write = Mt * Nt * sD
-        bytes_map = {
-            "HBM": {"read": bytes_read, "write": bytes_write},
-            "L2": {"read": bytes_read, "write": bytes_write},
-            "SMEM": {"read": 0.0, "write": 0.0},
-        }
+    if mode == "GMMA":
+        a_to_smem = 1.0 if gmma_variant == "SS" or a_through_smem else 0.0
     else:
-        if gmma_variant == "RS":
-            hbm_read = Kt * Nt * sB
-            smem_read = Kt * Nt * sB
-            if a_through_smem:
-                hbm_read += Mt * Kt * sA
-                smem_read += Mt * Kt * sA
-        else:  # SS
-            hbm_read = Mt * Kt * sA + Kt * Nt * sB
-            smem_read = hbm_read
-        hbm_read += gamma * Mt * Nt * sD
-        smem_read += gamma * Mt * Nt * sD
-        bytes_write = Mt * Nt * sD
-        bytes_map = {
-            "HBM": {"read": hbm_read, "write": bytes_write},
-            "L2": {"read": hbm_read, "write": bytes_write},
-            "SMEM": {"read": smem_read, "write": gamma * Mt * Nt * sD},
-        }
+        a_to_smem = 1.0
+
+    base_smem_load = ((a_bytes * a_to_smem) + b_bytes) * (1.0 + smem_reload_factor)
+    smem_read = base_smem_load + d_read_bytes
+    smem_write = d_bytes
+
+    direct_reg_load = (1.0 - a_to_smem) * a_bytes * (1.0 + smem_reload_factor)
+    l1_request = smem_read + direct_reg_load
+
+    l1_served_load = l1_request * l1_hit_rate
+    l1_miss_load = l1_request - l1_served_load
+    l2_served_load = l1_miss_load * l2_hit_rate
+    hbm_read = max(l1_miss_load - l2_served_load, 0.0)
+    l2_read = l1_miss_load
+
+    bytes_map = {
+        "SMEM": {"read": smem_read, "write": smem_write},
+        "L1": {"read": l1_served_load, "write": 0.0},
+        "L2": {"read": l2_read, "write": smem_write},
+        "HBM": {"read": hbm_read, "write": smem_write},
+    }
 
     B_need = {
         layer: {
-            direction: compute_bandwidth(bytes_value, t_comp)
+            direction: compute_bytes_per_cycle(bytes_value, cycles_per_tile)
             for direction, bytes_value in layer_bytes.items()
         }
         for layer, layer_bytes in bytes_map.items()
     }
 
-    AI_HBM = F_t / max(bytes_map["HBM"]["read"], EPSILON)
+    B_need_GBps = {
+        layer: {direction: need * sm_clock_GHz for direction, need in layer_dict.items()}
+        for layer, layer_dict in B_need.items()
+    }
 
-    cap_needed_bytes = alpha * (Mt * Kt * sA + Kt * Nt * sB + gamma * Mt * Nt * sD)
+    F_t = 2.0 * Mt * Nt * Kt
+    peak_flops_per_cycle = 0.0
+    if C_peak_TF > EPSILON:
+        peak_flops_per_cycle = (C_peak_TF * 1e12) / (sm_clock_GHz * 1e9)
+    actual_flops_per_cycle = F_t / max(cycles_per_tile, EPSILON)
+    MFU_compute = 1.0
+    if peak_flops_per_cycle > EPSILON:
+        MFU_compute = min(actual_flops_per_cycle / peak_flops_per_cycle, 1.0)
+
+    cap_needed_bytes = alpha * (a_bytes + b_bytes + d_read_bytes)
     cap_needed_KB = cap_needed_bytes / 1024.0
     smem_cap_limit_KB = float(params.get("SMEM_capacity_per_block_KB", 192.0))
     cap_ok = cap_needed_KB <= smem_cap_limit_KB + EPSILON
 
     bottlenecks: List[Dict[str, float]] = []
+    cap_ratios: List[float] = []
     for layer, bw_dict in B_need.items():
         for direction, need in bw_dict.items():
             if layer == "HBM":
                 cap_key = "HBM_read" if direction == "read" else "HBM_write"
             elif layer == "L2":
                 cap_key = "L2"
+            elif layer == "L1":
+                cap_key = "L1"
             else:
                 cap_key = "SMEM"
             cap_value = B_caps.get(cap_key, 0.0)
@@ -111,55 +135,74 @@ def calc_tile_metrics(params: Dict[str, float]) -> Dict[str, object]:
             else:
                 ratio = need / max(cap_value, EPSILON)
                 is_bottleneck = ratio > 1.0 + 1e-6
+            if need > EPSILON:
+                cap_ratios.append(cap_value / max(need, EPSILON))
             bottlenecks.append(
                 {
                     "layer": layer,
                     "direction": direction,
-                    "need_GBs": need,
-                    "cap_GBs": cap_value,
+                    "need_bytes_per_cycle": need,
+                    "cap_bytes_per_cycle": cap_value,
+                    "need_GBps": B_need_GBps[layer][direction],
+                    "cap_GBps": cap_value * sm_clock_GHz,
                     "ratio": ratio,
                     "is_bottleneck": is_bottleneck,
                 }
             )
 
-    potentials: List[float] = [MFU_target]
-    for layer, cap_key in [("HBM", "HBM_read"), ("HBM", "HBM_write"), ("L2", "L2"), ("SMEM", "SMEM")]:
-        bytes_total = sum(bytes_map[layer].values())
-        if bytes_total <= EPSILON:
-            continue
-        AI_layer = F_t / bytes_total
-        cap_value = B_caps.get(cap_key, 0.0)
-        if cap_value <= EPSILON:
-            continue
-        mfu_layer = (AI_layer * cap_value * 1e9) / max(peak_flops, EPSILON)
-        potentials.append(mfu_layer)
-    MFU_cap_estimate = float(np.clip(min(potentials), 0.0, 1.0))
+    MFU_bandwidth = 1.0
+    if cap_ratios:
+        MFU_bandwidth = float(np.clip(min(cap_ratios), 0.0, 1.0))
+
+    MFU_cap_estimate = float(np.clip(min(MFU_compute, MFU_bandwidth), 0.0, 1.0))
+
+    tiles_M = max(math.ceil(problem_M / max(Mt, 1)), 1)
+    tiles_N = max(math.ceil(problem_N / max(Nt, 1)), 1)
+    tiles_K = max(math.ceil(problem_K / max(Kt, 1)), 1)
+    total_tiles = tiles_M * tiles_N * tiles_K
+    total_cycles = cycles_per_tile * total_tiles
+    tile_time_seconds = cycles_per_tile / (sm_clock_GHz * 1e9)
+    total_time_seconds = total_cycles / (sm_clock_GHz * 1e9)
+
+    AI_HBM = F_t / max(bytes_map["HBM"]["read"], EPSILON)
 
     return {
         "F_t": F_t,
-        "t_comp": t_comp,
-        "C_eff": C_eff,
         "AI_HBM": AI_HBM,
         "B_need": B_need,
+        "B_need_GBps": B_need_GBps,
         "bytes": bytes_map,
+        "l1_request_bytes": l1_request,
+        "direct_reg_load_bytes": direct_reg_load,
         "bottlenecks": bottlenecks,
         "cap_needed_KB": cap_needed_KB,
         "cap_ok": cap_ok,
         "HBM_total_bytes_read": bytes_map["HBM"]["read"],
         "HBM_total_bytes_write": bytes_map["HBM"]["write"],
         "MFU_cap_estimate": MFU_cap_estimate,
+        "MFU_compute": MFU_compute,
+        "MFU_bandwidth": MFU_bandwidth,
+        "cycles_per_tile": cycles_per_tile,
+        "total_cycles": total_cycles,
+        "total_tiles": total_tiles,
+        "tile_time_seconds": tile_time_seconds,
+        "total_time_seconds": total_time_seconds,
     }
 
 
-def make_roofline_plot(ai_value: float, params: Dict[str, float]) -> go.Figure:
-    """Construct a simplified roofline chart."""
+def make_roofline_plot(metrics: Dict[str, object], params: Dict[str, float]) -> go.Figure:
+    """Construct a simplified roofline chart for per-SM modeling."""
 
+    ai_value = metrics["AI_HBM"]
     C_peak_TF = params.get("C_peak_TF", 0.0)
-    MFU_target = params.get("MFU_target", 0.0)
-    B_cap = params.get("B_HBM_read_cap", 0.0)
+    sm_clock_GHz = params.get("sm_clock_GHz", 0.0)
+    B_cap_cycle = params.get("B_HBM_read_cap_cycle", 0.0)
+    B_cap_GBps = B_cap_cycle * sm_clock_GHz
 
     x_vals = np.logspace(-2, 3, 200)
-    roof_bandwidth = np.minimum(x_vals * B_cap / 1000.0, C_peak_TF * MFU_target)
+    roof_bandwidth = np.minimum(x_vals * B_cap_GBps / 1000.0, C_peak_TF)
+
+    achievable = C_peak_TF * metrics["MFU_cap_estimate"] if C_peak_TF > 0 else 0.0
 
     fig = go.Figure()
     fig.add_trace(
@@ -168,16 +211,17 @@ def make_roofline_plot(ai_value: float, params: Dict[str, float]) -> go.Figure:
     fig.add_trace(
         go.Scatter(
             x=[ai_value],
-            y=[min(C_peak_TF * MFU_target, ai_value * B_cap / 1000.0)],
+            y=[achievable],
             mode="markers",
             name="当前 tile",
             marker=dict(size=12, color="crimson"),
         )
     )
-    fig.add_hline(y=C_peak_TF * MFU_target, line=dict(color="gray", dash="dash"), annotation_text="算力上限")
+    if C_peak_TF > 0:
+        fig.add_hline(y=C_peak_TF, line=dict(color="gray", dash="dash"), annotation_text="算力上限")
     fig.update_layout(
         xaxis_title="算术强度 AI (FLOPs/Byte)",
-        yaxis_title="达成算力 (TFLOPs)",
+        yaxis_title="可达算力 (TFLOPs)",
         title="简化 Roofline",
         xaxis_type="log",
     )
@@ -187,11 +231,19 @@ def make_roofline_plot(ai_value: float, params: Dict[str, float]) -> go.Figure:
 def make_bandwidth_chart(metrics: Dict[str, object], params: Dict[str, float]) -> go.Figure:
     """Create a grouped bar chart comparing bandwidth demand vs capacity."""
 
-    layers = ["HBM", "L2", "SMEM"]
-    read_needs = [metrics["B_need"][layer]["read"] for layer in layers]
-    write_needs = [metrics["B_need"][layer]["write"] for layer in layers]
-    caps_read = [params.get("B_HBM_read_cap", 0.0), params.get("B_L2_cap", 0.0), params.get("B_SMEM_cap", 0.0)]
-    caps_write = [params.get("B_HBM_write_cap", 0.0), params.get("B_L2_cap", 0.0), params.get("B_SMEM_cap", 0.0)]
+    sm_clock_GHz = params.get("sm_clock_GHz", 0.0)
+    layers = ["SMEM", "L1", "L2", "HBM"]
+    read_needs = [metrics["B_need_GBps"][layer]["read"] for layer in layers]
+    write_needs = [metrics["B_need_GBps"][layer]["write"] for layer in layers]
+    caps_cycle = {
+        "SMEM": params.get("B_SMEM_cap_cycle", 0.0),
+        "L1": params.get("B_L1_cap_cycle", 0.0),
+        "L2": params.get("B_L2_cap_cycle", 0.0),
+        "HBM_read": params.get("B_HBM_read_cap_cycle", 0.0),
+        "HBM_write": params.get("B_HBM_write_cap_cycle", 0.0),
+    }
+    caps_read = [caps_cycle["SMEM"] * sm_clock_GHz, caps_cycle["L1"] * sm_clock_GHz, caps_cycle["L2"] * sm_clock_GHz, caps_cycle["HBM_read"] * sm_clock_GHz]
+    caps_write = [caps_cycle["SMEM"] * sm_clock_GHz, caps_cycle["L1"] * sm_clock_GHz, caps_cycle["L2"] * sm_clock_GHz, caps_cycle["HBM_write"] * sm_clock_GHz]
 
     fig = go.Figure()
     fig.add_trace(go.Bar(name="读需求", x=layers, y=read_needs, marker_color="steelblue"))
@@ -278,19 +330,37 @@ def run_auto_tuner(base_params: Dict[str, float], objective: str) -> pd.DataFram
                 metrics = calc_tile_metrics(candidate)
                 if not metrics["cap_ok"]:
                     continue
-                read_cap = candidate.get("B_HBM_read_cap", 1.0)
-                write_cap = candidate.get("B_HBM_write_cap", 1.0)
-                read_ratio = metrics["B_need"]["HBM"]["read"] / max(read_cap, EPSILON)
-                write_ratio = metrics["B_need"]["HBM"]["write"] / max(write_cap, EPSILON)
-                stress = max(read_ratio, write_ratio)
+                ratios = []
+                for layer, direction in [
+                    ("HBM", "read"),
+                    ("HBM", "write"),
+                    ("L2", "read"),
+                    ("L2", "write"),
+                    ("L1", "read"),
+                    ("SMEM", "read"),
+                    ("SMEM", "write"),
+                ]:
+                    need = metrics["B_need"].get(layer, {}).get(direction, 0.0)
+                    if layer == "HBM":
+                        cap_key = "B_HBM_read_cap_cycle" if direction == "read" else "B_HBM_write_cap_cycle"
+                    elif layer == "L2":
+                        cap_key = "B_L2_cap_cycle"
+                    elif layer == "L1":
+                        cap_key = "B_L1_cap_cycle"
+                    else:
+                        cap_key = "B_SMEM_cap_cycle"
+                    cap = candidate.get(cap_key, 0.0)
+                    if cap > EPSILON:
+                        ratios.append(need / cap)
+                stress = max(ratios) if ratios else 0.0
                 results.append(
                     {
                         "Mt": Mt,
                         "Nt": Nt,
                         "Kt": Kt,
                         "AI_HBM": metrics["AI_HBM"],
-                        "B_read(GB/s)": metrics["B_need"]["HBM"]["read"],
-                        "B_write(GB/s)": metrics["B_need"]["HBM"]["write"],
+                        "B_read(GB/s)": metrics["B_need_GBps"]["HBM"]["read"],
+                        "B_write(GB/s)": metrics["B_need_GBps"]["HBM"]["write"],
                         "Stress": stress,
                         "MFU_cap": metrics["MFU_cap_estimate"],
                     }
@@ -313,10 +383,11 @@ def get_example_config(name: str) -> Dict[str, float]:
     """Return one of the predefined example configurations."""
 
     base = {
-        "B_HBM_read_cap": 1500.0,
-        "B_HBM_write_cap": 1500.0,
-        "B_L2_cap": 800.0,
-        "B_SMEM_cap": 3000.0,
+        "B_HBM_read_cap_cycle": 12.0,
+        "B_HBM_write_cap_cycle": 12.0,
+        "B_L2_cap_cycle": 32.0,
+        "B_L1_cap_cycle": 64.0,
+        "B_SMEM_cap_cycle": 128.0,
         "SMEM_capacity_per_block_KB": 192.0,
         "warps_per_block": 8,
         "blocks_per_SM": 2,
@@ -325,19 +396,27 @@ def get_example_config(name: str) -> Dict[str, float]:
         "alpha": 2.0,
         "a_through_smem": False,
         "gmma_variant": "RS",
+        "sm_clock_GHz": 1.8,
+        "cycles_per_tile": 16.0,
+        "l1_hit_rate": 0.7,
+        "l2_hit_rate": 0.6,
+        "smem_reload_factor": 0.0,
+        "problem_M": 4096,
+        "problem_N": 4096,
+        "problem_K": 8192,
+        "C_peak_TF": 1.0,
     }
     if name == "MMA-FP16":
         base.update(
             {
                 "mode": "MMA",
-                "C_peak_TF": 100.0,
-                "MFU_target": 0.8,
                 "Mt": 128,
                 "Nt": 128,
                 "Kt": 64,
                 "sA": 2.0,
                 "sB": 2.0,
                 "sD": 2.0,
+                "C_peak_TF": 1.0,
             }
         )
     elif name == "GMMA-RS-BF16":
@@ -346,14 +425,13 @@ def get_example_config(name: str) -> Dict[str, float]:
                 "mode": "GMMA",
                 "gmma_variant": "RS",
                 "a_through_smem": False,
-                "C_peak_TF": 200.0,
-                "MFU_target": 0.85,
                 "Mt": 128,
                 "Nt": 256,
                 "Kt": 128,
                 "sA": 2.0,
                 "sB": 2.0,
                 "sD": 2.0,
+                "C_peak_TF": 1.4,
             }
         )
     else:
@@ -361,14 +439,13 @@ def get_example_config(name: str) -> Dict[str, float]:
             {
                 "mode": "GMMA",
                 "gmma_variant": "SS",
-                "C_peak_TF": 300.0,
-                "MFU_target": 0.9,
                 "Mt": 256,
                 "Nt": 256,
                 "Kt": 128,
                 "sA": 1.0,
                 "sB": 1.0,
                 "sD": 1.0,
+                "C_peak_TF": 2.0,
             }
         )
     return base
@@ -415,12 +492,21 @@ def render_sidebar() -> Dict[str, float]:
         disabled=mode != "GMMA" or gmma_variant != "RS",
     )
 
-    C_peak_TF = st.sidebar.number_input("峰值算力 C_peak (TFLOPs)", min_value=1.0, value=float(st.session_state.get("C_peak_TF", 100.0)), key="C_peak_TF")
-    MFU_target = st.sidebar.slider("目标 MFU", 0.1, 1.0, float(st.session_state.get("MFU_target", 0.8)), key="MFU_target")
+    st.sidebar.subheader("问题规模 & Tile")
+    problem_M = st.sidebar.number_input("问题规模 M", min_value=1, step=16, value=int(st.session_state.get("problem_M", 4096)), key="problem_M")
+    problem_N = st.sidebar.number_input("问题规模 N", min_value=1, step=16, value=int(st.session_state.get("problem_N", 4096)), key="problem_N")
+    problem_K = st.sidebar.number_input("问题规模 K", min_value=1, step=16, value=int(st.session_state.get("problem_K", 8192)), key="problem_K")
 
-    Mt = st.sidebar.number_input("Mt", min_value=16, step=16, value=int(st.session_state.get("Mt", 128)), key="Mt")
-    Nt = st.sidebar.number_input("Nt", min_value=16, step=16, value=int(st.session_state.get("Nt", 128)), key="Nt")
-    Kt = st.sidebar.number_input("Kt", min_value=16, step=16, value=int(st.session_state.get("Kt", 64)), key="Kt")
+    Mt = st.sidebar.number_input("Tile Mt", min_value=16, step=16, value=int(st.session_state.get("Mt", 128)), key="Mt")
+    Nt = st.sidebar.number_input("Tile Nt", min_value=16, step=16, value=int(st.session_state.get("Nt", 128)), key="Nt")
+    Kt = st.sidebar.number_input("Tile Kt", min_value=16, step=16, value=int(st.session_state.get("Kt", 64)), key="Kt")
+
+    cycles_per_tile = st.sidebar.number_input(
+        "Tile 基本指令周期", min_value=1.0, value=float(st.session_state.get("cycles_per_tile", 16.0)), step=1.0, key="cycles_per_tile"
+    )
+    sm_clock_GHz = st.sidebar.slider("SM 时钟 (GHz)", 1.0, 2.5, float(st.session_state.get("sm_clock_GHz", 1.8)), key="sm_clock_GHz")
+    C_peak_TF = st.sidebar.number_input("单 SM 峰值算力 (TFLOPs)", min_value=0.1, value=float(st.session_state.get("C_peak_TF", 1.0)), key="C_peak_TF")
+
     gamma = st.sidebar.slider("gamma (读改写)", 0.0, 2.0, float(st.session_state.get("gamma", 1.0)), key="gamma")
     alpha = st.sidebar.selectbox("alpha (双缓冲倍数)", [1.0, 2.0, 3.0], index=[1.0, 2.0, 3.0].index(float(st.session_state.get("alpha", 2.0))), key="alpha")
 
@@ -428,10 +514,24 @@ def render_sidebar() -> Dict[str, float]:
     sB = st.sidebar.number_input("sB (Byte)", min_value=0.5, value=float(st.session_state.get("sB", 2.0)), step=0.5, key="sB")
     sD = st.sidebar.number_input("sD (Byte)", min_value=0.5, value=float(st.session_state.get("sD", 2.0)), step=0.5, key="sD")
 
-    B_HBM_read_cap = st.sidebar.number_input("HBM 读带宽上限 (GB/s)", min_value=100.0, value=float(st.session_state.get("B_HBM_read_cap", 1500.0)), key="B_HBM_read_cap")
-    B_HBM_write_cap = st.sidebar.number_input("HBM 写带宽上限 (GB/s)", min_value=100.0, value=float(st.session_state.get("B_HBM_write_cap", 1500.0)), key="B_HBM_write_cap")
-    B_L2_cap = st.sidebar.number_input("L2 带宽上限 (GB/s)", min_value=50.0, value=float(st.session_state.get("B_L2_cap", 800.0)), key="B_L2_cap")
-    B_SMEM_cap = st.sidebar.number_input("SMEM 带宽上限 (GB/s)", min_value=100.0, value=float(st.session_state.get("B_SMEM_cap", 3000.0)), key="B_SMEM_cap")
+    st.sidebar.subheader("缓存与命中率")
+    smem_reload_factor = st.sidebar.slider(
+        "SMEM 重载次数", 0.0, 4.0, float(st.session_state.get("smem_reload_factor", 0.0)), step=0.1, key="smem_reload_factor"
+    )
+    l1_hit_rate = st.sidebar.slider("L1 命中率", 0.0, 1.0, float(st.session_state.get("l1_hit_rate", 0.7)), key="l1_hit_rate")
+    l2_hit_rate = st.sidebar.slider("L2 命中率", 0.0, 1.0, float(st.session_state.get("l2_hit_rate", 0.6)), key="l2_hit_rate")
+
+    st.sidebar.subheader("带宽上限 (Byte/cycle)")
+    B_SMEM_cap = st.sidebar.number_input("SMEM", min_value=1.0, value=float(st.session_state.get("B_SMEM_cap_cycle", 128.0)), key="B_SMEM_cap_cycle")
+    B_L1_cap = st.sidebar.number_input("L1", min_value=1.0, value=float(st.session_state.get("B_L1_cap_cycle", 64.0)), key="B_L1_cap_cycle")
+    B_L2_cap = st.sidebar.number_input("L2", min_value=1.0, value=float(st.session_state.get("B_L2_cap_cycle", 32.0)), key="B_L2_cap_cycle")
+    B_HBM_read_cap = st.sidebar.number_input(
+        "HBM 读", min_value=0.5, value=float(st.session_state.get("B_HBM_read_cap_cycle", 12.0)), key="B_HBM_read_cap_cycle"
+    )
+    B_HBM_write_cap = st.sidebar.number_input(
+        "HBM 写", min_value=0.5, value=float(st.session_state.get("B_HBM_write_cap_cycle", 12.0)), key="B_HBM_write_cap_cycle"
+    )
+    st.sidebar.caption("提示：GB/s = Byte/cycle × SM 时钟 (GHz)")
 
     SMEM_capacity_per_block = st.sidebar.number_input(
         "每块 SMEM 容量 (KB)", min_value=32.0, value=float(st.session_state.get("SMEM_capacity_per_block_KB", 192.0)), key="SMEM_capacity_per_block_KB"
@@ -452,8 +552,12 @@ def render_sidebar() -> Dict[str, float]:
         "mode": mode,
         "gmma_variant": gmma_variant,
         "a_through_smem": a_through_smem,
+        "problem_M": int(problem_M),
+        "problem_N": int(problem_N),
+        "problem_K": int(problem_K),
         "C_peak_TF": C_peak_TF,
-        "MFU_target": MFU_target,
+        "sm_clock_GHz": float(sm_clock_GHz),
+        "cycles_per_tile": float(cycles_per_tile),
         "Mt": int(Mt),
         "Nt": int(Nt),
         "Kt": int(Kt),
@@ -462,10 +566,14 @@ def render_sidebar() -> Dict[str, float]:
         "sA": float(sA),
         "sB": float(sB),
         "sD": float(sD),
-        "B_HBM_read_cap": float(B_HBM_read_cap),
-        "B_HBM_write_cap": float(B_HBM_write_cap),
-        "B_L2_cap": float(B_L2_cap),
-        "B_SMEM_cap": float(B_SMEM_cap),
+        "smem_reload_factor": float(smem_reload_factor),
+        "l1_hit_rate": float(l1_hit_rate),
+        "l2_hit_rate": float(l2_hit_rate),
+        "B_HBM_read_cap_cycle": float(B_HBM_read_cap),
+        "B_HBM_write_cap_cycle": float(B_HBM_write_cap),
+        "B_L2_cap_cycle": float(B_L2_cap),
+        "B_L1_cap_cycle": float(B_L1_cap),
+        "B_SMEM_cap_cycle": float(B_SMEM_cap),
         "SMEM_capacity_per_block_KB": float(SMEM_capacity_per_block),
         "warps_per_block": int(warps_per_block),
         "blocks_per_SM": int(blocks_per_SM),
@@ -508,20 +616,52 @@ def render_app() -> None:
     df_bottleneck, suggestions = analyze_bottlenecks(metrics["bottlenecks"])
 
     with tabs[0]:
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("Tile FLOPs", f"{metrics['F_t'] / 1e9:.2f} GFLOPs")
-        col2.metric("tile 时间", f"{metrics['t_comp'] * 1e6:.2f} µs")
+        col2.metric("Tile 周期", f"{metrics['cycles_per_tile']:.1f}")
         col3.metric("AI (HBM)", f"{metrics['AI_HBM']:.2f} FLOPs/Byte")
-        col4.metric("MFU 上限", f"{metrics['MFU_cap_estimate']:.2f}")
-        st.plotly_chart(make_roofline_plot(metrics["AI_HBM"], params), use_container_width=True)
+        col4.metric("MFU-算力", f"{metrics['MFU_compute']:.2f}")
+        col5.metric("MFU-带宽", f"{metrics['MFU_bandwidth']:.2f}")
+        st.caption(
+            "Tile 数量：M×N×K = {} × {} × {} = {:,}".format(
+                math.ceil(params["problem_M"] / max(params["Mt"], 1)),
+                math.ceil(params["problem_N"] / max(params["Nt"], 1)),
+                math.ceil(params["problem_K"] / max(params["Kt"], 1)),
+                metrics["total_tiles"],
+            )
+        )
+        col6, col7, col8 = st.columns(3)
+        col6.metric("总周期", f"{metrics['total_cycles'] / 1e6:.2f} Mcycles", help="按单个 SM 估算")
+        col7.metric(
+            "总时间",
+            f"{metrics['total_time_seconds'] * 1e3:.2f} ms",
+            help="基于 cycles_per_tile 与 SM 时钟",
+        )
+        col8.metric("MFU 上限", f"{metrics['MFU_cap_estimate']:.2f}")
+        st.plotly_chart(make_roofline_plot(metrics, params), use_container_width=True)
         st.write("**带宽关键指标**")
-        st.dataframe(df_bottleneck.style.format({"need_GBs": "{:.1f}", "cap_GBs": "{:.1f}", "ratio": "{:.2f}"}))
+        st.dataframe(
+            df_bottleneck.style.format(
+                {
+                    "need_bytes_per_cycle": "{:.2f}",
+                    "cap_bytes_per_cycle": "{:.2f}",
+                    "need_GBps": "{:.1f}",
+                    "cap_GBps": "{:.1f}",
+                    "ratio": "{:.2f}",
+                }
+            )
+        )
         st.markdown("\n".join(suggestions))
 
     with tabs[1]:
         st.plotly_chart(make_bandwidth_chart(metrics, params), use_container_width=True)
         st.write("**瓶颈表**")
         st.dataframe(df_bottleneck)
+        st.caption(
+            "L1 请求总量：{:.0f} Byte/tile，直接寄存器路径：{:.0f} Byte/tile".format(
+                metrics["l1_request_bytes"], metrics["direct_reg_load_bytes"]
+            )
+        )
 
     with tabs[2]:
         st.subheader("片上资源")
@@ -560,7 +700,7 @@ def run_sanity_tests() -> None:
     metrics = calc_tile_metrics(example)
     expected_F_t = 2 * 128 * 128 * 64
     assert abs(metrics["F_t"] - expected_F_t) < 1e-3
-    assert metrics["t_comp"] >= 0.0
+    assert metrics["cycles_per_tile"] > 0
     assert metrics["B_need"]["HBM"]["read"] >= 0.0
     assert metrics["cap_ok"]
 
