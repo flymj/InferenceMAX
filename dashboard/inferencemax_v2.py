@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ._paths import ensure_repo_root_on_path
+from dashboard._paths import ensure_repo_root_on_path
 
 ensure_repo_root_on_path()
 
@@ -9,8 +9,8 @@ from typing import List
 import pandas as pd
 import plotly.graph_objects as go
 
-from .app_context import DashboardActions, DashboardState, bootstrap
-from .page_common import HardwareSpec, WorkloadConfig, compute_estimate
+from dashboard.app_context import DashboardActions, DashboardState, bootstrap
+from dashboard.page_common import HardwareSpec, WorkloadConfig, compute_estimate
 
 
 def render(state: DashboardState, actions: DashboardActions) -> None:

@@ -7,7 +7,7 @@ from typing import Dict, List, Sequence
 
 import pandas as pd
 
-from .app_context import DashboardActions
+from dashboard.app_context import DashboardActions
 
 
 @dataclass(frozen=True)

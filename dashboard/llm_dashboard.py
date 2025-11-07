@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .app import main as _app_main
+from dashboard.app import main as _app_main
 
 
 def main() -> None:

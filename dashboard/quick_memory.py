@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from services.llm_calcs import kv_capacity_tokens_per_gpu, weights_bytes_per_gpu
 
-from .app_context import DashboardActions, DashboardState, bootstrap
+from dashboard.app_context import DashboardActions, DashboardState, bootstrap
 
 
 def render(state: DashboardState, actions: DashboardActions) -> None:

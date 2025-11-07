@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .app_context import DashboardActions, DashboardState, bootstrap
+from dashboard.app_context import DashboardActions, DashboardState, bootstrap
 
 
 def render(state: DashboardState, actions: DashboardActions) -> None:
