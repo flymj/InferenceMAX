@@ -1,6 +1,6 @@
 # InferenceMAX Dashboard
 
-InferenceMAX 是一个围绕大模型推理性能剖析而构建的 Streamlit 仪表盘。最新的重构将核心算法集中到 `tabs/common`，并围绕四个面向场景的标签页组织功能：
+InferenceMAX 是一个围绕大模型推理性能剖析而构建的 Streamlit 仪表盘。最新的重构将核心算法集中到 `dashboard/tabs/common`，并围绕四个面向场景的标签页组织功能：
 
 - **Scale Up Search** — 批量探索 TP/DP/Batch 组合，寻找满足延迟目标的配置。
 - **Regression Calibration** — 根据实测数据回归拟合算力/带宽折减，输出校准后的硬件假设。
@@ -28,7 +28,7 @@ InferenceMAX/
 ├── dashboard/         # Streamlit 入口与页面骨架
 ├── runners/           # 各类任务/基准脚本
 ├── services/          # 后端服务（采集、调度等）
-├── tabs/              # 四个标签页与公共逻辑
+├── dashboard/tabs/    # 四个标签页与公共逻辑
 │   ├── common/        # 共享的推理估算算法
 │   ├── inferencemax.py
 │   ├── inferencemax_v2.py
@@ -38,7 +38,7 @@ InferenceMAX/
 └── tests/             # 单元测试
 ```
 
-### `tabs/common`
+### `dashboard/tabs/common`
 
 公共模块将延迟估算所需的模型参数提取、HBM/通信开销计算和时间重叠策略集中管理：
 
@@ -76,8 +76,8 @@ InferenceMAX/
 
 ## 扩展指南
 
-1. **新增算法**：将公共逻辑写入 `tabs/common`，并在标签页中通过导入复用。
-2. **新增标签页**：在 `tabs/` 下创建新文件并使用 `@register_tab` 装饰器注册；更新内容将在 `tabs/__init__.py` 中自动导入。
+1. **新增算法**：将公共逻辑写入 `dashboard/tabs/common`，并在标签页中通过导入复用。
+2. **新增标签页**：在 `dashboard/tabs/` 下创建新文件并使用 `@register_tab` 装饰器注册；更新内容将在 `dashboard/tabs/__init__.py` 中自动导入。
 3. **模型适配**：确保模型实现了以下接口，才能从公共模块正确提取统计信息：
    - `model.flops_component_rows(mode, batch, seq_len, kv_len, include_scores, top_k)`
    - `model.weights_totals(weight_dtype_bytes)`
