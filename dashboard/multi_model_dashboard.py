@@ -236,13 +236,16 @@ def _dtype_bytes(dtype: Optional[str], fallback: int) -> int:
     return fallback
 
 
+MAX_AUTO_CONCURRENCY = 8192
+
+
 @dataclass(frozen=True)
 class WorkloadSettings:
     """Global workload assumptions shared across model comparisons."""
 
     baseline_concurrency: float
-    max_concurrency: float
     curve_points: int
+    saturation_tolerance: float
     chunked_prefill: ChunkedPrefill
     kv_cache_hit: float
     base_hbm_efficiency: float
@@ -253,18 +256,8 @@ def _render_workload_controls() -> WorkloadSettings:
     st.subheader("Workload & Scheduling")
     col0, col1, col2 = st.columns(3)
     baseline_conc = float(col0.number_input("Baseline concurrency / GPU", min_value=1, max_value=4096, value=16))
-    curve_max_default = max(int(baseline_conc * 4), int(baseline_conc))
-    max_conc = float(
-        col1.number_input(
-            "Max concurrency for curve",
-            min_value=1,
-            max_value=8192,
-            value=min(8192, curve_max_default),
-        )
-    )
-    if max_conc < baseline_conc:
-        max_conc = baseline_conc
-    curve_points = int(col2.slider("Curve resolution", min_value=5, max_value=100, value=30, step=1))
+    curve_points = int(col1.slider("Curve resolution", min_value=5, max_value=100, value=30, step=1))
+    saturation_percent = float(col2.slider("Saturation threshold (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1))
 
     col3, col4, col5 = st.columns(3)
     chunked_prefill_intensity = float(col3.slider("Chunked prefill intensity", 0.0, 1.0, 0.5, 0.05))
@@ -277,8 +270,8 @@ def _render_workload_controls() -> WorkloadSettings:
 
     return WorkloadSettings(
         baseline_concurrency=baseline_conc,
-        max_concurrency=max_conc,
         curve_points=curve_points,
+        saturation_tolerance=saturation_percent / 100.0,
         chunked_prefill=ChunkedPrefill(chunked_prefill_intensity, decode_priority),
         kv_cache_hit=kv_cache_hit,
         base_hbm_efficiency=base_hbm_eff,
@@ -334,8 +327,10 @@ def _build_profile(
         st.warning(f"无法构建模型 {model_entry.get('name')}: {exc}")
         return None, cfg, {}
 
-    tensor_parallel = int(model_entry.get("tensor_parallel") or hardware["tensor_parallel"])
-    data_parallel = int(hardware.get("data_parallel", 1))
+    tensor_parallel = max(1, int(model_entry.get("tensor_parallel") or hardware["tensor_parallel"]))
+    data_parallel = max(1, int(model_entry.get("data_parallel") or hardware.get("data_parallel", 1)))
+    total_gpus_default = hardware.get("num_gpus", tensor_parallel * data_parallel)
+    total_gpus = max(tensor_parallel * data_parallel, int(model_entry.get("total_gpus") or total_gpus_default))
 
     weight_dtype = str(model_entry.get("weight_dtype") or hardware["default_weight_dtype"])
     activation_dtype = str(model_entry.get("activation_dtype") or "FP16")
@@ -381,6 +376,7 @@ def _build_profile(
         "prompt_batch": prompt_batch,
         "tensor_parallel": tensor_parallel,
         "data_parallel": data_parallel,
+        "total_gpus": total_gpus,
         "memory": memory,
     }
 
@@ -392,31 +388,72 @@ def _concurrency_curve(
     generation_tokens: int,
     workload: WorkloadSettings,
 ) -> pd.DataFrame:
-    values = np.linspace(1.0, workload.max_concurrency, workload.curve_points)
-    values = np.unique(np.maximum(1, values.astype(int)))
-    if workload.baseline_concurrency not in values:
-        values = np.unique(np.append(values, int(workload.baseline_concurrency)))
+    baseline = max(1, int(math.ceil(workload.baseline_concurrency)))
+    target_fraction = max(1e-3, min(1.0, 1.0 - float(workload.saturation_tolerance)))
+
+    decode_floor_ms = min(float(times.t_comp_decode_ms), float(times.t_hbm_decode_ms))
+    if decode_floor_ms <= 0:
+        theory_tokens_per_s = 0.0
+    else:
+        theory_tokens_per_s = 1000.0 / decode_floor_ms
+
+    cache: Dict[int, Dict[str, float]] = {}
+
+    def _compute_row(conc: int) -> Dict[str, float]:
+        conc_eff = max(1, int(conc))
+        if conc_eff in cache:
+            return cache[conc_eff]
+        adj = concurrency_adjusted_times(times=times, concurrency=float(conc_eff), alpha=float(workload.alpha))
+        seq_time_ms = adj.ttft_eff_ms + generation_tokens * adj.tpot_eff_ms
+        if seq_time_ms <= 0:
+            seq_per_s = 0.0
+        else:
+            seq_per_s = float(conc_eff) / (seq_time_ms / 1000.0)
+        tokens_per_s = seq_per_s * generation_tokens
+        row = {
+            "concurrency": float(conc_eff),
+            "seq_per_s": seq_per_s,
+            "tokens_per_s": tokens_per_s,
+            "ttft_ms": adj.ttft_eff_ms,
+            "tpot_ms": adj.tpot_eff_ms,
+            "theory_tokens_per_s": theory_tokens_per_s,
+        }
+        cache[conc_eff] = row
+        return row
+
+    final_max = baseline
+    last_row = _compute_row(final_max)
+    last_tokens = last_row["tokens_per_s"]
+    target_tokens = theory_tokens_per_s * target_fraction if theory_tokens_per_s > 0 else None
+
+    while final_max < MAX_AUTO_CONCURRENCY:
+        if target_tokens is not None and last_tokens >= target_tokens:
+            break
+        next_candidate = int(math.ceil(final_max * 1.5))
+        if next_candidate <= final_max:
+            next_candidate = final_max + 1
+        if next_candidate > MAX_AUTO_CONCURRENCY:
+            next_candidate = MAX_AUTO_CONCURRENCY
+        if next_candidate == final_max:
+            break
+        final_max = next_candidate
+        last_row = _compute_row(final_max)
+        last_tokens = last_row["tokens_per_s"]
+        if target_tokens is None and final_max >= baseline * 4:
+            break
+
+    raw_values = np.geomspace(1.0, float(final_max), max(workload.curve_points, 5))
+    values = np.unique(np.clip(np.round(raw_values).astype(int), 1, final_max))
+    if baseline not in values:
+        values = np.unique(np.append(values, baseline))
+    if final_max not in values:
+        values = np.unique(np.append(values, final_max))
     if len(values) == 0:
         values = np.array([1], dtype=int)
 
     rows: List[Dict[str, float]] = []
     for conc in values:
-        adj = concurrency_adjusted_times(times=times, concurrency=float(conc), alpha=float(workload.alpha))
-        seq_time_ms = adj.ttft_eff_ms + generation_tokens * adj.tpot_eff_ms
-        if seq_time_ms <= 0:
-            seq_per_s = 0.0
-        else:
-            seq_per_s = float(conc) / (seq_time_ms / 1000.0)
-        tokens_per_s = seq_per_s * generation_tokens
-        rows.append(
-            {
-                "concurrency": float(conc),
-                "seq_per_s": seq_per_s,
-                "tokens_per_s": tokens_per_s,
-                "ttft_ms": adj.ttft_eff_ms,
-                "tpot_ms": adj.tpot_eff_ms,
-            }
-        )
+        rows.append(_compute_row(int(conc)))
 
     return pd.DataFrame(rows).sort_values("concurrency")
 
@@ -462,6 +499,10 @@ def _model_metrics(
     baseline_tokens_per_s = float(baseline_row["tokens_per_s"])
     baseline_seq_per_s = float(baseline_row["seq_per_s"])
 
+    decode_floor_ms = min(float(times.t_comp_decode_ms), float(times.t_hbm_decode_ms))
+    theory_tokens_per_s = 1000.0 / decode_floor_ms if decode_floor_ms > 0 else 0.0
+    theory_seq_per_s = theory_tokens_per_s / generation_tokens if generation_tokens > 0 else 0.0
+
     kv_state_tokens = (prompt_tokens + generation_tokens) * max(1, int(math.ceil(baseline_conc)))
     kv_state_bytes = profile.kv_write_bytes(tokens=int(kv_state_tokens), tp=tensor_parallel)
     steady_hbm_bytes = weights_per_gpu_bytes + kv_state_bytes
@@ -499,11 +540,13 @@ def _model_metrics(
         "TPOT adj (ms/token)": baseline_row["tpot_ms"],
         "Seq/s per GPU @ baseline": baseline_seq_per_s,
         "Tokens/s per GPU @ baseline": baseline_tokens_per_s,
+        "Seq/s per GPU (theory)": theory_seq_per_s,
+        "Tokens/s per GPU (theory)": theory_tokens_per_s,
         "KV BW @ baseline (GB/s)": kv_bw_gbs,
         "Baseline concurrency": baseline_conc,
         "Tensor parallel": float(tensor_parallel),
         "Data parallel": float(data_parallel),
-        "Total GPUs": float(hardware.get("num_gpus", tensor_parallel * data_parallel)),
+        "Total GPUs": float(extras["total_gpus"]),
         "Weight dtype": weight_dtype,
         "Activation dtype": activation_dtype,
     }
@@ -570,26 +613,45 @@ def _render_model_forms(models: List[Dict[str, object]], hardware: Mapping[str, 
                 cols[2].number_input("Prompt batch size", min_value=1, value=int(model.get("prompt_batch_size", 1)), key=f"batch_{idx}")
             )
 
-            cols = st.columns(3)
+            cols_tp = st.columns(3)
             model["tensor_parallel"] = int(
-                cols[0].number_input(
+                cols_tp[0].number_input(
                     "Tensor parallel",
                     min_value=1,
                     value=int(model.get("tensor_parallel") or hardware["tensor_parallel"]),
                     key=f"tp_{idx}",
                 )
             )
+            model["data_parallel"] = int(
+                cols_tp[1].number_input(
+                    "Data parallel",
+                    min_value=1,
+                    value=int(model.get("data_parallel") or hardware.get("data_parallel", 1)),
+                    key=f"dp_{idx}",
+                )
+            )
+            min_gpus = max(1, int(model["tensor_parallel"]) * int(model["data_parallel"]))
+            default_gpus = int(model.get("total_gpus") or hardware.get("num_gpus", min_gpus))
+            model["total_gpus"] = int(
+                cols_tp[2].number_input(
+                    "Total GPUs",
+                    min_value=min_gpus,
+                    value=max(default_gpus, min_gpus),
+                    key=f"gpus_{idx}",
+                )
+            )
 
             dtype_options = list(DTYPE_BYTES.keys())
+            cols_dtype = st.columns(2)
             weight_dtype = model.get("weight_dtype") or hardware["default_weight_dtype"]
             weight_index = dtype_options.index(weight_dtype) if weight_dtype in dtype_options else dtype_options.index("FP16")
-            model["weight_dtype"] = cols[1].selectbox(
+            model["weight_dtype"] = cols_dtype[0].selectbox(
                 "Weight dtype", options=dtype_options, index=weight_index, key=f"w_dtype_{idx}"
             )
 
             activation_dtype = model.get("activation_dtype", "FP16")
             activation_index = dtype_options.index(activation_dtype) if activation_dtype in dtype_options else dtype_options.index("FP16")
-            model["activation_dtype"] = cols[2].selectbox(
+            model["activation_dtype"] = cols_dtype[1].selectbox(
                 "Activation dtype", options=dtype_options, index=activation_index, key=f"a_dtype_{idx}"
             )
 
@@ -616,6 +678,8 @@ def _render_summary(
         "HBM Headroom (GB)",
         "Seq/s per GPU @ baseline",
         "Tokens/s per GPU @ baseline",
+        "Seq/s per GPU (theory)",
+        "Tokens/s per GPU (theory)",
         "KV BW @ baseline (GB/s)",
         "TTFT adj (ms)",
         "TPOT adj (ms/token)",
@@ -630,7 +694,9 @@ def _render_summary(
 
     st.caption(
         "Baseline concurrency per GPU: "
-        f"{workload.baseline_concurrency:.0f}; curve spans up to {workload.max_concurrency:.0f}."
+        f"{workload.baseline_concurrency:.0f}; curves extend until throughput reaches "
+        f"{(1.0 - workload.saturation_tolerance) * 100:.1f}% of the theoretical decode limit "
+        f"or up to {MAX_AUTO_CONCURRENCY} concurrency."
     )
 
     if curves:
@@ -638,19 +704,38 @@ def _render_summary(
         for name, curve in curves:
             if curve.empty:
                 continue
-            custom = np.stack([curve["seq_per_s"].to_numpy()], axis=-1)
+            custom = np.stack(
+                [curve["seq_per_s"].to_numpy(), curve["theory_tokens_per_s"].to_numpy()], axis=-1
+            )
             fig.add_trace(
                 go.Scatter(
                     x=curve["concurrency"],
                     y=curve["tokens_per_s"],
                     mode="lines",
                     name=name,
+                    legendgroup=name,
                     customdata=custom,
                     hovertemplate=(
-                        "Concurrency=%{x:.0f}<br>Tokens/s=%{y:.2f}<br>Seq/s=%{customdata[0]:.2f}" "<extra>%{fullData.name}</extra>"
+                        "Concurrency=%{x:.0f}<br>Tokens/s=%{y:.2f}<br>Seq/s=%{customdata[0]:.2f}"
+                        "<br>Theory tokens/s=%{customdata[1]:.2f}<extra>%{fullData.name}</extra>"
                     ),
                 )
             )
+            theory_value = float(curve["theory_tokens_per_s"].iloc[0]) if "theory_tokens_per_s" in curve else None
+            if theory_value and theory_value > 0:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[curve["concurrency"].min(), curve["concurrency"].max()],
+                        y=[theory_value, theory_value],
+                        mode="lines",
+                        name=f"{name} 理论上限",
+                        legendgroup=name,
+                        line=dict(dash="dash"),
+                        hovertemplate=(
+                            "Concurrency=%{x:.0f}<br>Tokens/s=%{y:.2f}<extra>%{fullData.name}</extra>"
+                        ),
+                    )
+                )
         fig.update_layout(
             title="Throughput per GPU vs Concurrency",
             xaxis_title="Concurrency per GPU",
