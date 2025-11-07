@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from ._paths import ensure_repo_root_on_path
+
+ensure_repo_root_on_path()
+
 import plotly.graph_objects as go
 
-from . import DashboardActions, DashboardState, register_tab
-from .common import HardwareSpec, WorkloadConfig, compute_estimate
+from .page_common import HardwareSpec, WorkloadConfig, compute_estimate
+from .tab_registry import DashboardActions, DashboardState, register_tab
 
 
 @register_tab("inferencemax", "InferenceMax Overview")

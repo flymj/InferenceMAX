@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+
+from ._paths import ensure_repo_root_on_path
+
+ensure_repo_root_on_path()
 
 from dashboard.features import (
     ChipSpec,
@@ -22,7 +24,7 @@ from services.llm_calcs import (
     prefill_decode_time_breakdown,
 )
 
-from . import DashboardActions, DashboardState, register_tab
+from .tab_registry import DashboardActions, DashboardState, register_tab
 
 
 @dataclass
@@ -159,7 +161,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             cfg=cfg,
             N=int(N_cards),
             seq_len=search_cfg.avg_input,
-            kv_len_decode=search_cfg.seq_len_kv,
+            kv_len=search_cfg.seq_len_kv,
             dtype_bytes=search_cfg.dtype_bytes,
             kv_dtype_bytes=search_cfg.dtype_bytes,
             top_k_override=None,
@@ -198,223 +200,47 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         top_k=None,
     )
     comp_df = profile.component_dataframe()
-    if comp_df is not None:
-        session_state["model_profile_components"] = comp_df
-    session_state["attention_kv_variants"] = profile.kv_bytes_by_variant(tp=1)
 
-    flops_prefill = profile.prefill_totals["total"]
-    flops_decode = profile.decode_totals["total"]
+    st.subheader("方案对比表")
+    st.dataframe(df, use_container_width=True)
 
-    df["flops_prefill_T"] = flops_prefill / 1e12
-    df["flops_decode_G"] = flops_decode / 1e9
-
-    kv_traffic = KvCacheTraffic(profile)
-    memory = kv_traffic.estimate(
-        input_tokens=search_cfg.avg_input,
-        kv_len_decode=search_cfg.seq_len_kv,
-        kv_cache_hit=search_cfg.kv_cache_hit,
-        tp=1,
+    st.subheader("算力/带宽 利用率")
+    conc_times = concurrency_adjusted_times(
+        df,
+        concurrency=search_cfg.concurrency,
+        alpha=search_cfg.alpha_conc,
+        spec_speedup=search_cfg.spec_speedup,
     )
 
-    df["bytes_weight_GB"] = memory.weight_bytes / 1e9
-    df["bytes_activation_GB"] = memory.activation_bytes / 1e9
-    df["bytes_kv_prefill_GB"] = memory.kv_prefill_bytes / 1e9
-    df["bytes_kv_decode_GB"] = memory.kv_decode_bytes / 1e9
-
-    hbm_eff_eff = search_cfg.chunked_prefill.adjust_hbm_efficiency(hbm_eff)
-
-    eff_tflops = effective_compute_tflops(tflops, mfu)
-    times_obj = prefill_decode_time_breakdown(
-        flops_prefill=flops_prefill,
-        flops_decode=flops_decode,
-        effective_tflops=eff_tflops,
-        memory=memory,
-        hbm_bw_GBs=float(hbm_bw),
-        hbm_eff=float(hbm_eff_eff),
+    eff_compute = effective_compute_tflops(
+        tflops=float(tflops),
+        mfu=float(mfu),
+        concurrency=search_cfg.concurrency,
+        alpha=search_cfg.alpha_conc,
+        spec_speedup=search_cfg.spec_speedup,
     )
 
-    df["TTFT_theory_ms"] = times_obj.ttft_theory_ms
-    df["TPOT_theory_ms"] = times_obj.tpot_theory_ms
-    df["T_comp_prefill_ms"] = times_obj.t_comp_prefill_ms
-    df["T_hbm_prefill_ms"] = times_obj.t_hbm_prefill_ms
-    df["T_comp_decode_ms"] = times_obj.t_comp_decode_ms
-    df["T_hbm_decode_ms"] = times_obj.t_hbm_decode_ms
+    c19, c20 = st.columns(2)
+    c19.metric("Effective TFLOPs", f"{eff_compute:.1f}")
+    c20.metric("Concurrency-adjusted TTFT", f"{conc_times.ttft_ms:.1f} ms")
 
-    adj = concurrency_adjusted_times(
-        times=times_obj,
-        concurrency=float(search_cfg.concurrency),
-        alpha=float(search_cfg.alpha_conc),
+    st.subheader("TTFT vs. Batch per GPU")
+    fig_ttft = plot_metric_vs_batch(df, metric="ttft_ms")
+    st.plotly_chart(fig_ttft, use_container_width=True)
+
+    st.subheader("TPOT vs. Batch per GPU")
+    fig_tpot = plot_metric_vs_batch(df, metric="tpot_ms")
+    st.plotly_chart(fig_tpot, use_container_width=True)
+
+    st.subheader("Prefill/Decode Breakdown")
+    breakdown_df = prefill_decode_time_breakdown(df, comp_df, search_cfg.avg_input, search_cfg.avg_output)
+    st.dataframe(breakdown_df, use_container_width=True)
+
+    st.subheader("KV Cache Traffic")
+    kv_traffic = KvCacheTraffic(df, search_cfg.seq_len_kv, search_cfg.dtype_bytes)
+    st.plotly_chart(kv_traffic.plot(), use_container_width=True)
+
+    st.subheader("并发修正结果")
+    st.markdown(
+        f"TTFT: {conc_times.ttft_ms:.2f} ms · TPOT: {conc_times.tpot_ms:.3f} ms/token · Throughput: {conc_times.throughput_tps:.2f} tok/s"
     )
-
-    df["N_eq"] = adj.n_eq
-    df["TTFT_eff_ms"] = adj.ttft_eff_ms
-    df["TPOT_eff_ms"] = adj.tpot_eff_ms
-
-    st.subheader("📊 TTFT / TPOT 理论与修正")
-    theory_ttft = float(df["TTFT_theory_ms"].iloc[0])
-    theory_tpot = float(df["TPOT_theory_ms"].iloc[0])
-
-    df_plot = pd.DataFrame(
-        {
-            "Metric": ["TTFT", "TPOT"],
-            "理论值(ms)": [theory_ttft, theory_tpot],
-            "修正后(ms)": [adj.ttft_eff_ms, adj.tpot_eff_ms],
-        }
-    )
-    st.table(df_plot)
-
-    st.metric("平衡并发度 N_eq", f"{adj.n_eq:.1f}×")
-    st.metric(
-        "修正后 TTFT",
-        f"{adj.ttft_eff_ms:.2f} ms",
-        delta=f"{((adj.ttft_eff_ms / theory_ttft) - 1.0) * 100:.1f}%" if theory_ttft else "0.0%",
-    )
-    st.metric(
-        "修正后 TPOT",
-        f"{adj.tpot_eff_ms:.3f} ms/token",
-        delta=f"{((adj.tpot_eff_ms / theory_tpot) - 1.0) * 100:.1f}%" if theory_tpot else "0.0%",
-    )
-
-    st.plotly_chart(
-        plot_metric_vs_batch(
-            df,
-            metric="TTFT_theory_ms",
-            sla=search_cfg.sla_ttft_ms,
-            logy=False,
-            title="TTFT vs Batch (理论)",
-        ),
-        use_container_width=True,
-    )
-    st.plotly_chart(
-        plot_metric_vs_batch(
-            df,
-            metric="TPOT_theory_ms",
-            sla=search_cfg.sla_tpot_ms,
-            logy=True,
-            title="TPOT vs Batch (理论)",
-        ),
-        use_container_width=True,
-    )
-
-    conc_range = np.linspace(1, max(adj.n_eq, 1.0) * 4, 50)
-    ttft_curve = []
-    tpot_curve = []
-    for c in conc_range:
-        curve_adj = concurrency_adjusted_times(
-            times=times_obj, concurrency=float(c), alpha=float(search_cfg.alpha_conc)
-        )
-        ttft_curve.append(curve_adj.ttft_eff_ms)
-        tpot_curve.append(curve_adj.tpot_eff_ms)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=conc_range, y=ttft_curve, mode="lines", name="TTFT修正"))
-    fig.add_trace(
-        go.Scatter(
-            x=conc_range,
-            y=[float(df["TTFT_theory_ms"].iloc[0])] * len(conc_range),
-            name="TTFT理论",
-            line=dict(dash="dot"),
-        )
-    )
-    fig.add_trace(go.Scatter(x=conc_range, y=tpot_curve, mode="lines", name="TPOT修正"))
-    fig.add_trace(
-        go.Scatter(
-            x=conc_range,
-            y=[float(df["TPOT_theory_ms"].iloc[0])] * len(conc_range),
-            name="TPOT理论",
-            line=dict(dash="dot"),
-        )
-    )
-    fig.add_vline(x=adj.n_eq, line=dict(color="red", dash="dash"), annotation_text="N_eq")
-    fig.update_layout(
-        title="TTFT/TPOT vs Concurrency",
-        xaxis_title="并发数",
-        yaxis_title="ms",
-        height=400,
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    d = df.copy().assign(
-        TTFT_theory_ms=lambda x: x["TTFT_theory_ms"].round(2),
-        TTFT_eff_ms=lambda x: x["TTFT_eff_ms"].round(2),
-        TPOT_theory_ms=lambda x: x["TPOT_theory_ms"].round(3),
-        TPOT_eff_ms=lambda x: x["TPOT_eff_ms"].round(3),
-        T_comp_prefill_ms=lambda x: x["T_comp_prefill_ms"].round(2),
-        T_hbm_prefill_ms=lambda x: x["T_hbm_prefill_ms"].round(2),
-        T_comp_decode_ms=lambda x: x["T_comp_decode_ms"].round(2),
-        T_hbm_decode_ms=lambda x: x["T_hbm_decode_ms"].round(2),
-        bytes_weight_GB=lambda x: x["bytes_weight_GB"].round(2),
-        bytes_kv_decode_GB=lambda x: x["bytes_kv_decode_GB"].round(2),
-    )
-
-    cols = [
-        "TTFT_theory_ms",
-        "TTFT_eff_ms",
-        "TPOT_theory_ms",
-        "TPOT_eff_ms",
-        "T_comp_prefill_ms",
-        "T_hbm_prefill_ms",
-        "T_comp_decode_ms",
-        "T_hbm_decode_ms",
-        "bytes_weight_GB",
-        "bytes_kv_decode_GB",
-        "N_eq",
-    ]
-
-    OK_BG, OK_FG = "#E8F5E9", "#1B5E20"
-    BAD_BG, BAD_FG = "#FFF4E5", "#8B5E00"
-
-    def style_sla(row: pd.Series) -> list[str]:
-        styles = [""] * len(row)
-        idx = {c: i for i, c in enumerate(d[cols].columns)}
-        if "TTFT_eff_ms" in idx:
-            i = idx["TTFT_eff_ms"]
-            styles[i] = (
-                f"background-color:{BAD_BG}; color:{BAD_FG}; font-weight:600;"
-                if row["TTFT_eff_ms"] > search_cfg.sla_ttft_ms
-                else f"background-color:{OK_BG}; color:{OK_FG}; font-weight:600;"
-            )
-        if "TPOT_eff_ms" in idx:
-            i = idx["TPOT_eff_ms"]
-            styles[i] = (
-                f"background-color:{BAD_BG}; color:{BAD_FG}; font-weight:600;"
-                if row["TPOT_eff_ms"] > search_cfg.sla_tpot_ms
-                else f"background-color:{OK_BG}; color:{OK_FG}; font-weight:600;"
-            )
-        return styles
-
-    st.dataframe(
-        d[cols].style.apply(style_sla, axis=1), use_container_width=True, height=420
-    )
-
-    with st.expander("📘 理论推导与参数解释", expanded=False):
-        st.markdown(
-            r"""
-### 1️⃣ 模型计算逻辑
-- **Attention FLOPs**
-  \[
-  FLOPs_{attn} = 4·H·d_{head}·D·mask_{ratio}
-  \]
-  若 causal mask ⇒ mask_ratio=0.5。
-  若 Linear Attention ⇒ 2·H·r·d_v·L。
-
-- **FFN/MoE**
-  - Dense: \(8·D^2·ffn_{mult}\)
-  - MoE: \(4·D^2·ffn_{mult}·(top_k/E_{total})·cap_f·(1+router_{aux})\)
-
-- **GQA/MLA修正**
-  - GQA: 仅部分 head 参与 KV，计算减半。
-  - MLA: 按窗口/层分级减少 \(L_{kv}\)。
-
-### 2️⃣ HBM Traffic
-  \[
-  Bytes_{HBM} = Bytes_{weights} + Bytes_{activations} + Bytes_{KV}
-  \]
-
-### 3️⃣ 并发修正
-- $N_{conc}$: 实际并发度。
-- $\alpha$: 并发平滑系数，越大表示越快逼近饱和。
-- $N_{eq}$: 令修正后 TTFT/TPOT 等于理论值的等效并发度。
-            """,
-            unsafe_allow_html=False,
-        )

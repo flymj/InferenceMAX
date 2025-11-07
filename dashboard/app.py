@@ -2,7 +2,7 @@
 
 from .components.header import render_header
 from .components.sidebar import render_sidebar
-from .tabs import render_tabs
+from .tab_registry import render_tabs
 
 
 def main() -> None:

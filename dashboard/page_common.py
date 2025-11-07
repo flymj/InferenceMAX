@@ -1,6 +1,8 @@
-"""Shared utilities for dashboard tabs."""
+"""Shared utilities for dashboard pages."""
 
-from .calculations import (
+from __future__ import annotations
+
+from .page_calculations import (
     EstimateBreakdown,
     HardwareSpec,
     WorkloadConfig,

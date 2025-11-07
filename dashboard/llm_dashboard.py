@@ -25,7 +25,7 @@ from dashboard.features import (
 )
 
 from models import build_model
-from dashboard.tabs import (
+from dashboard.tab_registry import (
     DashboardActions,
     DashboardState,
     get_registered_tabs,

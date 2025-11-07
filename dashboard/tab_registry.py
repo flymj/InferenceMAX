@@ -1,12 +1,18 @@
+"""Registration helpers for dashboard pages."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ._paths import ensure_repo_root_on_path
+
+ensure_repo_root_on_path()
+
 
 @dataclass
 class DashboardState:
-    """Mutable data that tabs rely on for rendering."""
+    """Mutable data that pages rely on for rendering."""
 
     st: Any
     session_state: Any
@@ -26,37 +32,39 @@ class DashboardActions:
 
 
 @dataclass
-class _TabDefinition:
+class _PageDefinition:
     name: str
     title: str
     render: Callable[[DashboardState, DashboardActions], None]
 
 
-_registry: Dict[str, _TabDefinition] = {}
+_registry: Dict[str, _PageDefinition] = {}
 
 
 def register_tab(
     name: str, title: str
 ) -> Callable[[Callable[[DashboardState, DashboardActions], None]], Callable[[DashboardState, DashboardActions], None]]:
-    """Decorator used by tab modules to register themselves."""
+    """Decorator used by page modules to register themselves."""
 
-    def decorator(func: Callable[[DashboardState, DashboardActions], None]) -> Callable[[DashboardState, DashboardActions], None]:
+    def decorator(
+        func: Callable[[DashboardState, DashboardActions], None]
+    ) -> Callable[[DashboardState, DashboardActions], None]:
         if name in _registry:
             raise ValueError(f"Tab '{name}' already registered")
-        _registry[name] = _TabDefinition(name=name, title=title, render=func)
+        _registry[name] = _PageDefinition(name=name, title=title, render=func)
         return func
 
     return decorator
 
 
-def get_registered_tabs() -> List[_TabDefinition]:
-    """Return registered tab definitions in registration order."""
+def get_registered_tabs() -> List[_PageDefinition]:
+    """Return registered page definitions in registration order."""
 
     return list(_registry.values())
 
 
-def resolve_tabs(names: Optional[Iterable[str]] = None) -> List[_TabDefinition]:
-    """Return tab definitions filtered by ``name`` or ``title``.
+def resolve_tabs(names: Optional[Iterable[str]] = None) -> List[_PageDefinition]:
+    """Return page definitions filtered by ``name`` or ``title``.
 
     Args:
         names: Optional iterable of identifiers matching either the
@@ -65,7 +73,7 @@ def resolve_tabs(names: Optional[Iterable[str]] = None) -> List[_TabDefinition]:
 
     Raises:
         KeyError: If any requested identifiers do not correspond to a
-            registered tab.
+            registered page.
     """
 
     tabs = get_registered_tabs()
@@ -76,7 +84,7 @@ def resolve_tabs(names: Optional[Iterable[str]] = None) -> List[_TabDefinition]:
     lookup = {tab.name: tab for tab in tabs}
     lookup.update({tab.title: tab for tab in tabs})
 
-    resolved: List[_TabDefinition] = []
+    resolved: List[_PageDefinition] = []
     missing: List[str] = []
     for item in requested:
         tab = lookup.get(item)
@@ -97,31 +105,10 @@ def render_tab_group(
     state: DashboardState,
     actions: DashboardActions,
     *,
-    tabs: Optional[Sequence[_TabDefinition]] = None,
+    tabs: Optional[Sequence[_PageDefinition]] = None,
     tab_widgets: Optional[Sequence[Any]] = None,
-) -> Tuple[Sequence[Any], List[_TabDefinition]]:
-    """Render dashboard tabs inside the provided Streamlit containers.
-
-    This helper centralises the rendering contract shared by every tab and
-    allows other Streamlit entrypoints to embed the same modules without
-    duplicating boilerplate.
-
-    Args:
-        state: Shared mutable dashboard state passed to every tab.
-        actions: Common helper callbacks used during rendering.
-        tabs: Optional explicit ordering of tab definitions. When omitted,
-            all registered tabs are used.
-        tab_widgets: Optional sequence of Streamlit containers returned by
-            ``st.tabs`` (or compatible API). When omitted, ``state.st`` is
-            used to create a new tab bar for the selected tab titles.
-
-    Returns:
-        A tuple ``(containers, definitions)`` where ``containers`` is the
-        sequence of Streamlit tab containers that were rendered into and
-        ``definitions`` is the resolved list of tab definitions in render
-        order. Returning both enables callers to append additional tabs or
-        inspect metadata after rendering.
-    """
+) -> Tuple[Sequence[Any], List[_PageDefinition]]:
+    """Render dashboard pages inside the provided Streamlit containers."""
 
     resolved_tabs = list(tabs) if tabs is not None else get_registered_tabs()
     if not resolved_tabs:
@@ -139,19 +126,31 @@ def render_tab_group(
 
 
 def render_tabs() -> None:
-    """Render the dashboard tabs inside the default layout.
-
-    The legacy ``dashboard.app`` entrypoint expects a callable with this name,
-    but the fully featured Streamlit experience is orchestrated from
-    ``dashboard.llm_dashboard``. Keeping this no-op preserves compatibility
-    without duplicating the complex rendering pipeline.
-    """
+    """Render the dashboard tabs inside the default layout."""
 
     return None
 
 
-# Import built-in tabs so they register on module import.
-from . import scale_up_search  # noqa: E402,F401
-from . import regression_calibration  # noqa: E402,F401
-from . import inferencemax  # noqa: E402,F401
-from . import inferencemax_v2  # noqa: E402,F401
+# Import built-in pages so they register on module import.
+from . import (  # noqa: E402,F401
+    page_quick_estimation,
+    page_attention_vs_head_dim,
+    page_quick_memory,
+    page_host_bandwidth,
+    page_experts_calculation,
+    page_scale_up_search,
+    page_regression_calibration,
+    page_inferencemax,
+    page_inferencemax_v2,
+)
+
+
+__all__ = [
+    "DashboardActions",
+    "DashboardState",
+    "get_registered_tabs",
+    "register_tab",
+    "render_tab_group",
+    "render_tabs",
+    "resolve_tabs",
+]

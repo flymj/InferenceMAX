@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from ._paths import ensure_repo_root_on_path
+
+ensure_repo_root_on_path()
+
 from typing import List
 
 import numpy as np
 import pandas as pd
 
-from . import DashboardActions, DashboardState, register_tab
-from .common import HardwareSpec, WorkloadConfig, compute_estimate, parse_measurement_csv
+from .page_common import HardwareSpec, WorkloadConfig, compute_estimate, parse_measurement_csv
+from .tab_registry import DashboardActions, DashboardState, register_tab
 
 
 @register_tab("regression_calibration", "Regression Calibration")
