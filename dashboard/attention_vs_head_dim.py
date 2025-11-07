@@ -8,7 +8,7 @@ from typing import Callable
 import pandas as pd
 import plotly.graph_objects as go
 
-from .app_context import DashboardActions, DashboardState, bootstrap
+from dashboard.app_context import DashboardActions, DashboardState, bootstrap
 
 
 def _default_attn_component_flops_prefill_fa3(

@@ -6,7 +6,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from ._paths import ensure_repo_root_on_path
+from dashboard._paths import ensure_repo_root_on_path
 
 ensure_repo_root_on_path()
 
@@ -24,7 +24,7 @@ from services.llm_calcs import (
     prefill_decode_time_breakdown,
 )
 
-from .app_context import DashboardActions, DashboardState, bootstrap
+from dashboard.app_context import DashboardActions, DashboardState, bootstrap
 
 
 @dataclass

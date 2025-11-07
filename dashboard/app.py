@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from ._paths import ensure_repo_root_on_path
+from dashboard._paths import ensure_repo_root_on_path
 
 ensure_repo_root_on_path()
 

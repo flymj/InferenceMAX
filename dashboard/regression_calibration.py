@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ._paths import ensure_repo_root_on_path
+from dashboard._paths import ensure_repo_root_on_path
 
 ensure_repo_root_on_path()
 
@@ -9,8 +9,13 @@ from typing import List
 import numpy as np
 import pandas as pd
 
-from .app_context import DashboardActions, DashboardState, bootstrap
-from .page_common import HardwareSpec, WorkloadConfig, compute_estimate, parse_measurement_csv
+from dashboard.app_context import DashboardActions, DashboardState, bootstrap
+from dashboard.page_common import (
+    HardwareSpec,
+    WorkloadConfig,
+    compute_estimate,
+    parse_measurement_csv,
+)
 
 
 def render(state: DashboardState, actions: DashboardActions) -> None:
