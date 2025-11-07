@@ -301,7 +301,9 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     st.dataframe(breakdown_df, use_container_width=True)
 
     st.subheader("KV Cache Traffic")
-    kv_traffic = KvCacheTraffic(df, search_cfg.seq_len_kv, search_cfg.dtype_bytes)
+    kv_traffic = KvCacheTraffic(
+        df=df, seq_len_kv=search_cfg.seq_len_kv, dtype_bytes=search_cfg.dtype_bytes
+    )
     st.plotly_chart(kv_traffic.plot(), use_container_width=True)
 
     st.subheader("并发修正结果")
