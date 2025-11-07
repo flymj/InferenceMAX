@@ -451,11 +451,34 @@ def get_example_config(name: str) -> Dict[str, float]:
     return base
 
 
-def apply_config_to_state(config: Dict[str, float]) -> None:
-    """Write configuration values into Streamlit session state."""
+_PENDING_CONFIG_KEY = "_pending_config_updates"
+_CONFIG_FEEDBACK_KEY = "_config_feedback_message"
 
-    for key, value in config.items():
+
+def _queue_config_update(config: Dict[str, float]) -> None:
+    """Store configuration overrides to be applied on the next safe rerun."""
+
+    if not config:
+        return
+    pending = st.session_state.get(_PENDING_CONFIG_KEY, {})
+    pending.update(config)
+    st.session_state[_PENDING_CONFIG_KEY] = pending
+
+
+def flush_pending_config_updates() -> None:
+    """Apply queued configuration values before widget instantiation."""
+
+    pending = st.session_state.pop(_PENDING_CONFIG_KEY, None)
+    if not pending:
+        return
+    for key, value in pending.items():
         st.session_state[key] = value
+
+
+def apply_config_to_state(config: Dict[str, float]) -> None:
+    """Queue configuration values for application on the next rerun."""
+
+    _queue_config_update(config)
 
 
 def ensure_session_defaults() -> None:
@@ -464,6 +487,7 @@ def ensure_session_defaults() -> None:
     defaults = get_example_config("MMA-FP16")
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+    flush_pending_config_updates()
 
 
 def render_sidebar() -> Dict[str, float]:
@@ -472,10 +496,13 @@ def render_sidebar() -> Dict[str, float]:
     st.sidebar.title("参数配置")
     if st.sidebar.button("重置：MMA-FP16"):
         apply_config_to_state(get_example_config("MMA-FP16"))
+        st.experimental_rerun()
     if st.sidebar.button("重置：GMMA-RS-BF16"):
         apply_config_to_state(get_example_config("GMMA-RS-BF16"))
+        st.experimental_rerun()
     if st.sidebar.button("重置：GMMA-SS-FP8"):
         apply_config_to_state(get_example_config("GMMA-SS-FP8"))
+        st.experimental_rerun()
 
     mode = st.sidebar.radio("模式", ["MMA", "GMMA"], index=0 if st.session_state.get("mode", "MMA") == "MMA" else 1, key="mode")
     gmma_variant = st.sidebar.radio(
@@ -588,6 +615,9 @@ def render_parameter_snapshot(params: Dict[str, float]) -> None:
     """Render JSON snapshot with download/upload controls."""
 
     st.subheader("参数快照")
+    feedback = st.session_state.pop(_CONFIG_FEEDBACK_KEY, None)
+    if feedback:
+        st.success(feedback)
     snapshot = json.dumps(params, indent=2)
     st.code(snapshot, language="json")
     st.download_button("下载当前配置", data=snapshot, file_name="mma_modeler_config.json", mime="application/json")
@@ -596,7 +626,8 @@ def render_parameter_snapshot(params: Dict[str, float]) -> None:
         try:
             data = json.load(uploaded)
             apply_config_to_state(data)
-            st.success("配置已加载，请在侧边栏确认。")
+            st.session_state[_CONFIG_FEEDBACK_KEY] = "配置已加载，请在侧边栏确认。"
+            st.experimental_rerun()
         except Exception as exc:  # noqa: BLE001
             st.error(f"解析失败：{exc}")
 
