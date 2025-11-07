@@ -1,3 +1,5 @@
+"""Shared calculations for dashboard pages."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,7 +7,7 @@ from typing import Dict, List, Sequence
 
 import pandas as pd
 
-from .. import DashboardActions
+from .app_context import DashboardActions
 
 
 @dataclass(frozen=True)
@@ -22,7 +24,7 @@ class WorkloadConfig:
 
 @dataclass(frozen=True)
 class HardwareSpec:
-    """Hardware related knobs shared by tabs."""
+    """Hardware related knobs shared by pages."""
 
     tensor_tflops: float
     mfu: float
@@ -236,13 +238,47 @@ def generate_search_table(
 
 
 def parse_measurement_csv(text: str) -> pd.DataFrame:
-    """Parse CSV-like user input used by the regression tab."""
+    """Parse measurement CSV/TSV data pasted into a text area."""
 
-    if not text.strip():
+    if not text:
         return pd.DataFrame()
+
     from io import StringIO
 
     try:
-        return pd.read_csv(StringIO(text))
+        df = pd.read_csv(StringIO(text))
     except Exception:
-        return pd.DataFrame()
+        try:
+            df = pd.read_csv(StringIO(text), sep="\t")
+        except Exception:
+            return pd.DataFrame()
+
+    expected_cols = [
+        "tp",
+        "dp",
+        "batch_per_gpu",
+        "seq_len",
+        "decode_tokens",
+        "grad_accum",
+        "measured_prefill_ms",
+        "measured_decode_ms",
+    ]
+    missing = set(expected_cols).difference(df.columns)
+    for col in missing:
+        if col == "grad_accum":
+            df[col] = 1
+        else:
+            df[col] = 0
+
+    return df[expected_cols]
+
+
+__all__ = [
+    "EstimateBreakdown",
+    "HardwareSpec",
+    "WorkloadConfig",
+    "aggregate_component_times",
+    "compute_estimate",
+    "generate_search_table",
+    "parse_measurement_csv",
+]

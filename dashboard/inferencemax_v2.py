@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from ._paths import ensure_repo_root_on_path
+
+ensure_repo_root_on_path()
+
 from typing import List
 
 import pandas as pd
 import plotly.graph_objects as go
 
-from . import DashboardActions, DashboardState, register_tab
-from .common import HardwareSpec, WorkloadConfig, compute_estimate
+from .app_context import DashboardActions, DashboardState, bootstrap
+from .page_common import HardwareSpec, WorkloadConfig, compute_estimate
 
 
-@register_tab("inferencemax_v2", "InferenceMax v2")
 def render(state: DashboardState, actions: DashboardActions) -> None:
     st = state.st
     session_state = state.session_state
@@ -169,24 +172,28 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         "Decode HBM",
         "Decode comm",
     ]:
+        subset = [item for item in stacked if item["component"] == component]
         fig.add_trace(
             go.Bar(
                 name=component,
-                x=[item["name"] for item in records],
-                y=[item["ms"] for item in stacked if item["component"] == component],
+                x=[item["name"] for item in subset],
+                y=[item["ms"] for item in subset],
             )
         )
+
     fig.update_layout(
         barmode="stack",
         xaxis_title="Scenario",
-        yaxis_title="Latency contribution (ms)",
-        height=460,
+        yaxis_title="Latency (ms)",
+        height=480,
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    st.download_button(
-        "Download CSV",
-        result_df.to_csv(index=False).encode("utf-8"),
-        file_name="inferencemax_v2_scenarios.csv",
-        mime="text/csv",
-    )
+
+def main() -> None:
+    state, actions = bootstrap("InferenceMax v2")
+    render(state, actions)
+
+
+if __name__ == "__main__":
+    main()

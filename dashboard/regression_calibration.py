@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from ._paths import ensure_repo_root_on_path
+
+ensure_repo_root_on_path()
+
 from typing import List
 
 import numpy as np
 import pandas as pd
 
-from . import DashboardActions, DashboardState, register_tab
-from .common import HardwareSpec, WorkloadConfig, compute_estimate, parse_measurement_csv
+from .app_context import DashboardActions, DashboardState, bootstrap
+from .page_common import HardwareSpec, WorkloadConfig, compute_estimate, parse_measurement_csv
 
 
-@register_tab("regression_calibration", "Regression Calibration")
 def render(state: DashboardState, actions: DashboardActions) -> None:
     st = state.st
     session_state = state.session_state
@@ -186,3 +189,12 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     st.subheader("Fit quality")
     result_df = pd.DataFrame(predicted_rows)
     st.dataframe(result_df, use_container_width=True)
+
+
+def main() -> None:
+    state, actions = bootstrap("Regression Calibration")
+    render(state, actions)
+
+
+if __name__ == "__main__":
+    main()
