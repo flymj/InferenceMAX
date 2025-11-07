@@ -548,13 +548,13 @@ def render_sidebar() -> Dict[str, float]:
     st.sidebar.title("参数配置")
     if st.sidebar.button("重置：MMA-FP16"):
         apply_config_to_state(get_example_config("MMA-FP16"))
-        st.experimental_rerun()
+        st.rerun()
     if st.sidebar.button("重置：GMMA-RS-BF16"):
         apply_config_to_state(get_example_config("GMMA-RS-BF16"))
-        st.experimental_rerun()
+        st.rerun()
     if st.sidebar.button("重置：GMMA-SS-FP8"):
         apply_config_to_state(get_example_config("GMMA-SS-FP8"))
-        st.experimental_rerun()
+        st.rerun()
 
     mode = st.sidebar.radio("模式", ["MMA", "GMMA"], index=0 if st.session_state.get("mode", "MMA") == "MMA" else 1, key="mode")
     gmma_variant = st.sidebar.radio(
