@@ -109,13 +109,6 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         avg_output = c4.number_input("平均输出 tokens (avg_output)", 1, 32768, 256, step=16, key="avg_out_tokens")
         seq_len_kv = c5.number_input("Decode KV 长度 (L_kv)", 128, 131072, 4096, step=128, key="seq_len_kv")
 
-        do_search = st.button(
-            "Run search",
-            type="primary",
-            use_container_width=False,
-            key="scale_up_dashboard_run_search",
-        )
-
     with st.expander("硬件参数", expanded=True):
         c5, c6, c7 = st.columns(3)
         tflops = c5.number_input("芯片峰值算力 (TFLOPs)", 10.0, 2000.0, 600.0, step=10.0)
@@ -143,6 +136,13 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         alpha_conc = c17.slider("并发平滑系数 α", 1.0, 3.0, 1.7, 0.1)
         spec_speedup = c18.slider("Speculative 解码加速", 1.0, 3.0, 1.3, 0.1)
 
+    do_search = st.button(
+        "开始搜索",
+        type="primary",
+        use_container_width=True,
+        key="scale_up_dashboard_run_search",
+    )
+
     search_cfg = _SearchConfig(
         chip=ChipSpec(float(tflops), float(mfu), float(hbm_bw), float(hbm_bw * 0.3)),
         sla_ttft_ms=float(sla_ttft_ms),
@@ -167,7 +167,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             cfg=cfg,
             N=int(N_cards),
             seq_len=search_cfg.avg_input,
-            kv_len=search_cfg.seq_len_kv,
+            kv_len_decode=search_cfg.seq_len_kv,
             dtype_bytes=search_cfg.dtype_bytes,
             kv_dtype_bytes=search_cfg.dtype_bytes,
             top_k_override=None,
