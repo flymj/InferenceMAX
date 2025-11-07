@@ -114,7 +114,37 @@ def calc_tile_metrics(params: Dict[str, float]) -> Dict[str, object]:
     cap_needed_bytes = alpha * (a_bytes + b_bytes + d_read_bytes)
     cap_needed_KB = cap_needed_bytes / 1024.0
     smem_cap_limit_KB = float(params.get("SMEM_capacity_per_block_KB", 192.0))
-    cap_ok = cap_needed_KB <= smem_cap_limit_KB + EPSILON
+    l1_cap_limit_KB = float(params.get("L1_capacity_per_SM_KB", 256.0))
+    l2_cap_limit_KB = float(params.get("L2_capacity_per_GPU_KB", 98304.0))
+
+    capacity_requirements = {
+        "SMEM": cap_needed_bytes,
+        "L1": l1_request,
+        "L2": bytes_map["L2"]["read"] + bytes_map["L2"]["write"],
+        "HBM": bytes_map["HBM"]["read"] + bytes_map["HBM"]["write"],
+    }
+
+    capacity_limits = {
+        "SMEM": smem_cap_limit_KB * 1024.0,
+        "L1": l1_cap_limit_KB * 1024.0,
+        "L2": l2_cap_limit_KB * 1024.0,
+        "HBM": float(params.get("HBM_capacity_per_GPU_GB", 0.0)) * (1024.0**3),
+    }
+
+    capacity_checks: Dict[str, Dict[str, float]] = {}
+    for layer, need_bytes in capacity_requirements.items():
+        limit_bytes = capacity_limits.get(layer, 0.0)
+        if limit_bytes <= EPSILON:
+            ok = True
+        else:
+            ok = need_bytes <= limit_bytes + EPSILON
+        capacity_checks[layer] = {
+            "need_bytes": need_bytes,
+            "limit_bytes": limit_bytes,
+            "ok": ok,
+        }
+
+    cap_ok = capacity_checks.get("SMEM", {}).get("ok", True)
 
     bottlenecks: List[Dict[str, float]] = []
     cap_ratios: List[float] = []
@@ -177,6 +207,10 @@ def calc_tile_metrics(params: Dict[str, float]) -> Dict[str, object]:
         "bottlenecks": bottlenecks,
         "cap_needed_KB": cap_needed_KB,
         "cap_ok": cap_ok,
+        "capacity_requirements": capacity_requirements,
+        "capacity_limits": capacity_limits,
+        "capacity_checks": capacity_checks,
+        "capacity_all_ok": all(check["ok"] for check in capacity_checks.values()),
         "HBM_total_bytes_read": bytes_map["HBM"]["read"],
         "HBM_total_bytes_write": bytes_map["HBM"]["write"],
         "MFU_cap_estimate": MFU_cap_estimate,
@@ -297,21 +331,36 @@ def analyze_bottlenecks(bottlenecks: List[Dict[str, float]]) -> tuple[pd.DataFra
 
 
 def make_capacity_message(metrics: Dict[str, object], params: Dict[str, float]) -> str:
-    """Create a textual summary for SMEM capacity usage."""
+    """Create a textual summary for on-chip capacity usage."""
 
-    cap_needed = metrics["cap_needed_KB"]
-    cap_limit = params.get("SMEM_capacity_per_block_KB", 0.0)
     warps = params.get("warps_per_block", 0)
     blocks_per_sm = params.get("blocks_per_SM", 0)
     active_sms = params.get("active_SMs", 0)
-    if metrics["cap_ok"]:
-        status = "🟢 满足 SMEM 容量约束"
-    else:
-        status = "🔴 超出 SMEM 容量，请减小 tile 或降低 α/gamma。"
-    return (
-        f"{status}：需要 {cap_needed:.1f} KB / 上限 {cap_limit:.1f} KB。\n"
-        f"并发提示：{warps} warps/block, {blocks_per_sm} blocks/SM, 活跃 SM≈{active_sms}。"
-    )
+
+    layer_units = {
+        "SMEM": ("KB", 1024.0),
+        "L1": ("KB", 1024.0),
+        "L2": ("MB", 1024.0**2),
+    }
+
+    lines: List[str] = []
+    for layer, (unit, factor) in layer_units.items():
+        check = metrics["capacity_checks"].get(layer)
+        if not check:
+            continue
+        limit_bytes = check["limit_bytes"]
+        if limit_bytes <= EPSILON:
+            continue
+        need_value = check["need_bytes"] / factor
+        limit_value = limit_bytes / factor
+        status = "🟢" if check["ok"] else "🔴"
+        lines.append(f"{status} {layer}: 需求 {need_value:.1f} {unit} / 上限 {limit_value:.1f} {unit}")
+
+    if not lines:
+        lines.append("ℹ️ 尚未设置 L1/L2 容量上限，默认忽略片上缓存容量约束。")
+
+    lines.append(f"并发提示：{warps} warps/block, {blocks_per_sm} blocks/SM, 活跃 SM≈{active_sms}。")
+    return "\n".join(lines)
 
 
 def run_auto_tuner(base_params: Dict[str, float], objective: str) -> pd.DataFrame:
@@ -328,7 +377,7 @@ def run_auto_tuner(base_params: Dict[str, float], objective: str) -> pd.DataFram
                 candidate = dict(base_params)
                 candidate.update({"Mt": Mt, "Nt": Nt, "Kt": Kt})
                 metrics = calc_tile_metrics(candidate)
-                if not metrics["cap_ok"]:
+                if not metrics["capacity_all_ok"]:
                     continue
                 ratios = []
                 for layer, direction in [
@@ -389,6 +438,9 @@ def get_example_config(name: str) -> Dict[str, float]:
         "B_L1_cap_cycle": 64.0,
         "B_SMEM_cap_cycle": 128.0,
         "SMEM_capacity_per_block_KB": 192.0,
+        "L1_capacity_per_SM_KB": 256.0,
+        "L2_capacity_per_GPU_KB": 98304.0,
+        "HBM_capacity_per_GPU_GB": 80.0,
         "warps_per_block": 8,
         "blocks_per_SM": 2,
         "active_SMs": 80,
@@ -563,6 +615,27 @@ def render_sidebar() -> Dict[str, float]:
     SMEM_capacity_per_block = st.sidebar.number_input(
         "每块 SMEM 容量 (KB)", min_value=32.0, value=float(st.session_state.get("SMEM_capacity_per_block_KB", 192.0)), key="SMEM_capacity_per_block_KB"
     )
+    L1_capacity_per_sm = st.sidebar.number_input(
+        "L1 容量 / SM (KB)",
+        min_value=0.0,
+        value=float(st.session_state.get("L1_capacity_per_SM_KB", 256.0)),
+        step=16.0,
+        key="L1_capacity_per_SM_KB",
+    )
+    L2_capacity_per_gpu = st.sidebar.number_input(
+        "L2 总容量 (KB)",
+        min_value=0.0,
+        value=float(st.session_state.get("L2_capacity_per_GPU_KB", 98304.0)),
+        step=1024.0,
+        key="L2_capacity_per_GPU_KB",
+    )
+    HBM_capacity_per_gpu = st.sidebar.number_input(
+        "HBM 总容量 (GB)",
+        min_value=0.0,
+        value=float(st.session_state.get("HBM_capacity_per_GPU_GB", 80.0)),
+        step=1.0,
+        key="HBM_capacity_per_GPU_GB",
+    )
     warps_per_block = st.sidebar.number_input("warps/block", min_value=1, value=int(st.session_state.get("warps_per_block", 8)), key="warps_per_block")
     blocks_per_SM = st.sidebar.number_input("blocks/SM", min_value=1, value=int(st.session_state.get("blocks_per_SM", 2)), key="blocks_per_SM")
     active_SMs = st.sidebar.number_input("活跃 SM 数", min_value=1, value=int(st.session_state.get("active_SMs", 80)), key="active_SMs")
@@ -602,6 +675,9 @@ def render_sidebar() -> Dict[str, float]:
         "B_L1_cap_cycle": float(B_L1_cap),
         "B_SMEM_cap_cycle": float(B_SMEM_cap),
         "SMEM_capacity_per_block_KB": float(SMEM_capacity_per_block),
+        "L1_capacity_per_SM_KB": float(L1_capacity_per_sm),
+        "L2_capacity_per_GPU_KB": float(L2_capacity_per_gpu),
+        "HBM_capacity_per_GPU_GB": float(HBM_capacity_per_gpu),
         "warps_per_block": int(warps_per_block),
         "blocks_per_SM": int(blocks_per_SM),
         "active_SMs": int(active_SMs),
@@ -697,6 +773,48 @@ def render_app() -> None:
     with tabs[2]:
         st.subheader("片上资源")
         st.info(make_capacity_message(metrics, params))
+        unit_map = {
+            "SMEM": ("KB", 1024.0),
+            "L1": ("KB", 1024.0),
+            "L2": ("MB", 1024.0**2),
+            "HBM": ("GB", 1024.0**3),
+        }
+        capacity_rows: List[Dict[str, object]] = []
+        for layer in ["SMEM", "L1", "L2", "HBM"]:
+            check = metrics["capacity_checks"].get(layer)
+            if not check:
+                continue
+            limit_bytes = check["limit_bytes"]
+            need_bytes = check["need_bytes"]
+            unit, factor = unit_map.get(layer, ("Byte", 1.0))
+            if limit_bytes <= EPSILON and need_bytes <= EPSILON:
+                continue
+            limit_value = limit_bytes / factor if limit_bytes > EPSILON else np.nan
+            need_value = need_bytes / factor
+            utilization = need_bytes / limit_bytes if limit_bytes > EPSILON else np.nan
+            capacity_rows.append(
+                {
+                    "层级": layer,
+                    "需求 ({})".format(unit): need_value,
+                    "上限 ({})".format(unit): limit_value,
+                    "占用比例": utilization,
+                }
+            )
+        if capacity_rows:
+            cap_df = pd.DataFrame(capacity_rows)
+            st.dataframe(
+                cap_df.style.format(
+                    {
+                        "需求 (KB)": "{:.1f}",
+                        "需求 (MB)": "{:.3f}",
+                        "需求 (GB)": "{:.3f}",
+                        "上限 (KB)": "{:.1f}",
+                        "上限 (MB)": "{:.3f}",
+                        "上限 (GB)": "{:.3f}",
+                        "占用比例": "{:.2%}",
+                    }
+                )
+            )
         if params.get("auto_enabled"):
             st.subheader("自动推导候选")
             candidates = run_auto_tuner(params, params.get("auto_objective", "Max AI"))
@@ -733,7 +851,8 @@ def run_sanity_tests() -> None:
     assert abs(metrics["F_t"] - expected_F_t) < 1e-3
     assert metrics["cycles_per_tile"] > 0
     assert metrics["B_need"]["HBM"]["read"] >= 0.0
-    assert metrics["cap_ok"]
+    assert metrics["capacity_checks"]["SMEM"]["ok"]
+    assert metrics["capacity_all_ok"]
 
 
 if __name__ == "__main__":
