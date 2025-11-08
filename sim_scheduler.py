@@ -2,9 +2,9 @@
 =================
 
 Discrete-event simulator for a vLLM-style scheduler supporting continuous
-batching and chunked prefills.  The module exposes a command line interface
-that performs parameter sweeps, evaluates SLA constraints, and exports
-metrics/plots for further analysis.
+batching and chunked prefills.  The module exposes both a command line
+interface and optional Streamlit UI to perform parameter sweeps, evaluate SLA
+constraints, and export metrics/plots for further analysis.
 
 Quick start
 -----------
@@ -14,7 +14,7 @@ To run a default sweep and write results/plots:
 ```
 python sim_scheduler.py --concurrency-list 64 128 --times-per-concurrency 4 \
     --min-input 4096 --max-input 8192 --min-output 32 --max-output 128 \
-    --tp 8 --dp 1 --ep 1 8 --num-gpus 8 --out-csv results.csv --out-dir charts
+    --tp 8 --dp 1 --ep 1 --num-gpus 8 --out-csv results.csv --out-dir charts
 ```
 
 The command emits a textual summary, a CSV table with one row per grid point,
@@ -22,13 +22,14 @@ and diagnostic figures for each simulation.  The CLI exposes additional flags
 to adjust scheduler knobs, SLA targets, arrival shaping, and randomness seeds.
 Passing ``--model-config path/to/config.json`` loads a model definition from
 the dashboard registry, enabling cost-aware scheduling that differentiates
-prefill and decode FLOPs/HBM consumption and records the phase-wise totals in
-the exported CSV/summary output.
+prefill and decode FLOPs/HBM consumption.  Providing ``--device-caps`` with a
+hardware capability JSON file fuses the simulation with realistic compute and
+HBM bandwidth envelopes, producing time-based TTFT/TPOT estimates alongside the
+step statistics.  The optional :mod:`app` module offers a Streamlit-driven UI
+to tweak the same knobs interactively.
 
-The module is self-contained and does not require external dependencies beyond
-the Python standard library, NumPy, and matplotlib.  Streamlit support can be
-added in a separate ``app.py`` if desired, but is optional for using the
-simulator.
+The simulator only depends on the Python standard library plus NumPy and
+matplotlib (for plotting).  Streamlit is required solely when launching the UI.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ import statistics
 from collections import deque
 from dataclasses import dataclass, field
 from itertools import product
-from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -172,6 +173,112 @@ class KVCapacityTracker:
         if delta < 0:
             raise ValueError("free expects non-negative delta")
         self.used_tokens = max(0, self.used_tokens - delta)
+
+
+@dataclass
+class DeviceCapabilities:
+    """Represents per-device compute and memory characteristics."""
+
+    name: str
+    peak_tflops: float
+    tensor_mfu: float
+    hbm_bandwidth_GBps: float
+    hbm_efficiency: float
+    scheduler_overhead_ms: float = 0.0
+
+    @property
+    def achievable_flops_per_ms(self) -> float:
+        """Effective FLOPs the device can sustain per millisecond."""
+
+        if self.peak_tflops <= 0 or self.tensor_mfu <= 0:
+            return 0.0
+        return self.peak_tflops * 1e12 * self.tensor_mfu / 1000.0
+
+    @property
+    def achievable_hbm_bytes_per_ms(self) -> float:
+        """Effective HBM bandwidth expressed in bytes per millisecond."""
+
+        if self.hbm_bandwidth_GBps <= 0 or self.hbm_efficiency <= 0:
+            return 0.0
+        return self.hbm_bandwidth_GBps * 1e9 * self.hbm_efficiency / 1000.0
+
+    def step_time_ms(self, flops: float, hbm_bytes: float) -> float:
+        """Estimate the time to execute a step consuming the given resources."""
+
+        compute_ms = 0.0
+        bandwidth_ms = 0.0
+        flops_per_ms = self.achievable_flops_per_ms
+        if flops_per_ms > 0:
+            compute_ms = float(flops) / flops_per_ms
+        hbm_per_ms = self.achievable_hbm_bytes_per_ms
+        if hbm_per_ms > 0:
+            bandwidth_ms = float(hbm_bytes) / hbm_per_ms
+        return max(compute_ms, bandwidth_ms) + float(self.scheduler_overhead_ms)
+
+
+def _resolve_float(mapping: Mapping[str, Any], *keys: str, default: float = 0.0) -> float:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return float(mapping[key])
+    return float(default)
+
+
+def load_device_capabilities(
+    path: str,
+    *,
+    tensor_mfu: Optional[float] = None,
+    hbm_efficiency: Optional[float] = None,
+    scheduler_overhead_ms: Optional[float] = None,
+    device_name_override: Optional[str] = None,
+) -> DeviceCapabilities:
+    """Load :class:`DeviceCapabilities` from a JSON description."""
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, Mapping):
+        raise ValueError("Device capabilities JSON must map keys to values")
+    name = str(device_name_override or data.get("name") or data.get("device") or "device")
+    peak_tflops = _resolve_float(data, "peak_tflops", "tflops", "tflops_achievable")
+    if peak_tflops <= 0:
+        raise ValueError("Device capabilities must provide positive peak_tflops")
+    resolved_tensor_mfu = tensor_mfu if tensor_mfu is not None else _resolve_float(
+        data,
+        "tensor_mfu",
+        "mfu",
+        "tensor_utilization",
+        default=0.7,
+    )
+    resolved_hbm_eff = hbm_efficiency if hbm_efficiency is not None else _resolve_float(
+        data,
+        "hbm_efficiency",
+        "hbm_eff_base",
+        "bandwidth_efficiency",
+        default=0.5,
+    )
+    bandwidth_gbps = _resolve_float(
+        data,
+        "hbm_bandwidth_GBps",
+        "hbm_peak_GBps",
+        "hbm_peak_gbps",
+        "peak_hbm_GBps",
+        "peak_hbm_gbps",
+    )
+    if bandwidth_gbps <= 0:
+        raise ValueError("Device capabilities must provide positive HBM bandwidth")
+    overhead_ms = scheduler_overhead_ms if scheduler_overhead_ms is not None else _resolve_float(
+        data,
+        "scheduler_overhead_ms",
+        "overhead_ms",
+        default=0.0,
+    )
+    return DeviceCapabilities(
+        name=name,
+        peak_tflops=peak_tflops,
+        tensor_mfu=resolved_tensor_mfu,
+        hbm_bandwidth_GBps=bandwidth_gbps,
+        hbm_efficiency=resolved_hbm_eff,
+        scheduler_overhead_ms=overhead_ms,
+    )
 
 
 class ModelCostModel:
@@ -509,12 +616,28 @@ class SimulationResult:
     decode_flops_total: float
     prefill_hbm_total: float
     decode_hbm_total: float
+    device_name: Optional[str]
+    step_compute_flops: List[float]
+    step_hbm_bytes: List[float]
+    step_time_ms: List[float]
+    ttft_avg_ms: float
+    ttft_p50_ms: float
+    ttft_p95_ms: float
+    ttft_max_ms: float
+    tpot_avg_ms: float
 
     def summary(self) -> str:
+        device_part = f" device={self.device_name}" if self.device_name else ""
+        time_part = ""
+        if not math.isnan(self.ttft_p95_ms):
+            time_part = (
+                f" ttft_p95_ms={self.ttft_p95_ms:.1f}"
+                f" tpot_ms={self.tpot_avg_ms:.3f}"
+            )
         return (
-            f"C={self.target_concurrency} tp={self.tp} dp={self.dp} ep={self.ep} "
+            f"C={self.target_concurrency} tp={self.tp} dp={self.dp} ep={self.ep}{device_part} "
             f"budget={self.effective_token_budget:.1f} steps={self.total_steps} "
-            f"ttft_p95={self.ttft_p95:.2f} tpot_avg={self.tpot_avg:.3f} "
+            f"ttft_p95={self.ttft_p95:.2f} tpot_avg={self.tpot_avg:.3f}{time_part} "
             f"decode_hbm={self.decode_hbm_total/1e9:.2f}GB "
             f"SLA(ttft={self.sla_ttft_ok}, tpot={self.sla_tpot_ok})"
         )
@@ -533,6 +656,7 @@ class EngineSimulator:
         ep: int,
         num_gpus: int,
         cost_model: Optional[ModelCostModel] = None,
+        device_caps: Optional[DeviceCapabilities] = None,
     ) -> None:
         if tp <= 0 or dp <= 0 or ep <= 0:
             raise ValueError("tp, dp, ep must be positive integers")
@@ -546,6 +670,7 @@ class EngineSimulator:
         self.ep = ep
         self.num_gpus = num_gpus
         self.cost_tracker = CostTracker(cost_model, tp)
+        self.device_caps = device_caps
         self.kv_tracker = KVCapacityTracker(config.kv_capacity_tokens)
         self.running: Dict[int, Request] = {}
         self.waiting: Deque[Request] = deque()
@@ -557,6 +682,9 @@ class EngineSimulator:
         self.step_prefill_tokens: List[int] = []
         self.step_decode_tokens: List[int] = []
         self.step_running_sizes: List[int] = []
+        self.step_compute_flops: List[float] = []
+        self.step_hbm_bytes: List[float] = []
+        self.step_times_ms: List[float] = []
         self.total_prefill_flops: float = 0.0
         self.total_decode_flops: float = 0.0
         self.total_prefill_hbm: float = 0.0
@@ -578,6 +706,7 @@ class EngineSimulator:
         step = 0
         decode_tokens_generated = 0
         decode_active_steps = 0
+        decode_time_total_ms = 0.0
 
         while completed < total_requests and step < self.config.max_steps:
             self._admit_arrivals(step)
@@ -606,6 +735,12 @@ class EngineSimulator:
                 self.step_prefill_tokens.append(0)
                 self.step_decode_tokens.append(0)
                 self.step_running_sizes.append(len(self.running))
+                self.step_compute_flops.append(0.0)
+                self.step_hbm_bytes.append(0.0)
+                if self.device_caps is not None:
+                    self.step_times_ms.append(0.0)
+                else:
+                    self.step_times_ms.append(float("nan"))
                 continue
 
             for req in plan.preempted_requests:
@@ -648,6 +783,17 @@ class EngineSimulator:
             self.step_prefill_tokens.append(plan.prefill_tokens)
             self.step_decode_tokens.append(plan.decode_tokens)
             self.step_running_sizes.append(len(self.running))
+            step_compute = plan.compute_prefill_consumed + plan.compute_decode_consumed
+            step_hbm = plan.hbm_prefill_consumed + plan.hbm_decode_consumed
+            self.step_compute_flops.append(step_compute)
+            self.step_hbm_bytes.append(step_hbm)
+            if self.device_caps is not None:
+                step_time_ms = self.device_caps.step_time_ms(step_compute, step_hbm)
+                self.step_times_ms.append(step_time_ms)
+                if plan.decode_plans:
+                    decode_time_total_ms += step_time_ms
+            else:
+                self.step_times_ms.append(float("nan"))
             step += 1
 
         ttft_samples = [
@@ -669,6 +815,33 @@ class EngineSimulator:
                 tpot_avg = float("inf")
             else:
                 tpot_avg = decode_active_steps / decode_tokens_generated
+
+        ttft_times_ms: List[float] = []
+        ttft_avg_ms = ttft_p50_ms = ttft_p95_ms = ttft_max_ms = float("nan")
+        tpot_avg_ms = float("nan")
+        if self.device_caps is not None and self.step_times_ms:
+            cumulative_times = np.cumsum(self.step_times_ms)
+            for req in self.requests:
+                if req.first_token_step is None:
+                    continue
+                end_idx = req.first_token_step
+                end_time = float(cumulative_times[end_idx])
+                start_time = (
+                    float(cumulative_times[req.arrival_step - 1])
+                    if req.arrival_step > 0
+                    else 0.0
+                )
+                ttft_times_ms.append(end_time - start_time)
+            if ttft_times_ms:
+                ttft_avg_ms = statistics.mean(ttft_times_ms)
+                ttft_p50_ms = float(np.percentile(ttft_times_ms, 50))
+                ttft_p95_ms = float(np.percentile(ttft_times_ms, 95))
+                ttft_max_ms = max(ttft_times_ms)
+            if decode_tokens_generated > 0:
+                if decode_time_total_ms > 0:
+                    tpot_avg_ms = decode_time_total_ms / decode_tokens_generated
+                elif decode_tokens_generated > 0:
+                    tpot_avg_ms = 0.0
 
         sla_ttft_ok = bool(ttft_samples) and ttft_p95 <= self.config.sla.ttft_p95_max_steps
         sla_tpot_ok = (
@@ -702,6 +875,15 @@ class EngineSimulator:
             decode_flops_total=self.total_decode_flops,
             prefill_hbm_total=self.total_prefill_hbm,
             decode_hbm_total=self.total_decode_hbm,
+            device_name=self.device_caps.name if self.device_caps is not None else None,
+            step_compute_flops=self.step_compute_flops,
+            step_hbm_bytes=self.step_hbm_bytes,
+            step_time_ms=self.step_times_ms,
+            ttft_avg_ms=ttft_avg_ms,
+            ttft_p50_ms=ttft_p50_ms,
+            ttft_p95_ms=ttft_p95_ms,
+            ttft_max_ms=ttft_max_ms,
+            tpot_avg_ms=tpot_avg_ms,
         )
 
     # ------------------------------------------------------------------
@@ -1002,6 +1184,7 @@ def write_results_csv(
         "tp",
         "dp",
         "ep",
+        "device",
         "effective_token_budget",
         "steps",
         "decode_tokens",
@@ -1014,6 +1197,11 @@ def write_results_csv(
         "ttft_p50",
         "ttft_p95",
         "tpot_avg",
+        "ttft_avg_ms",
+        "ttft_p50_ms",
+        "ttft_p95_ms",
+        "ttft_max_ms",
+        "tpot_avg_ms",
         "kv_peak",
         "kv_final",
         "sla_ttft_ok",
@@ -1033,6 +1221,7 @@ def write_results_csv(
                     "tp": res.tp,
                     "dp": res.dp,
                     "ep": res.ep,
+                    "device": res.device_name or "",
                     "effective_token_budget": f"{res.effective_token_budget:.3f}",
                     "steps": res.total_steps,
                     "decode_tokens": res.decode_tokens,
@@ -1045,6 +1234,11 @@ def write_results_csv(
                     "ttft_p50": f"{res.ttft_p50:.4f}",
                     "ttft_p95": f"{res.ttft_p95:.4f}",
                     "tpot_avg": f"{res.tpot_avg:.6f}",
+                    "ttft_avg_ms": "" if math.isnan(res.ttft_avg_ms) else f"{res.ttft_avg_ms:.4f}",
+                    "ttft_p50_ms": "" if math.isnan(res.ttft_p50_ms) else f"{res.ttft_p50_ms:.4f}",
+                    "ttft_p95_ms": "" if math.isnan(res.ttft_p95_ms) else f"{res.ttft_p95_ms:.4f}",
+                    "ttft_max_ms": "" if math.isnan(res.ttft_max_ms) else f"{res.ttft_max_ms:.4f}",
+                    "tpot_avg_ms": "" if math.isnan(res.tpot_avg_ms) else f"{res.tpot_avg_ms:.6f}",
                     "kv_peak": res.kv_peak,
                     "kv_final": res.kv_final,
                     "sla_ttft_ok": int(res.sla_ttft_ok),
@@ -1070,6 +1264,21 @@ def run_sweep(args: argparse.Namespace) -> List[SimulationResult]:
             raise FileNotFoundError(f"Model config not found: {args.model_config}") from exc
         except json.JSONDecodeError as exc:  # pragma: no cover - CLI surface
             raise ValueError(f"Invalid JSON in model config {args.model_config}") from exc
+
+    device_caps: Optional[DeviceCapabilities] = None
+    if args.device_caps:
+        try:
+            device_caps = load_device_capabilities(
+                args.device_caps,
+                tensor_mfu=args.device_tensor_mfu,
+                hbm_efficiency=args.device_hbm_efficiency,
+                scheduler_overhead_ms=args.device_overhead_ms,
+                device_name_override=args.device_name or None,
+            )
+        except FileNotFoundError as exc:  # pragma: no cover - CLI surface
+            raise FileNotFoundError(f"Device caps not found: {args.device_caps}") from exc
+        except json.JSONDecodeError as exc:  # pragma: no cover - CLI surface
+            raise ValueError(f"Invalid JSON in device caps {args.device_caps}") from exc
 
     config = SchedulerConfig(
         max_num_batched_tokens=args.max_num_batched_tokens,
@@ -1128,6 +1337,7 @@ def run_sweep(args: argparse.Namespace) -> List[SimulationResult]:
                 ep=ep_value,
                 num_gpus=args.num_gpus,
                 cost_model=cost_model,
+                device_caps=device_caps,
             )
             result = simulator.run()
             all_results.append(result)
@@ -1158,6 +1368,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-config", type=str, default="", help="Path to model config JSON for cost-aware scheduling")
     parser.add_argument("--weight-bytes", type=int, default=2, help="Weight dtype size in bytes when loading a model config")
     parser.add_argument("--kv-bytes", type=int, default=2, help="KV cache dtype size in bytes when loading a model config")
+    parser.add_argument("--device-caps", type=str, default="", help="Path to device capability JSON")
+    parser.add_argument("--device-name", type=str, default="", help="Override device name in reports")
+    parser.add_argument("--device-tensor-mfu", type=float, default=None, help="Override tensor MFU when loading device caps")
+    parser.add_argument("--device-hbm-efficiency", type=float, default=None, help="Override HBM efficiency when loading device caps")
+    parser.add_argument("--device-overhead-ms", type=float, default=None, help="Override scheduler overhead per step in milliseconds")
     parser.add_argument("--input-dist", choices=["uniform", "lognormal", "fixed"], default="uniform")
     parser.add_argument("--output-dist", choices=["uniform", "lognormal", "fixed"], default="uniform")
     parser.add_argument("--input-seed", type=int, default=0)
