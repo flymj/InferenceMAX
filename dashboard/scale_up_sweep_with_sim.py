@@ -283,11 +283,12 @@ def main() -> None:
         value=4096,
         step=16,
     )
+    default_max_input = max(8192, int(min_input))
     max_input = st.sidebar.number_input(
         "Prompt 最大长度 (tokens)",
         min_value=int(min_input),
         max_value=131072,
-        value=8192,
+        value=default_max_input,
         step=16,
     )
     min_output = st.sidebar.number_input(
@@ -297,11 +298,12 @@ def main() -> None:
         value=32,
         step=1,
     )
+    default_max_output = max(128, int(min_output))
     max_output = st.sidebar.number_input(
         "输出最大长度 (tokens)",
         min_value=int(min_output),
         max_value=16384,
-        value=128,
+        value=default_max_output,
         step=1,
     )
     concurrency_choices = [32, 64, 128, 256]
