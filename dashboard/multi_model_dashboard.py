@@ -27,13 +27,22 @@ from dashboard.components.sidebar import render_sidebar
 from dashboard.features import ChunkedPrefill, KvCacheTraffic
 from dashboard.models import build_model
 from dashboard.common import load_model_json
-from .services.llm_calcs import (
-    ModelProfile,
-    concurrency_adjusted_times,
-    effective_compute_tflops,
-    prefill_decode_time_breakdown,
-    weights_bytes_per_gpu,
-)
+try:  # pragma: no cover - allow running as a script
+    from dashboard.services.llm_calcs import (
+        ModelProfile,
+        concurrency_adjusted_times,
+        effective_compute_tflops,
+        prefill_decode_time_breakdown,
+        weights_bytes_per_gpu,
+    )
+except ImportError:  # pragma: no cover - executed when imported as package module
+    from .services.llm_calcs import (
+        ModelProfile,
+        concurrency_adjusted_times,
+        effective_compute_tflops,
+        prefill_decode_time_breakdown,
+        weights_bytes_per_gpu,
+    )
 
 
 @dataclass

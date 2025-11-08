@@ -24,13 +24,22 @@ from dashboard.features import (
     plot_metric_vs_batch,
     run_scaleup_search_fixedN,
 )
-from .services.llm_calcs import (
-    ModelProfile,
-    concurrency_adjusted_times,
-    effective_compute_tflops,
-    kv_cache_memory_traffic,
-    prefill_decode_time_breakdown,
-)
+try:  # pragma: no cover - allow running as a script
+    from dashboard.services.llm_calcs import (
+        ModelProfile,
+        concurrency_adjusted_times,
+        effective_compute_tflops,
+        kv_cache_memory_traffic,
+        prefill_decode_time_breakdown,
+    )
+except ImportError:  # pragma: no cover - executed when imported as package module
+    from .services.llm_calcs import (
+        ModelProfile,
+        concurrency_adjusted_times,
+        effective_compute_tflops,
+        kv_cache_memory_traffic,
+        prefill_decode_time_breakdown,
+    )
 
 from dashboard.app_context import DashboardActions, DashboardState, bootstrap
 
