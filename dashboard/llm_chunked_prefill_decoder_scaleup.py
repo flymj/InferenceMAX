@@ -24,8 +24,10 @@ ensure_repo_root_on_path()
 import io
 import json
 import math
+import random
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 try:  # pragma: no cover - optional dependency for plotting/heatmaps
     import numpy as np
@@ -166,6 +168,56 @@ def effective_hbm_efficiency(base_eff: float, overlap: float) -> float:
 
 
 @dataclass
+class LengthDistribution:
+    """User-configurable distribution for prompt or generation lengths."""
+
+    name: str
+    min_len: int
+    max_len: int
+    mean: float
+    std: float
+
+    def expected_value(self) -> float:
+        """Return the nominal mean clipped to the configured bounds."""
+
+        return float(min(max(self.mean, self.min_len), self.max_len))
+
+    def generate(self, count: int, seed: int = 42) -> List[int]:
+        """Generate `count` samples respecting the configured bounds."""
+
+        if count <= 0:
+            return []
+
+        rng = np.random.default_rng(seed) if np is not None else None
+
+        python_rng = random.Random(seed)
+
+        values: List[int] = []
+        attempts = 0
+        max_attempts = max(count * 10, 1000)
+
+        while len(values) < count and attempts < max_attempts:
+            attempts += 1
+            if self.name == "均匀分布":
+                if rng is not None:
+                    sample = float(rng.uniform(self.min_len, self.max_len))
+                else:
+                    sample = python_rng.uniform(self.min_len, self.max_len)
+            else:  # default to normal distribution semantics
+                if rng is not None:
+                    sample = float(rng.normal(self.mean, max(self.std, 1.0)))
+                else:
+                    sample = python_rng.gauss(self.mean, max(self.std, 1.0))
+            sample = min(max(sample, self.min_len), self.max_len)
+            values.append(int(round(sample)))
+
+        if len(values) < count:
+            values.extend([int(self.expected_value())] * (count - len(values)))
+
+        return values[:count]
+
+
+@dataclass
 class StepTimes:
     C_pref: int
     C_dec: int
@@ -280,12 +332,28 @@ class SimulationResult:
     tpot_ms_p95: float
 
 
+@dataclass
+class ContinuousBatchingSummary:
+    """Aggregated metrics for continuous batching execution."""
+
+    total_time_s: float
+    total_steps: int
+    decode_steps: int
+    prefill_steps: int
+    overall_throughput_tps: float
+    average_latency_ms: float
+    timeline: pd.DataFrame | None
+
+
 def simulate_discrete_timeline(
     model_cfg: ModelConfig,
     hw: HwConfig,
     sched: SchedConfig,
     workload: WorkloadConfig,
     seq_len_kv: int,
+    total_queries: int,
+    prompt_samples: Iterable[int],
+    gen_samples: Iterable[int],
 ) -> SimulationResult:
     """Discrete time-step simulation of chunked prefill and decode scheduling."""
 
@@ -298,14 +366,30 @@ def simulate_discrete_timeline(
         model_cfg, workload.prompt_len, sched.max_num_batched_tokens
     )
 
-    requests = [
-        {
-            "prefill_remaining": workload.prompt_len,
-            "decode_remaining": workload.gen_len,
-            "ttft": None,
-        }
-        for _ in range(workload.concurrency)
-    ]
+    prompt_iter = iter(prompt_samples)
+    gen_iter = iter(gen_samples)
+
+    pending = deque()
+    for idx in range(max(total_queries, 0)):
+        try:
+            prompt_tokens = int(next(prompt_iter))
+        except StopIteration:
+            prompt_tokens = workload.prompt_len
+        try:
+            gen_tokens = int(next(gen_iter))
+        except StopIteration:
+            gen_tokens = workload.gen_len
+        pending.append(
+            {
+                "id": idx,
+                "prefill_remaining": max(prompt_tokens, 0),
+                "decode_remaining": max(gen_tokens, 0),
+                "ttft": None,
+            }
+        )
+
+    active: List[Dict[str, float]] = []
+    all_requests: List[Dict[str, float]] = []
 
     time_s = 0.0
     step_records = []
@@ -314,15 +398,25 @@ def simulate_discrete_timeline(
     step_index = 0
 
     def has_work() -> bool:
-        return any(r["prefill_remaining"] > 0 or r["decode_remaining"] > 0 for r in requests)
+        return bool(active or pending)
 
-    while has_work() and step_index < 10000:
-        decode_ready = [r for r in requests if r["prefill_remaining"] <= 0 and r["decode_remaining"] > 0]
+    max_steps = max(20000, total_queries * 8)
+
+    while has_work() and step_index < max_steps:
+        while len(active) < workload.concurrency and pending:
+            req = pending.popleft()
+            all_requests.append(req)
+            active.append(req)
+
+        if not active:
+            break
+
+        decode_ready = [r for r in active if r["prefill_remaining"] <= 0 and r["decode_remaining"] > 0]
         C_dec = min(len(decode_ready), sched.max_num_seqs, sched.max_num_batched_tokens)
         decode_selected = decode_ready[:C_dec]
 
         token_budget = sched.max_num_batched_tokens - C_dec
-        prefill_candidates = [r for r in requests if r["prefill_remaining"] > 0]
+        prefill_candidates = [r for r in active if r["prefill_remaining"] > 0]
         pref_tokens = 0
         for req in prefill_candidates:
             if token_budget <= 0:
@@ -354,6 +448,8 @@ def simulate_discrete_timeline(
             req["decode_remaining"] -= 1
             decode_completion_times.append(time_s + step_time)
 
+        active = [r for r in active if r["prefill_remaining"] > 0 or r["decode_remaining"] > 0]
+
         step_records.append(
             {
                 "step": step_index,
@@ -372,7 +468,7 @@ def simulate_discrete_timeline(
         time_s += step_time
         step_index += 1
 
-    for req in requests:
+    for req in all_requests:
         ttft_list.append((req["ttft"] or time_s) * 1000.0)
 
     ttft_series = pd.Series(ttft_list) if ttft_list else pd.Series(dtype=float)
@@ -385,6 +481,82 @@ def simulate_discrete_timeline(
         ttft_ms_p95=float(ttft_series.quantile(0.95)) if not ttft_series.empty else 0.0,
         tpot_ms_p50=float(decode_series.diff().dropna().quantile(0.5)) if len(decode_series) > 1 else 0.0,
         tpot_ms_p95=float(decode_series.diff().dropna().quantile(0.95)) if len(decode_series) > 1 else 0.0,
+    )
+
+
+def compute_continuous_batching_summary(
+    sla_estimate: SlaEstimate,
+    workload: WorkloadConfig,
+    total_queries: int,
+) -> ContinuousBatchingSummary:
+    if pd is None:
+        raise ModuleNotFoundError("pandas is required to build continuous batching summaries")
+
+    if total_queries <= 0:
+        empty_df = pd.DataFrame(
+            columns=["step", "start_s", "end_s", "prefill_tokens", "decode_tokens", "prefill_duration_s", "decode_duration_s"],
+        )
+        return ContinuousBatchingSummary(0.0, 0, 0, 0, 0.0, 0.0, empty_df)
+
+    step = sla_estimate.step_times
+    decode_capacity = max(step.C_dec, 1)
+    prefill_capacity = max(step.C_pref, 1)
+
+    total_prefill_tokens = total_queries * max(workload.prompt_len, 0)
+    total_decode_tokens = total_queries * max(workload.gen_len, 0)
+
+    decode_steps = math.ceil(total_decode_tokens / decode_capacity)
+    prefill_steps = math.ceil(total_prefill_tokens / prefill_capacity)
+    total_steps = max(decode_steps, prefill_steps)
+
+    step_time = max(step.step_time, 1e-9)
+    total_time_s = total_steps * step_time
+
+    throughput = (total_decode_tokens / total_time_s) if total_time_s > 0 else 0.0
+    avg_latency = (total_time_s / total_queries) * 1000.0 if total_queries > 0 else 0.0
+
+    rows = []
+    pref_remaining = total_prefill_tokens
+    dec_remaining = total_decode_tokens
+    current_time = 0.0
+    prefill_unit_time = step.prefill_compute_time / max(prefill_capacity, 1) if step.prefill_compute_time > 0 else 0.0
+    decode_unit_time = step.decode_time_per_token
+
+    max_rows = min(total_steps, 200)
+
+    for idx in range(total_steps):
+        pref_tokens = min(pref_remaining, prefill_capacity)
+        dec_tokens = min(dec_remaining, decode_capacity)
+        pref_duration = pref_tokens * prefill_unit_time
+        dec_duration = dec_tokens * decode_unit_time
+        if idx < max_rows:
+            rows.append(
+                {
+                    "step": idx,
+                    "start_s": current_time,
+                    "end_s": current_time + step_time,
+                    "prefill_tokens": pref_tokens,
+                    "decode_tokens": dec_tokens,
+                    "prefill_duration_s": pref_duration,
+                    "decode_duration_s": dec_duration,
+                }
+            )
+        pref_remaining -= pref_tokens
+        dec_remaining -= dec_tokens
+        pref_remaining = max(pref_remaining, 0)
+        dec_remaining = max(dec_remaining, 0)
+        current_time += step_time
+
+    timeline_df = pd.DataFrame(rows)
+
+    return ContinuousBatchingSummary(
+        total_time_s=total_time_s,
+        total_steps=total_steps,
+        decode_steps=decode_steps,
+        prefill_steps=prefill_steps,
+        overall_throughput_tps=throughput,
+        average_latency_ms=avg_latency,
+        timeline=timeline_df,
     )
 
 
@@ -502,6 +674,61 @@ def build_batch_scan_curve(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def build_continuous_timeline(df: pd.DataFrame) -> go.Figure:
+    if go is None:
+        raise ModuleNotFoundError("plotly is required for visualization generation")
+    if df.empty:
+        return go.Figure()
+
+    long_rows = []
+    for _, row in df.iterrows():
+        long_rows.append(
+            {
+                "step": f"Step {int(row['step'])}",
+                "phase": "Prefill",
+                "start": row["start_s"],
+                "duration": row["prefill_duration_s"],
+                "tokens": row["prefill_tokens"],
+            }
+        )
+        long_rows.append(
+            {
+                "step": f"Step {int(row['step'])}",
+                "phase": "Decode",
+                "start": row["start_s"],
+                "duration": row["decode_duration_s"],
+                "tokens": row["decode_tokens"],
+            }
+        )
+
+    long_df = pd.DataFrame(long_rows)
+
+    fig = go.Figure()
+    for phase in ["Prefill", "Decode"]:
+        subset = long_df[long_df["phase"] == phase]
+        fig.add_trace(
+            go.Bar(
+                x=subset["duration"],
+                y=subset["step"],
+                base=subset["start"],
+                orientation="h",
+                name=phase,
+                hovertemplate="阶段: %{customdata[0]}<br>开始: %{base:.3f}s<br>时长: %{x:.3f}s<br>Tokens: %{customdata[1]}<extra></extra>",
+                customdata=subset[["phase", "tokens"]].values,
+                opacity=0.8 if phase == "Prefill" else 0.6,
+            )
+        )
+
+    fig.update_layout(
+        title="连续批处理调度时间线 (前 200 步)",
+        xaxis_title="时间 (秒)",
+        yaxis_title="调度步",
+        barmode="overlay",
+        legend=dict(orientation="h"),
+    )
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Streamlit application
 # ---------------------------------------------------------------------------
@@ -512,7 +739,18 @@ def parse_model_config(json_str: str) -> ModelConfig:
     return ModelConfig.parse_obj(data)
 
 
-def sidebar_inputs() -> Tuple[ModelConfig, HwConfig, SchedConfig, WorkloadConfig, Dict[str, int], Dict[str, int]]:
+def sidebar_inputs() -> Tuple[
+    ModelConfig,
+    HwConfig,
+    SchedConfig,
+    WorkloadConfig,
+    Dict[str, int],
+    Dict[str, int],
+    LengthDistribution,
+    LengthDistribution,
+    Dict[str, float],
+    int,
+]:
     st.sidebar.header("参数配置")
 
     uploaded_model = st.sidebar.file_uploader("模型配置 JSON", type=["json"])
@@ -576,17 +814,91 @@ def sidebar_inputs() -> Tuple[ModelConfig, HwConfig, SchedConfig, WorkloadConfig
         decode_compute_flops_per_token=float(decode_compute_flops),
     )
 
+    st.sidebar.info(
+        "默认启用 chunked prefill，并结合 decode-maximal 调度：B 控制单步 token 预算，S 控制解码批内序列数。"
+        "可在此处快速试验不同组合，以获得较为通用的推理吞吐。"
+    )
+
     st.sidebar.subheader("工作负载")
-    prompt_len = st.sidebar.number_input("Prompt 长度 L", min_value=16, max_value=65536, value=4096, step=16)
-    gen_len = st.sidebar.number_input("生成长度 T", min_value=1, max_value=4096, value=128, step=1)
     concurrency = st.sidebar.number_input("稳态并发 C", min_value=1, max_value=4096, value=64, step=1)
-    seq_len_kv = st.sidebar.number_input("Decode KV 长度 (L_kv)", min_value=128, max_value=131072, value=4096, step=128)
+    total_queries = st.sidebar.number_input(
+        "总请求数 (Total Queries)",
+        min_value=1,
+        max_value=200000,
+        value=4000,
+        step=1,
+    )
+
+    st.sidebar.markdown("**Prompt 长度分布**")
+    prompt_dist_name = st.sidebar.selectbox("分布类型", options=["正态分布", "均匀分布"], index=0, key="prompt_dist")
+    prompt_min = st.sidebar.number_input("Prompt 最小长度", min_value=16, max_value=262144, value=1024, step=16)
+    prompt_max = st.sidebar.number_input(
+        "Prompt 最大长度",
+        min_value=int(prompt_min),
+        max_value=262144,
+        value=8192,
+        step=16,
+    )
+    prompt_mean = st.sidebar.number_input(
+        "Prompt 平均长度",
+        min_value=float(prompt_min),
+        max_value=float(prompt_max),
+        value=float((prompt_min + prompt_max) // 2),
+        step=16.0,
+    )
+    prompt_std = st.sidebar.number_input("Prompt 标准差", min_value=1.0, max_value=32768.0, value=512.0, step=16.0)
+    prompt_dist = LengthDistribution(
+        name=prompt_dist_name,
+        min_len=int(prompt_min),
+        max_len=int(prompt_max),
+        mean=float(prompt_mean),
+        std=float(prompt_std),
+    )
+
+    st.sidebar.markdown("**生成长度分布**")
+    gen_dist_name = st.sidebar.selectbox("分布类型", options=["正态分布", "均匀分布"], index=0, key="gen_dist")
+    gen_min = st.sidebar.number_input("生成最小长度", min_value=1, max_value=65536, value=64, step=1)
+    gen_max = st.sidebar.number_input(
+        "生成最大长度",
+        min_value=int(gen_min),
+        max_value=65536,
+        value=512,
+        step=1,
+    )
+    gen_mean = st.sidebar.number_input(
+        "生成平均长度",
+        min_value=float(gen_min),
+        max_value=float(gen_max),
+        value=float(max(gen_min, min(gen_max, 256))),
+        step=1.0,
+    )
+    gen_std = st.sidebar.number_input("生成标准差", min_value=1.0, max_value=8192.0, value=64.0, step=1.0)
+    gen_dist = LengthDistribution(
+        name=gen_dist_name,
+        min_len=int(gen_min),
+        max_len=int(gen_max),
+        mean=float(gen_mean),
+        std=float(gen_std),
+    )
+
+    prompt_expected = int(round(prompt_dist.expected_value()))
+    gen_expected = int(round(gen_dist.expected_value()))
 
     workload_cfg = WorkloadConfig(
-        prompt_len=int(prompt_len),
-        gen_len=int(gen_len),
+        prompt_len=max(prompt_expected, 1),
+        gen_len=max(gen_expected, 1),
         concurrency=int(concurrency),
     )
+
+    seq_len_kv = st.sidebar.number_input("Decode KV 长度 (L_kv)", min_value=128, max_value=131072, value=4096, step=128)
+
+    if total_queries < concurrency:
+        st.sidebar.warning("总请求数小于并发度，连续批处理将退化为一次性批次。")
+
+    st.sidebar.subheader("SLA 目标")
+    sla_ttft = st.sidebar.number_input("TTFT SLA (ms)", min_value=1.0, max_value=5000.0, value=600.0, step=10.0)
+    sla_tpot = st.sidebar.number_input("TPOT SLA (ms/token)", min_value=0.01, max_value=50.0, value=5.0, step=0.1)
+    sla_targets = {"ttft_ms": float(sla_ttft), "tpot_ms": float(sla_tpot)}
 
     st.sidebar.subheader("扫描范围")
     conc_start = st.sidebar.number_input("并发起始", min_value=1, max_value=4096, value=8, step=1)
@@ -604,6 +916,10 @@ def sidebar_inputs() -> Tuple[ModelConfig, HwConfig, SchedConfig, WorkloadConfig
         workload_cfg,
         {"start": int(conc_start), "end": int(conc_end), "step": int(conc_step)},
         {"start": int(batch_start), "end": int(batch_end), "step": int(batch_step), "seq_len_kv": int(seq_len_kv)},
+        prompt_dist,
+        gen_dist,
+        sla_targets,
+        int(total_queries),
     )
 
 
@@ -708,10 +1024,18 @@ def run_app() -> None:
         workload_cfg,
         conc_range,
         batch_range,
+        prompt_dist,
+        gen_dist,
+        sla_targets,
+        total_queries,
     ) = sidebar_inputs()
 
     st.title("⚙️ Chunked Prefill + Decode-Maximal Scale-up Explorer")
     st.caption("使用 chunked prefill + decode-maximal 调度模型进行并发规模化探索")
+    st.info(
+        "提示：默认启用的 chunked prefill 参数 (B=2048, S=1024, decode 优先级=0.7) 适用于大部分 GPU 服务场景，并可在侧边栏"
+        "进一步校准。连续批处理计算基于请求长度分布的期望值。"
+    )
 
     model_json_str = format_model_json(model_cfg.dict())
     st.subheader("模型配置 JSON")
@@ -747,6 +1071,25 @@ def run_app() -> None:
         f"推荐 Prefill Chunk Size: **{recommended_chunk}** tokens，共需要约 **{total_chunks}** 个 chunk 完成 {workload_cfg.prompt_len} token 的 prompt。"
     )
 
+    st.subheader("请求长度分布假设")
+    p_col, g_col = st.columns(2)
+    p_col.metric(
+        "Prompt 期望长度",
+        f"{workload_cfg.prompt_len} tokens",
+        help="基于所选分布的期望值，用于闭式估算与连续批处理分析。",
+    )
+    p_col.caption(
+        f"范围 {prompt_dist.min_len}-{prompt_dist.max_len}，均值 {prompt_dist.mean:.0f}，标准差 {prompt_dist.std:.0f}。"
+    )
+    g_col.metric(
+        "生成期望长度",
+        f"{workload_cfg.gen_len} tokens",
+        help="基于所选分布的期望值；仿真可按实际样本运行。",
+    )
+    g_col.caption(
+        f"范围 {gen_dist.min_len}-{gen_dist.max_len}，均值 {gen_dist.mean:.0f}，标准差 {gen_dist.std:.0f}。"
+    )
+
     sla_estimate = estimate_sla_closed_form(
         model_cfg,
         hw_cfg,
@@ -770,6 +1113,36 @@ def run_app() -> None:
     m5.metric("HBM 利用率", f"{sla_estimate.step_times.hbm_eff:.2f}")
 
     st.write("Chunked Prefill 设置与 Decode 优先级将动态影响重叠度与 HBM 利用率。")
+
+    sla_col1, sla_col2 = st.columns(2)
+    ttft_margin = sla_targets["ttft_ms"] - sla_estimate.ttft_ms
+    tpot_margin = sla_targets["tpot_ms"] - sla_estimate.tpot_ms
+    if ttft_margin >= 0:
+        sla_col1.success(f"TTFT 满足 SLA ({sla_estimate.ttft_ms:.1f} ms ≤ {sla_targets['ttft_ms']:.1f} ms)，余量 {ttft_margin:.1f} ms。")
+    else:
+        sla_col1.error(f"TTFT 超出 SLA {abs(ttft_margin):.1f} ms。")
+    if tpot_margin >= 0:
+        sla_col2.success(
+            f"TPOT 满足 SLA ({sla_estimate.tpot_ms:.3f} ms/token ≤ {sla_targets['tpot_ms']:.3f} ms/token)，余量 {tpot_margin:.3f} ms/token。"
+        )
+    else:
+        sla_col2.error(f"TPOT 超出 SLA {abs(tpot_margin):.3f} ms/token。")
+
+    if pd is not None:
+        continuous_summary = compute_continuous_batching_summary(sla_estimate, workload_cfg, total_queries)
+        st.subheader("连续批处理汇总")
+        cb1, cb2, cb3, cb4 = st.columns(4)
+        cb1.metric("调度步数", f"{continuous_summary.total_steps}")
+        cb2.metric("总运行时长", f"{continuous_summary.total_time_s:.1f} s")
+        cb3.metric("整体吞吐", f"{continuous_summary.overall_throughput_tps:.1f} tok/s")
+        cb4.metric("平均完成延迟", f"{continuous_summary.average_latency_ms:.1f} ms/req")
+        st.caption(
+            "步骤数取 max(prefill, decode) 用以反映连续批处理的 steady-state，时长基于单步耗时线性推算 (显示前 200 步时间线)。"
+        )
+        if continuous_summary.timeline is not None and not continuous_summary.timeline.empty:
+            st.plotly_chart(build_continuous_timeline(continuous_summary.timeline), use_container_width=True)
+    else:  # pragma: no cover - UI hint when pandas missing
+        st.warning("需要 pandas 才能生成连续批处理汇总与时间线图。")
 
     scan_df = compute_concurrency_scan(
         model_cfg, hw_cfg, sched_cfg, workload_cfg, batch_range["seq_len_kv"], conc_range
@@ -838,12 +1211,17 @@ sequenceDiagram
 
     st.subheader("仿真模式 (可选)")
     if st.checkbox("运行离散事件仿真", value=False):
+        prompt_samples = prompt_dist.generate(total_queries)
+        gen_samples = gen_dist.generate(total_queries)
         simulation = simulate_discrete_timeline(
             model_cfg,
             hw_cfg,
             sched_cfg,
             workload_cfg,
             batch_range["seq_len_kv"],
+            total_queries,
+            prompt_samples,
+            gen_samples,
         )
         st.dataframe(simulation.step_data)
         st.metric("TTFT P50 (ms)", f"{simulation.ttft_ms_p50:.1f}")
@@ -853,7 +1231,7 @@ sequenceDiagram
 
     st.markdown("---")
     st.markdown(
-        "可通过右上角的 `▶️ Run` 按钮实时调整参数，并将校准曲线替换为本地实测数据以细化模型。"
+        "参数发生变更后会自动重新计算图表与指标；也可以在此处替换为本地校准数据以进一步优化模型。"
         "\n# --- CALIBRATION HOOK ---"
     )
 
