@@ -634,6 +634,86 @@ def main() -> None:
     )
     chosen = results[selected_idx]
 
+    if chosen.kv_capacity_limit > 0:
+        capacity_line = (
+            f"调度 KV 容量上限：{chosen.kv_capacity_limit:,} tokens"
+            f"（请求值 {chosen.kv_capacity_requested:,}）"
+        )
+        if chosen.kv_capacity_limit < chosen.kv_capacity_requested:
+            st.warning(capacity_line + " —— 已根据设备 HBM 自动收紧。")
+        else:
+            st.caption(capacity_line)
+
+    st.subheader("Per-request cost breakdown")
+    ttft_col, decode_col = st.columns(2)
+
+    ttft_lines: List[str] = []
+    if chosen.ttft_count <= 0:
+        ttft_lines.append("- 无可用的首 token 样本。")
+    else:
+        if not math.isnan(chosen.ttft_prefill_flops_per_request):
+            ttft_flops = chosen.ttft_prefill_flops_per_request / 1e12
+            ttft_lines.append(f"- 平均算力需求（单请求）：{ttft_flops:.2f} TFLOPs")
+        if not math.isnan(chosen.ttft_prefill_flops_p95):
+            ttft_flops_p95 = chosen.ttft_prefill_flops_p95 / 1e12
+            ttft_lines.append(f"  · P95 算力需求：{ttft_flops_p95:.2f} TFLOPs")
+        if not math.isnan(chosen.ttft_prefill_hbm_per_request):
+            ttft_hbm = chosen.ttft_prefill_hbm_per_request / 1e9
+            ttft_lines.append(f"- 平均 HBM 访存（单请求）：{ttft_hbm:.2f} GB")
+        if not math.isnan(chosen.ttft_prefill_compute_time_ms):
+            ttft_lines.append(
+                f"- 仅算力瓶颈耗时（均值）：{chosen.ttft_prefill_compute_time_ms:.2f} ms"
+            )
+        if not math.isnan(chosen.ttft_prefill_compute_time_ms_p95):
+            ttft_lines.append(
+                f"  · 仅算力瓶颈耗时 P95：{chosen.ttft_prefill_compute_time_ms_p95:.2f} ms"
+            )
+        if not math.isnan(chosen.ttft_prefill_hbm_time_ms):
+            ttft_lines.append(
+                f"- 仅 HBM 瓶颈耗时（均值）：{chosen.ttft_prefill_hbm_time_ms:.2f} ms"
+            )
+        if not math.isnan(chosen.ttft_prefill_hbm_time_ms_p95):
+            ttft_lines.append(
+                f"  · 仅 HBM 瓶颈耗时 P95：{chosen.ttft_prefill_hbm_time_ms_p95:.2f} ms"
+            )
+        if not math.isnan(chosen.ttft_prefill_time_ms):
+            ttft_lines.append(
+                f"- 单请求综合估算耗时（取算力/访存最大）：{chosen.ttft_prefill_time_ms:.2f} ms"
+            )
+        if not math.isnan(chosen.ttft_prefill_time_ms_p95):
+            ttft_lines.append(
+                f"  · 单请求耗时 P95：{chosen.ttft_prefill_time_ms_p95:.2f} ms"
+            )
+        if not math.isnan(chosen.ttft_avg_ms):
+            ttft_lines.append(f"- 模拟平均首 token 延迟：{chosen.ttft_avg_ms:.2f} ms")
+    ttft_col.markdown("**TTFT (首 token)**")
+    ttft_col.markdown("\n".join(ttft_lines) or "- 无数据")
+
+    decode_lines: List[str] = []
+    if chosen.decode_tokens_count <= 0:
+        decode_lines.append("- 无生成 token 样本。")
+    else:
+        if not math.isnan(chosen.decode_flops_per_token):
+            decode_flops = chosen.decode_flops_per_token / 1e12
+            decode_lines.append(f"- 平均算力需求：{decode_flops:.2f} TFLOPs/token")
+        if not math.isnan(chosen.decode_hbm_per_token):
+            decode_hbm = chosen.decode_hbm_per_token / 1e9
+            decode_lines.append(f"- 平均 HBM 访存：{decode_hbm:.3f} GB/token")
+        if not math.isnan(chosen.decode_compute_time_ms):
+            decode_lines.append(
+                f"- 仅算力瓶颈耗时：{chosen.decode_compute_time_ms:.3f} ms/token"
+            )
+        if not math.isnan(chosen.decode_hbm_time_ms):
+            decode_lines.append(
+                f"- 仅 HBM 瓶颈耗时：{chosen.decode_hbm_time_ms:.3f} ms/token"
+            )
+        if not math.isnan(chosen.tpot_avg_ms):
+            decode_lines.append(
+                f"- 模拟平均生成速率：{chosen.tpot_avg_ms:.3f} ms/token"
+            )
+    decode_col.markdown("**Decode (生成阶段)**")
+    decode_col.markdown("\n".join(decode_lines) or "- 无数据")
+
     col1, col2, col3 = st.columns(3)
     fig_tokens = _plot_step_tokens(chosen)
     if fig_tokens is not None:
