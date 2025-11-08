@@ -12,7 +12,7 @@ Quick start
 To run a default sweep and write results/plots:
 
 ```
-python sim_scheduler.py --concurrency-list 64 128 --times-per-concurrency 4 \
+python -m dashboard.sim_scheduler --concurrency-list 64 128 --times-per-concurrency 4 \
     --min-input 4096 --max-input 8192 --min-output 32 --max-output 128 \
     --tp 8 --dp 1 --ep 1 --num-gpus 8 --out-csv results.csv --out-dir charts
 ```
@@ -43,7 +43,17 @@ import statistics
 from collections import deque
 from dataclasses import dataclass, field
 from itertools import product
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 
@@ -185,14 +195,25 @@ class DeviceCapabilities:
     hbm_bandwidth_GBps: float
     hbm_efficiency: float
     scheduler_overhead_ms: float = 0.0
+    fp16_tflops: Optional[float] = None
+    fp8_tflops: Optional[float] = None
+    alltoall_bandwidth_GBps: Optional[float] = None
+    allreduce_bandwidth_GBps: Optional[float] = None
+    hbm_size_GB: Optional[float] = None
 
     @property
     def achievable_flops_per_ms(self) -> float:
         """Effective FLOPs the device can sustain per millisecond."""
 
-        if self.peak_tflops <= 0 or self.tensor_mfu <= 0:
+        peak = self.peak_tflops
+        if peak <= 0:
+            if self.fp16_tflops and self.fp16_tflops > 0:
+                peak = self.fp16_tflops
+            elif self.fp8_tflops and self.fp8_tflops > 0:
+                peak = self.fp8_tflops
+        if peak <= 0 or self.tensor_mfu <= 0:
             return 0.0
-        return self.peak_tflops * 1e12 * self.tensor_mfu / 1000.0
+        return peak * 1e12 * self.tensor_mfu / 1000.0
 
     @property
     def achievable_hbm_bytes_per_ms(self) -> float:
@@ -239,7 +260,15 @@ def load_device_capabilities(
         raise ValueError("Device capabilities JSON must map keys to values")
     name = str(device_name_override or data.get("name") or data.get("device") or "device")
     peak_tflops = _resolve_float(data, "peak_tflops", "tflops", "tflops_achievable")
-    if peak_tflops <= 0:
+    fp16_tflops = _resolve_float(data, "fp16_tflops", "fp16_peak_tflops", default=0.0)
+    fp8_tflops = _resolve_float(data, "fp8_tflops", "fp8_peak_tflops", default=0.0)
+    resolved_peak = peak_tflops
+    if resolved_peak <= 0:
+        for candidate in (fp16_tflops, fp8_tflops):
+            if candidate > 0:
+                resolved_peak = candidate
+                break
+    if resolved_peak <= 0:
         raise ValueError("Device capabilities must provide positive peak_tflops")
     resolved_tensor_mfu = tensor_mfu if tensor_mfu is not None else _resolve_float(
         data,
@@ -271,13 +300,40 @@ def load_device_capabilities(
         "overhead_ms",
         default=0.0,
     )
+    alltoall_bw = _resolve_float(
+        data,
+        "alltoall_bandwidth_GBps",
+        "all_to_all_bandwidth_GBps",
+        "all_to_all_GBps",
+        "alltoall_GBps",
+        default=0.0,
+    )
+    allreduce_bw = _resolve_float(
+        data,
+        "allreduce_bandwidth_GBps",
+        "all_reduce_bandwidth_GBps",
+        "allreduce_GBps",
+        default=0.0,
+    )
+    hbm_size = _resolve_float(
+        data,
+        "hbm_size_GB",
+        "hbm_capacity_GB",
+        "hbm_memory_GB",
+        default=0.0,
+    )
     return DeviceCapabilities(
         name=name,
-        peak_tflops=peak_tflops,
+        peak_tflops=resolved_peak,
         tensor_mfu=resolved_tensor_mfu,
         hbm_bandwidth_GBps=bandwidth_gbps,
         hbm_efficiency=resolved_hbm_eff,
         scheduler_overhead_ms=overhead_ms,
+        fp16_tflops=fp16_tflops if fp16_tflops > 0 else None,
+        fp8_tflops=fp8_tflops if fp8_tflops > 0 else None,
+        alltoall_bandwidth_GBps=alltoall_bw if alltoall_bw > 0 else None,
+        allreduce_bandwidth_GBps=allreduce_bw if allreduce_bw > 0 else None,
+        hbm_size_GB=hbm_size if hbm_size > 0 else None,
     )
 
 
@@ -409,6 +465,25 @@ class ModelCostModel:
         return flops, hbm
 
 
+def load_model_cost_model_from_config(
+    cfg: Mapping[str, Any],
+    *,
+    weight_dtype_bytes: int,
+    kv_dtype_bytes: int,
+    include_scores: bool = True,
+) -> ModelCostModel:
+    config_dict = dict(cfg)
+    model = build_model(config_dict)
+    top_k = config_dict.get("num_experts_per_tok") or config_dict.get("top_k")
+    return ModelCostModel(
+        model,
+        weight_dtype_bytes=weight_dtype_bytes,
+        kv_dtype_bytes=kv_dtype_bytes,
+        include_scores=include_scores,
+        top_k=top_k,
+    )
+
+
 def load_model_cost_model(
     path: str,
     weight_dtype_bytes: int,
@@ -417,14 +492,13 @@ def load_model_cost_model(
 ) -> ModelCostModel:
     with open(path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    model = build_model(cfg)
-    top_k = cfg.get("num_experts_per_tok") or cfg.get("top_k")
-    return ModelCostModel(
-        model,
+    if not isinstance(cfg, Mapping):
+        raise ValueError("Model config JSON must map keys to values")
+    return load_model_cost_model_from_config(
+        cfg,
         weight_dtype_bytes=weight_dtype_bytes,
         kv_dtype_bytes=kv_dtype_bytes,
         include_scores=include_scores,
-        top_k=top_k,
     )
 
 
