@@ -7,6 +7,11 @@ import statistics
 from typing import Dict, List, Optional, Sequence
 
 import streamlit as st
+if __package__ is None or __package__ == "":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 try:  # pragma: no cover - Streamlit UI is optional
     import matplotlib.pyplot as plt
@@ -18,8 +23,8 @@ try:  # pragma: no cover - pandas is optional for table rendering
 except ModuleNotFoundError:  # pragma: no cover - pandas is optional
     pd = None  # type: ignore[assignment]
 
-from .common import DEFAULT_MODEL_JSON, DEFAULT_MODEL_JSON_TEXT, load_model_json
-from .sim_scheduler import (
+from dashboard.common import DEFAULT_MODEL_JSON, DEFAULT_MODEL_JSON_TEXT, load_model_json
+from dashboard.sim_scheduler import (
     DeviceCapabilities,
     EngineSimulator,
     ModelCostModel,
