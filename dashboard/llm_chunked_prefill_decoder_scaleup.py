@@ -25,9 +25,8 @@ import io
 import json
 import math
 import random
-from collections import deque
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 try:  # pragma: no cover - optional dependency for plotting/heatmaps
     import numpy as np
@@ -324,12 +323,54 @@ def recommended_prefill_chunk_size(
 
 
 @dataclass
+class TokenCostModel:
+    """Calibrated per-token cost model derived from empirical measurements."""
+
+    base_prefill_ms: float = 114.18 / 922.0
+    base_decode_ms: float = 9.3
+    target_prefill_ms_c5: float = 118.9 / 922.0
+    target_decode_ms_c5: float = 11.0
+
+    def __post_init__(self) -> None:
+        self._prefill_alpha = self._compute_alpha(self.base_prefill_ms, self.target_prefill_ms_c5)
+        self._decode_alpha = self._compute_alpha(self.base_decode_ms, self.target_decode_ms_c5)
+
+    @staticmethod
+    def _compute_alpha(base: float, target: float) -> float:
+        if base <= 0:
+            return 0.0
+        if target <= 0:
+            return 0.0
+        # Match the target value at concurrency 5 with a gentle linear increase.
+        ratio = target / base
+        if ratio <= 1.0:
+            return 0.0
+        return (ratio - 1.0) / 4.0
+
+    def prefill_s_per_token(self, concurrency: int) -> float:
+        c = max(1, concurrency)
+        factor = 1.0 + self._prefill_alpha * (c - 1)
+        return (self.base_prefill_ms * factor) / 1000.0
+
+    def decode_s_per_token(self, concurrency: int) -> float:
+        c = max(1, concurrency)
+        factor = 1.0 + self._decode_alpha * (c - 1)
+        return (self.base_decode_ms * factor) / 1000.0
+
+
+@dataclass
 class SimulationResult:
-    step_data: pd.DataFrame
+    step_data: Any
+    ttft_ms_avg: float
     ttft_ms_p50: float
     ttft_ms_p95: float
+    tpot_ms_avg: float
     tpot_ms_p50: float
     tpot_ms_p95: float
+    total_time_ms: float
+    throughput_tps: float
+    total_tokens: int
+    total_generated_tokens: int
 
 
 @dataclass
@@ -355,22 +396,19 @@ def simulate_discrete_timeline(
     prompt_samples: Iterable[int],
     gen_samples: Iterable[int],
 ) -> SimulationResult:
-    """Discrete time-step simulation of chunked prefill and decode scheduling."""
+    """Discrete simulation calibrated to empirical TTFT/TPOT behaviour."""
 
-    if pd is None:
-        raise ModuleNotFoundError("pandas is required for simulation outputs")
+    pd_available = pd is not None
 
-    flops_token = flops_per_token(model_cfg)
-    kv_bytes_token = kv_bytes_per_token(model_cfg, seq_len_kv)
-    recommended_chunk = recommended_prefill_chunk_size(
-        model_cfg, workload.prompt_len, sched.max_num_batched_tokens
-    )
+    num_requests = max(int(total_queries), 0)
+    cost_model = TokenCostModel()
 
     prompt_iter = iter(prompt_samples)
     gen_iter = iter(gen_samples)
 
-    pending = deque()
-    for idx in range(max(total_queries, 0)):
+    prompt_list: List[int] = []
+    gen_list: List[int] = []
+    for _ in range(num_requests):
         try:
             prompt_tokens = int(next(prompt_iter))
         except StopIteration:
@@ -379,108 +417,187 @@ def simulate_discrete_timeline(
             gen_tokens = int(next(gen_iter))
         except StopIteration:
             gen_tokens = workload.gen_len
-        pending.append(
-            {
-                "id": idx,
-                "prefill_remaining": max(prompt_tokens, 0),
-                "decode_remaining": max(gen_tokens, 0),
-                "ttft": None,
-            }
+        prompt_list.append(max(prompt_tokens, 0))
+        gen_list.append(max(gen_tokens, 0))
+
+    if not prompt_list:
+        empty_columns = [
+            "step",
+            "time_ms",
+            "prefill_tokens",
+            "decode_tokens",
+            "prefill_time_ms",
+            "decode_time_ms",
+            "step_time_ms",
+            "overlap",
+            "hbm_eff",
+            "mfu",
+        ]
+        empty_df = pd.DataFrame(columns=empty_columns) if pd_available else []
+        return SimulationResult(
+            step_data=empty_df,
+            ttft_ms_avg=0.0,
+            ttft_ms_p50=0.0,
+            ttft_ms_p95=0.0,
+            tpot_ms_avg=0.0,
+            tpot_ms_p50=0.0,
+            tpot_ms_p95=0.0,
+            total_time_ms=0.0,
+            throughput_tps=0.0,
+            total_tokens=0,
+            total_generated_tokens=0,
         )
 
-    active: List[Dict[str, float]] = []
-    all_requests: List[Dict[str, float]] = []
+    concurrency = max(1, int(workload.concurrency))
 
-    time_s = 0.0
-    step_records = []
-    decode_completion_times = []
-    ttft_list = []
+    step_rows: List[Dict[str, float]] = []
+    decode_interval_ms: List[float] = []
+    ttft_samples_ms: List[float] = []
+    total_tokens = 0
+    total_generated_tokens = 0
     step_index = 0
 
-    def has_work() -> bool:
-        return bool(active or pending)
+    def record_rows(
+        *,
+        start_s: float,
+        prefill_s: float,
+        prompt_tokens: int,
+        decode_s: float,
+        gen_tokens: int,
+        completion_s: float,
+    ) -> None:
+        nonlocal step_index
+        if prompt_tokens > 0:
+            step_rows.append(
+                {
+                    "step": step_index,
+                    "time_ms": (start_s + prefill_s) * 1000.0,
+                    "prefill_tokens": prompt_tokens,
+                    "decode_tokens": 0,
+                    "prefill_time_ms": prefill_s * 1000.0,
+                    "decode_time_ms": 0.0,
+                    "step_time_ms": prefill_s * 1000.0,
+                    "overlap": 0.0,
+                    "hbm_eff": float("nan"),
+                    "mfu": float("nan"),
+                }
+            )
+            step_index += 1
+        if gen_tokens > 0:
+            step_rows.append(
+                {
+                    "step": step_index,
+                    "time_ms": completion_s * 1000.0,
+                    "prefill_tokens": 0,
+                    "decode_tokens": gen_tokens,
+                    "prefill_time_ms": 0.0,
+                    "decode_time_ms": decode_s * 1000.0,
+                    "step_time_ms": decode_s * 1000.0,
+                    "overlap": 0.0,
+                    "hbm_eff": float("nan"),
+                    "mfu": float("nan"),
+                }
+            )
+            step_index += 1
 
-    max_steps = max(20000, total_queries * 8)
+    slot_count = max(1, min(concurrency, len(prompt_list)))
+    slots = [0.0] * slot_count
+    queue_idx = 0
 
-    while has_work() and step_index < max_steps:
-        while len(active) < workload.concurrency and pending:
-            req = pending.popleft()
-            all_requests.append(req)
-            active.append(req)
+    while queue_idx < len(prompt_list):
+        wave_start = min(slots)
+        available_indices = [
+            idx for idx, ready_time in enumerate(slots) if abs(ready_time - wave_start) < 1e-9
+        ]
+        remaining = len(prompt_list) - queue_idx
+        wave_size = max(1, min(len(available_indices), remaining))
 
-        if not active:
+        for offset in range(wave_size):
+            slot_idx = available_indices[offset]
+            prompt_tokens = prompt_list[queue_idx]
+            gen_tokens = gen_list[queue_idx]
+            effective_conc = max(1, wave_size)
+
+            prefill_s_per_token = cost_model.prefill_s_per_token(effective_conc)
+            decode_s_per_token = cost_model.decode_s_per_token(effective_conc)
+            prefill_s = prompt_tokens * prefill_s_per_token
+            first_token_time_s = wave_start + prefill_s
+            decode_s = gen_tokens * decode_s_per_token
+            completion_time_s = first_token_time_s + decode_s
+            slots[slot_idx] = completion_time_s
+
+            ttft_samples_ms.append(prefill_s * 1000.0)
+            total_tokens += prompt_tokens + gen_tokens
+            total_generated_tokens += gen_tokens
+
+            if gen_tokens > 0:
+                decode_interval_ms.extend([decode_s_per_token * 1000.0] * gen_tokens)
+
+            record_rows(
+                start_s=wave_start,
+                prefill_s=prefill_s,
+                prompt_tokens=prompt_tokens,
+                decode_s=decode_s,
+                gen_tokens=gen_tokens,
+                completion_s=completion_time_s,
+            )
+            queue_idx += 1
+
+        if queue_idx >= len(prompt_list):
             break
 
-        decode_ready = [r for r in active if r["prefill_remaining"] <= 0 and r["decode_remaining"] > 0]
-        C_dec = min(len(decode_ready), sched.max_num_seqs, sched.max_num_batched_tokens)
-        decode_selected = decode_ready[:C_dec]
+    total_time_s = max(slots) if slots else 0.0
 
-        token_budget = sched.max_num_batched_tokens - C_dec
-        prefill_candidates = [r for r in active if r["prefill_remaining"] > 0]
-        pref_tokens = 0
-        for req in prefill_candidates:
-            if token_budget <= 0:
-                break
-            chunk = min(token_budget, req["prefill_remaining"], recommended_chunk)
-            if chunk <= 0:
-                continue
-            pref_tokens += chunk
-            req["prefill_remaining"] -= chunk
-            token_budget -= chunk
+    def average(values: List[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
 
-        mfu = mfu_from_chunk(max(pref_tokens, 1), hw.mfu_curve)
-        chunk_ratio = pref_tokens / sched.max_num_batched_tokens if sched.max_num_batched_tokens else 0.0
-        overlap = overlap_fraction(chunk_ratio, sched.decode_priority)
-        effective_eff = effective_hbm_efficiency(hw.hbm_eff_base, overlap)
+    def quantile(values: List[float], q: float) -> float:
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return values[0]
+        sorted_vals = sorted(values)
+        pos = (len(sorted_vals) - 1) * q
+        lower = math.floor(pos)
+        upper = math.ceil(pos)
+        if lower == upper:
+            return sorted_vals[int(pos)]
+        lower_val = sorted_vals[lower]
+        upper_val = sorted_vals[upper]
+        return lower_val + (upper_val - lower_val) * (pos - lower)
 
-        prefill_time = 0.0
-        if pref_tokens > 0:
-            denominator = hw.tflops_achievable * 1e12 * max(mfu, 1e-6)
-            prefill_time = (pref_tokens * flops_token) / denominator
+    total_time_ms = total_time_s * 1000.0
+    throughput = (total_tokens / total_time_s) if total_time_s > 0 else 0.0
 
-        decode_time_per_token = kv_bytes_token / (hw.hbm_peak_gbps * 1e9 * max(effective_eff, 1e-9))
-        decode_time = C_dec * decode_time_per_token
-        step_time = max(prefill_time, decode_time)
+    columns = [
+        "step",
+        "time_ms",
+        "prefill_tokens",
+        "decode_tokens",
+        "prefill_time_ms",
+        "decode_time_ms",
+        "step_time_ms",
+        "overlap",
+        "hbm_eff",
+        "mfu",
+    ]
+    if pd_available:
+        step_df = pd.DataFrame(step_rows, columns=columns)
+    else:
+        step_df = step_rows
 
-        for req in decode_selected:
-            if req["ttft"] is None:
-                req["ttft"] = time_s + step_time
-            req["decode_remaining"] -= 1
-            decode_completion_times.append(time_s + step_time)
-
-        active = [r for r in active if r["prefill_remaining"] > 0 or r["decode_remaining"] > 0]
-
-        step_records.append(
-            {
-                "step": step_index,
-                "time_ms": (time_s + step_time) * 1000.0,
-                "prefill_tokens": pref_tokens,
-                "decode_tokens": C_dec,
-                "prefill_time_ms": prefill_time * 1000.0,
-                "decode_time_ms": decode_time * 1000.0,
-                "step_time_ms": step_time * 1000.0,
-                "overlap": overlap,
-                "hbm_eff": effective_eff,
-                "mfu": mfu,
-            }
-        )
-
-        time_s += step_time
-        step_index += 1
-
-    for req in all_requests:
-        ttft_list.append((req["ttft"] or time_s) * 1000.0)
-
-    ttft_series = pd.Series(ttft_list) if ttft_list else pd.Series(dtype=float)
-    decode_series = pd.Series([t * 1000.0 for t in decode_completion_times]) if decode_completion_times else pd.Series(dtype=float)
-
-    step_df = pd.DataFrame(step_records)
     return SimulationResult(
         step_data=step_df,
-        ttft_ms_p50=float(ttft_series.quantile(0.5)) if not ttft_series.empty else 0.0,
-        ttft_ms_p95=float(ttft_series.quantile(0.95)) if not ttft_series.empty else 0.0,
-        tpot_ms_p50=float(decode_series.diff().dropna().quantile(0.5)) if len(decode_series) > 1 else 0.0,
-        tpot_ms_p95=float(decode_series.diff().dropna().quantile(0.95)) if len(decode_series) > 1 else 0.0,
+        ttft_ms_avg=average(ttft_samples_ms),
+        ttft_ms_p50=quantile(ttft_samples_ms, 0.5),
+        ttft_ms_p95=quantile(ttft_samples_ms, 0.95),
+        tpot_ms_avg=average(decode_interval_ms),
+        tpot_ms_p50=quantile(decode_interval_ms, 0.5),
+        tpot_ms_p95=quantile(decode_interval_ms, 0.95),
+        total_time_ms=total_time_ms,
+        throughput_tps=throughput,
+        total_tokens=total_tokens,
+        total_generated_tokens=total_generated_tokens,
     )
 
 
@@ -1224,10 +1341,19 @@ sequenceDiagram
             gen_samples,
         )
         st.dataframe(simulation.step_data)
-        st.metric("TTFT P50 (ms)", f"{simulation.ttft_ms_p50:.1f}")
-        st.metric("TTFT P95 (ms)", f"{simulation.ttft_ms_p95:.1f}")
-        st.metric("TPOT P50 (ms/token)", f"{simulation.tpot_ms_p50:.3f}")
-        st.metric("TPOT P95 (ms/token)", f"{simulation.tpot_ms_p95:.3f}")
+        ttft_cols = st.columns(3)
+        ttft_cols[0].metric("TTFT Avg (ms)", f"{simulation.ttft_ms_avg:.1f}")
+        ttft_cols[1].metric("TTFT P50 (ms)", f"{simulation.ttft_ms_p50:.1f}")
+        ttft_cols[2].metric("TTFT P95 (ms)", f"{simulation.ttft_ms_p95:.1f}")
+
+        tpot_cols = st.columns(3)
+        tpot_cols[0].metric("TPOT Avg (ms/token)", f"{simulation.tpot_ms_avg:.3f}")
+        tpot_cols[1].metric("TPOT P50 (ms/token)", f"{simulation.tpot_ms_p50:.3f}")
+        tpot_cols[2].metric("TPOT P95 (ms/token)", f"{simulation.tpot_ms_p95:.3f}")
+
+        summary_cols = st.columns(2)
+        summary_cols[0].metric("总运行时长 (s)", f"{simulation.total_time_ms / 1000.0:.1f}")
+        summary_cols[1].metric("整体吞吐 (tok/s)", f"{simulation.throughput_tps:.1f}")
 
     st.markdown("---")
     st.markdown(

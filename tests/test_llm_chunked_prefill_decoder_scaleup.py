@@ -15,6 +15,12 @@ from dashboard.services.chunked_prefill_module import (
     ModelConfig,
     estimate_sla,
 )
+from dashboard.llm_chunked_prefill_decoder_scaleup import (
+    DEFAULT_HW as SIM_DEFAULT_HW,
+    DEFAULT_SCHED as SIM_DEFAULT_SCHED,
+    DEFAULT_WORKLOAD as SIM_DEFAULT_WORKLOAD,
+    simulate_discrete_timeline,
+)
 
 HOOKS = DEFAULT_CALIBRATION_HOOKS
 DEFAULT_HW = DEFAULT_HARDWARE_CONFIG
@@ -78,4 +84,40 @@ def test_decode_time_halves_when_bytes_reduce() -> None:
     est_fp8 = estimate_sla(model_fp8, DEFAULT_HW, DEFAULT_SCHED, workload, hooks=HOOKS, seq_len_kv=workload.prompt_len)
     est_bf16 = estimate_sla(model_bf16, DEFAULT_HW, DEFAULT_SCHED, workload, hooks=HOOKS, seq_len_kv=workload.prompt_len)
     assert est_fp8.tpot_ms_per_token <= est_bf16.tpot_ms_per_token * 0.6
+
+
+def test_simulation_calibrated_concurrency_one() -> None:
+    workload = SIM_DEFAULT_WORKLOAD.copy(update={"concurrency": 1, "prompt_len": 922, "gen_len": 416})
+    result = simulate_discrete_timeline(
+        MODEL_CFG,
+        SIM_DEFAULT_HW,
+        SIM_DEFAULT_SCHED,
+        workload,
+        workload.prompt_len,
+        50,
+        [workload.prompt_len] * 50,
+        [workload.gen_len] * 50,
+    )
+    assert math.isclose(result.ttft_ms_avg, 114.18, abs_tol=5.0)
+    assert math.isclose(result.tpot_ms_avg, 9.3, abs_tol=0.5)
+    assert math.isclose(result.total_time_ms / 1000.0, 199.0, rel_tol=0.1)
+    assert math.isclose(result.throughput_tps, 336.0, rel_tol=0.2)
+
+
+def test_simulation_calibrated_concurrency_five() -> None:
+    workload = SIM_DEFAULT_WORKLOAD.copy(update={"concurrency": 5, "prompt_len": 922, "gen_len": 416})
+    result = simulate_discrete_timeline(
+        MODEL_CFG,
+        SIM_DEFAULT_HW,
+        SIM_DEFAULT_SCHED,
+        workload,
+        workload.prompt_len,
+        50,
+        [workload.prompt_len] * 50,
+        [workload.gen_len] * 50,
+    )
+    assert math.isclose(result.ttft_ms_avg, 118.9, abs_tol=5.0)
+    assert math.isclose(result.tpot_ms_avg, 11.0, abs_tol=0.6)
+    assert math.isclose(result.total_time_ms / 1000.0, 48.5, rel_tol=0.2)
+    assert math.isclose(result.throughput_tps, 1379.0, rel_tol=0.2)
 
