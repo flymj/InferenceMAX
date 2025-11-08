@@ -12,7 +12,6 @@ from dashboard._paths import ensure_repo_root_on_path
 
 ensure_repo_root_on_path()
 
-import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +26,8 @@ from dashboard.components.header import render_header
 from dashboard.components.sidebar import render_sidebar
 from dashboard.features import ChunkedPrefill, KvCacheTraffic
 from dashboard.models import build_model
-from services.llm_calcs import (
+from dashboard.common import load_model_json
+from .services.llm_calcs import (
     ModelProfile,
     concurrency_adjusted_times,
     effective_compute_tflops,
@@ -220,8 +220,8 @@ def _add_model_from_json(json_text: str, name_override: str | None = None) -> bo
         return False
 
     try:
-        config = json.loads(json_text)
-    except json.JSONDecodeError as exc:
+        config = load_model_json(json_text)
+    except ValueError as exc:
         st.error(f"无法解析 JSON：{exc}")
         return False
 

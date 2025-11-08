@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from services.llm_calcs import chunked_prefill_overlap, effective_hbm_efficiency
+from ..services.llm_calcs import chunked_prefill_overlap, effective_hbm_efficiency
 
 
 @dataclass(frozen=True)

@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 import plotly.graph_objects as go
 
-from services.llm_calcs import (
+from ..services.llm_calcs import (
     ModelProfile,
     kv_cache_memory_traffic,
     kv_capacity_tokens_per_gpu,

@@ -12,7 +12,7 @@ from dashboard._paths import ensure_repo_root_on_path
 
 ensure_repo_root_on_path()
 
-from services.llm_calcs import kv_capacity_tokens_per_gpu, weights_bytes_per_gpu
+from .services.llm_calcs import kv_capacity_tokens_per_gpu, weights_bytes_per_gpu
 
 from dashboard.app_context import DashboardActions, DashboardState, bootstrap
 

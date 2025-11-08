@@ -24,7 +24,7 @@ from dashboard.features import (
     plot_metric_vs_batch,
     run_scaleup_search_fixedN,
 )
-from services.llm_calcs import (
+from .services.llm_calcs import (
     ModelProfile,
     concurrency_adjusted_times,
     effective_compute_tflops,
