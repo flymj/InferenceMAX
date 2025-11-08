@@ -66,24 +66,44 @@ from dashboard.common import (
     load_model_json,
 )
 
-from .services.chunked_prefill_module import (
-    CalibrationHooks,
-    DEFAULT_CALIBRATION_HOOKS,
-    DEFAULT_HARDWARE_CONFIG,
-    DEFAULT_MODEL_CONFIG,
-    DEFAULT_SCHED_CONFIG,
-    DEFAULT_WORKLOAD_SNAPSHOT,
-    HardwareConfig,
-    ModelConfig,
-    SLAEstimate,
-    SchedConfig,
-    StepBudget,
-    StepCost,
-    WorkloadSnapshot,
-    estimate_sla,
-    estimate_step_cost,
-    plan_step_budget,
-)
+try:  # pragma: no cover - support running as a script
+    from dashboard.services.chunked_prefill_module import (
+        CalibrationHooks,
+        DEFAULT_CALIBRATION_HOOKS,
+        DEFAULT_HARDWARE_CONFIG,
+        DEFAULT_MODEL_CONFIG,
+        DEFAULT_SCHED_CONFIG,
+        DEFAULT_WORKLOAD_SNAPSHOT,
+        HardwareConfig,
+        ModelConfig,
+        SLAEstimate,
+        SchedConfig,
+        StepBudget,
+        StepCost,
+        WorkloadSnapshot,
+        estimate_sla,
+        estimate_step_cost,
+        plan_step_budget,
+    )
+except ImportError:  # pragma: no cover - executed when imported as package module
+    from .services.chunked_prefill_module import (
+        CalibrationHooks,
+        DEFAULT_CALIBRATION_HOOKS,
+        DEFAULT_HARDWARE_CONFIG,
+        DEFAULT_MODEL_CONFIG,
+        DEFAULT_SCHED_CONFIG,
+        DEFAULT_WORKLOAD_SNAPSHOT,
+        HardwareConfig,
+        ModelConfig,
+        SLAEstimate,
+        SchedConfig,
+        StepBudget,
+        StepCost,
+        WorkloadSnapshot,
+        estimate_sla,
+        estimate_step_cost,
+        plan_step_budget,
+    )
 
 
 st.set_page_config(
