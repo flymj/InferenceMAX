@@ -326,6 +326,8 @@ def recommended_prefill_chunk_size(
 class TokenCostModel:
     """Calibrated per-token cost model derived from empirical measurements."""
 
+    model_cfg: ModelConfig
+    hw_cfg: HwConfig
     base_prefill_ms: float = 114.18 / 922.0
     base_decode_ms: float = 9.3
     target_prefill_ms_c5: float = 118.9 / 922.0
@@ -334,6 +336,13 @@ class TokenCostModel:
     def __post_init__(self) -> None:
         self._prefill_alpha = self._compute_alpha(self.base_prefill_ms, self.target_prefill_ms_c5)
         self._decode_alpha = self._compute_alpha(self.base_decode_ms, self.target_decode_ms_c5)
+        self._dtype_bytes = self._infer_dtype_bytes(self.model_cfg.torch_dtype)
+        self._decode_weight_bytes = self._estimate_decode_weight_bytes()
+        bandwidth = self._effective_bandwidth_bytes_per_s()
+        if bandwidth <= 0.0:
+            self._decode_weight_seconds = 0.0
+        else:
+            self._decode_weight_seconds = self._decode_weight_bytes / bandwidth
 
     @staticmethod
     def _compute_alpha(base: float, target: float) -> float:
@@ -347,6 +356,28 @@ class TokenCostModel:
             return 0.0
         return (ratio - 1.0) / 4.0
 
+    @staticmethod
+    def _infer_dtype_bytes(dtype: str) -> float:
+        lowered = str(dtype).lower()
+        if any(token in lowered for token in ("16", "bf16", "fp16", "half")):
+            return 2.0
+        if "8" in lowered:
+            return 1.0
+        return 4.0
+
+    def _estimate_decode_weight_bytes(self) -> float:
+        """Approximate per-token weight traffic for decoder layers."""
+
+        h = float(self.model_cfg.hidden_size)
+        i = float(self.model_cfg.intermediate_size)
+        layers = float(self.model_cfg.num_layers)
+        per_layer_params = 4.0 * h * h + 2.0 * h * i
+        return per_layer_params * layers * self._dtype_bytes
+
+    def _effective_bandwidth_bytes_per_s(self) -> float:
+        effective_gbps = float(self.hw_cfg.hbm_peak_GBps) * float(self.hw_cfg.hbm_eff_base)
+        return effective_gbps * 1e9 if effective_gbps > 0.0 else 0.0
+
     def prefill_s_per_token(self, concurrency: int) -> float:
         c = max(1, concurrency)
         factor = 1.0 + self._prefill_alpha * (c - 1)
@@ -355,7 +386,9 @@ class TokenCostModel:
     def decode_s_per_token(self, concurrency: int) -> float:
         c = max(1, concurrency)
         factor = 1.0 + self._decode_alpha * (c - 1)
-        return (self.base_decode_ms * factor) / 1000.0
+        compute_s = (self.base_decode_ms * factor) / 1000.0
+        weight_s = self._decode_weight_seconds * factor
+        return max(compute_s, weight_s)
 
 
 @dataclass
@@ -401,7 +434,7 @@ def simulate_discrete_timeline(
     pd_available = pd is not None
 
     num_requests = max(int(total_queries), 0)
-    cost_model = TokenCostModel()
+    cost_model = TokenCostModel(model_cfg=model_cfg, hw_cfg=hw)
 
     prompt_iter = iter(prompt_samples)
     gen_iter = iter(gen_samples)
@@ -526,7 +559,8 @@ def simulate_discrete_timeline(
             completion_time_s = first_token_time_s + decode_s
             slots[slot_idx] = completion_time_s
 
-            ttft_samples_ms.append(prefill_s * 1000.0)
+            ttft_duration_s = max(first_token_time_s - wave_start, 0.0)
+            ttft_samples_ms.append(ttft_duration_s * 1000.0)
             total_tokens += prompt_tokens + gen_tokens
             total_generated_tokens += gen_tokens
 
