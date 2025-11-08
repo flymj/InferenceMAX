@@ -840,6 +840,23 @@ class EngineSimulator:
         bandwidth_ms = float(hbm) / hbm_per_ms if hbm_per_ms > 0 else 0.0
         return max(compute_ms, bandwidth_ms) + float(self.device_caps.scheduler_overhead_ms)
 
+    def _decode_phase_time_samples(self, plan: StepPlan) -> List[float]:
+        if self.device_caps is None or not plan.decode_plans:
+            return []
+        flops_per_ms = self._effective_flops_per_ms()
+        hbm_per_ms = self._effective_hbm_bytes_per_ms()
+        if flops_per_ms <= 0 and hbm_per_ms <= 0:
+            return []
+        tokens_in_step = max(1, plan.decode_tokens + plan.prefill_tokens)
+        overhead_per_token = float(self.device_caps.scheduler_overhead_ms) / tokens_in_step
+        samples: List[float] = []
+        for entry in plan.decode_plans:
+            compute_ms = entry.flops_cost / flops_per_ms if flops_per_ms > 0 else 0.0
+            hbm_ms = entry.hbm_cost / hbm_per_ms if hbm_per_ms > 0 else 0.0
+            token_ms = max(compute_ms, hbm_ms) + overhead_per_token
+            samples.append(token_ms)
+        return samples
+
     def _compute_effective_token_budget(self) -> float:
         cap = (
             self.config.max_num_batched_tokens
@@ -889,6 +906,7 @@ class EngineSimulator:
         decode_tokens_generated = 0
         decode_active_steps = 0
         decode_time_total_ms = 0.0
+        decode_token_time_samples_ms: List[float] = []
 
         def _request_start_step(req: Request) -> int:
             return req.dispatch_step if req.dispatch_step is not None else req.arrival_step
@@ -977,7 +995,12 @@ class EngineSimulator:
                 step_time_ms = self._step_time_ms(step_compute, step_hbm)
                 self.step_times_ms.append(step_time_ms)
                 if plan.decode_plans:
-                    decode_time_total_ms += step_time_ms
+                    phase_samples = self._decode_phase_time_samples(plan)
+                    if phase_samples:
+                        decode_token_time_samples_ms.extend(phase_samples)
+                        decode_time_total_ms += sum(phase_samples)
+                    else:
+                        decode_time_total_ms += step_time_ms
             else:
                 self.step_times_ms.append(float("nan"))
             step += 1
@@ -1034,9 +1057,11 @@ class EngineSimulator:
                 ttft_p95_ms = float(np.percentile(ttft_times_ms, 95))
                 ttft_max_ms = max(ttft_times_ms)
             if decode_tokens_generated > 0:
-                if decode_time_total_ms > 0:
+                if decode_token_time_samples_ms:
+                    tpot_avg_ms = statistics.mean(decode_token_time_samples_ms)
+                elif decode_time_total_ms > 0:
                     tpot_avg_ms = decode_time_total_ms / decode_tokens_generated
-                elif decode_tokens_generated > 0:
+                else:
                     tpot_avg_ms = 0.0
             for req in self.requests:
                 if req.completion_step is None:
