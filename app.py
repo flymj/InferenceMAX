@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
-from typing import Iterable, List, Optional, Sequence
+import math
+from typing import Dict, List, Optional, Sequence
 
 import streamlit as st
 
@@ -18,7 +17,12 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - pandas is optional
     pd = None  # type: ignore[assignment]
 
-from sim_scheduler import (
+from dashboard.common import (
+    DEFAULT_MODEL_JSON,
+    DEFAULT_MODEL_JSON_TEXT,
+    load_model_json,
+)
+from dashboard.sim_scheduler import (
     DeviceCapabilities,
     EngineSimulator,
     ModelCostModel,
@@ -27,8 +31,7 @@ from sim_scheduler import (
     SLAConfig,
     build_request_specs,
     instantiate_requests,
-    load_device_capabilities,
-    load_model_cost_model,
+    load_model_cost_model_from_config,
 )
 
 
@@ -49,35 +52,120 @@ def _number_list_from_text(text: str, default: Sequence[int]) -> List[int]:
     return sorted(set(values))
 
 
-def _write_temp_file(uploaded_file) -> Optional[str]:
-    if uploaded_file is None:
+HARDWARE_PRESETS: Dict[str, Dict[str, float]] = {
+    "NVIDIA H100 (80GB)": {
+        "fp16_tflops": 989.0,
+        "fp8_tflops": 1979.0,
+        "hbm_bandwidth": 3350.0,
+        "alltoall_bandwidth": 900.0,
+        "allreduce_bandwidth": 900.0,
+        "hbm_size": 80.0,
+        "tensor_mfu": 0.55,
+        "hbm_efficiency": 0.60,
+    },
+    "NVIDIA A100 (80GB)": {
+        "fp16_tflops": 624.0,
+        "fp8_tflops": 1248.0,
+        "hbm_bandwidth": 2039.0,
+        "alltoall_bandwidth": 600.0,
+        "allreduce_bandwidth": 600.0,
+        "hbm_size": 80.0,
+        "tensor_mfu": 0.50,
+        "hbm_efficiency": 0.55,
+    },
+    "AMD MI300X": {
+        "fp16_tflops": 1230.0,
+        "fp8_tflops": 2450.0,
+        "hbm_bandwidth": 5120.0,
+        "alltoall_bandwidth": 800.0,
+        "allreduce_bandwidth": 800.0,
+        "hbm_size": 192.0,
+        "tensor_mfu": 0.50,
+        "hbm_efficiency": 0.60,
+    },
+    "Custom": {
+        "fp16_tflops": 800.0,
+        "fp8_tflops": 1600.0,
+        "hbm_bandwidth": 2500.0,
+        "alltoall_bandwidth": 700.0,
+        "allreduce_bandwidth": 700.0,
+        "hbm_size": 120.0,
+        "tensor_mfu": 0.50,
+        "hbm_efficiency": 0.55,
+    },
+}
+
+
+def _metric_values(field: str) -> List[float]:
+    values: List[float] = []
+    for preset in HARDWARE_PRESETS.values():
+        value = float(preset.get(field, 0.0))
+        if value <= 0:
+            continue
+        if not any(math.isclose(value, existing, rel_tol=1e-6) for existing in values):
+            values.append(value)
+    values.sort()
+    return values
+
+
+def _select_metric(
+    label: str,
+    field: str,
+    default_value: float,
+    *,
+    step: float,
+    format_spec: str = "{:.0f}",
+) -> float:
+    candidates = _metric_values(field)
+    if not any(math.isclose(default_value, val, rel_tol=1e-6) for val in candidates):
+        candidates.append(float(default_value))
+        candidates.sort()
+    options: List[tuple[str, Optional[float]]] = [
+        (format_spec.format(val), val) for val in candidates
+    ]
+    options.append(("自定义", None))
+    try:
+        default_index = next(
+            idx
+            for idx, (_, val) in enumerate(options)
+            if val is not None and math.isclose(val, default_value, rel_tol=1e-6)
+        )
+    except StopIteration:
+        default_index = 0
+    label_key = f"hardware_{field}_choice"
+    choice_label, choice_value = st.sidebar.selectbox(
+        label,
+        options,
+        index=default_index,
+        format_func=lambda opt: opt[0],
+        key=label_key,
+    )
+    if choice_value is None:
+        return float(
+            st.sidebar.number_input(
+                f"{label} (自定义)",
+                value=float(default_value),
+                step=step,
+                key=f"{label_key}_custom",
+            )
+        )
+    return float(choice_value)
+
+
+def _load_cost_model_from_text(
+    json_text: str,
+    *,
+    weight_bytes: int,
+    kv_bytes: int,
+) -> Optional[ModelCostModel]:
+    if not json_text.strip():
         return None
-    data = uploaded_file.read()
-    if not data:
-        return None
-    handle = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-    handle.write(data)
-    handle.flush()
-    handle.close()
-    return handle.name
-
-
-def _cleanup_temp(paths: Iterable[Optional[str]]) -> None:
-    for path in paths:
-        if path and os.path.exists(path):
-            os.unlink(path)
-
-
-def _load_model(path: Optional[str], weight_bytes: int, kv_bytes: int) -> Optional[ModelCostModel]:
-    if not path:
-        return None
-    return load_model_cost_model(path, weight_dtype_bytes=weight_bytes, kv_dtype_bytes=kv_bytes)
-
-
-def _load_device(path: Optional[str]) -> Optional[DeviceCapabilities]:
-    if not path:
-        return None
-    return load_device_capabilities(path)
+    config = load_model_json(json_text, default=DEFAULT_MODEL_JSON)
+    return load_model_cost_model_from_config(
+        config,
+        weight_dtype_bytes=weight_bytes,
+        kv_dtype_bytes=kv_bytes,
+    )
 
 
 def _run_simulation(
@@ -228,10 +316,65 @@ def main() -> None:
     dp_text = st.sidebar.text_input("DP values", "1")
     ep_text = st.sidebar.text_input("EP values", "1")
 
-    st.sidebar.header("Hardware")
+    st.sidebar.header("模型配置")
+    if "scheduler_model_json" not in st.session_state:
+        st.session_state["scheduler_model_json"] = DEFAULT_MODEL_JSON_TEXT
+    uploaded_model = st.sidebar.file_uploader(
+        "上传模型 JSON (可选)",
+        type=["json"],
+        key="scheduler_model_upload",
+    )
+    if uploaded_model is not None:
+        try:
+            uploaded_text = uploaded_model.read().decode("utf-8")
+            st.session_state["scheduler_model_json"] = uploaded_text
+            st.sidebar.success("已从上传文件加载模型配置。")
+        except UnicodeDecodeError:
+            st.sidebar.error("模型 JSON 需要使用 UTF-8 编码。")
+    model_json_text = st.sidebar.text_area(
+        "模型配置 (可粘贴/编辑)",
+        value=st.session_state.get("scheduler_model_json", DEFAULT_MODEL_JSON_TEXT),
+        height=300,
+        key="scheduler_model_json",
+        help="直接粘贴模型 JSON 内容，或编辑默认示例。",
+    )
+
+    st.sidebar.header("硬件配置")
     num_gpus = st.sidebar.number_input("# GPUs", min_value=1, max_value=256, value=8)
-    model_file = st.sidebar.file_uploader("Model config JSON", type="json")
-    device_file = st.sidebar.file_uploader("Device caps JSON", type="json")
+    enable_device_caps = st.sidebar.checkbox("启用硬件建模", value=True)
+    preset_name = st.sidebar.selectbox("硬件预设", list(HARDWARE_PRESETS.keys()), index=0)
+    preset = HARDWARE_PRESETS[preset_name]
+    fp16_peak = _select_metric("FP16 峰值算力 (TFLOPs)", "fp16_tflops", preset["fp16_tflops"], step=10.0)
+    fp8_peak = _select_metric("FP8 峰值算力 (TFLOPs)", "fp8_tflops", preset["fp8_tflops"], step=10.0)
+    hbm_bandwidth = _select_metric("HBM 带宽 (GB/s)", "hbm_bandwidth", preset["hbm_bandwidth"], step=50.0)
+    alltoall_bandwidth = _select_metric(
+        "AllToAll 带宽 (GB/s)", "alltoall_bandwidth", preset["alltoall_bandwidth"], step=50.0
+    )
+    allreduce_bandwidth = _select_metric(
+        "AllReduce 带宽 (GB/s)", "allreduce_bandwidth", preset["allreduce_bandwidth"], step=50.0
+    )
+    hbm_size = _select_metric("HBM 容量 (GB)", "hbm_size", preset["hbm_size"], step=1.0)
+    tensor_mfu = st.sidebar.slider(
+        "Tensor MFU",
+        min_value=0.10,
+        max_value=1.00,
+        value=float(preset["tensor_mfu"]),
+        step=0.01,
+    )
+    hbm_efficiency = st.sidebar.slider(
+        "HBM 效率",
+        min_value=0.10,
+        max_value=1.00,
+        value=float(preset["hbm_efficiency"]),
+        step=0.01,
+    )
+    scheduler_overhead_ms = st.sidebar.number_input(
+        "调度额外开销 (ms/step)",
+        min_value=0.0,
+        max_value=100.0,
+        value=0.0,
+        step=0.1,
+    )
 
     st.sidebar.header("Scheduler knobs")
     max_num_batched_tokens = st.sidebar.number_input("Max batched tokens", min_value=32, max_value=16384, value=2048)
@@ -274,12 +417,52 @@ def main() -> None:
         sla=SLAConfig(ttft_p95_max_steps=int(ttft_p95), tpot_avg_max_steps=float(tpot_avg)),
     )
 
-    model_path = _write_temp_file(model_file)
-    device_path = _write_temp_file(device_file)
+    try:
+        cost_model = _load_cost_model_from_text(
+            model_json_text,
+            weight_bytes=2,
+            kv_bytes=2,
+        )
+    except ValueError as exc:
+        st.error(f"模型配置解析失败：{exc}")
+        return
+    except Exception as exc:  # pragma: no cover - user provided input
+        st.error(f"模型分析失败：{exc}")
+        return
+
+    device_caps: Optional[DeviceCapabilities] = None
+    if enable_device_caps:
+        customised = any(
+            not math.isclose(
+                float(selected),
+                float(preset[key]),
+                rel_tol=1e-6,
+            )
+            for selected, key in [
+                (fp16_peak, "fp16_tflops"),
+                (fp8_peak, "fp8_tflops"),
+                (hbm_bandwidth, "hbm_bandwidth"),
+                (alltoall_bandwidth, "alltoall_bandwidth"),
+                (allreduce_bandwidth, "allreduce_bandwidth"),
+                (hbm_size, "hbm_size"),
+            ]
+        )
+        device_name = f"{preset_name} (自定义)" if customised else preset_name
+        device_caps = DeviceCapabilities(
+            name=device_name,
+            peak_tflops=float(fp16_peak),
+            tensor_mfu=float(tensor_mfu),
+            hbm_bandwidth_GBps=float(hbm_bandwidth),
+            hbm_efficiency=float(hbm_efficiency),
+            scheduler_overhead_ms=float(scheduler_overhead_ms),
+            fp16_tflops=float(fp16_peak),
+            fp8_tflops=float(fp8_peak) if fp8_peak > 0 else None,
+            alltoall_bandwidth_GBps=float(alltoall_bandwidth) if alltoall_bandwidth > 0 else None,
+            allreduce_bandwidth_GBps=float(allreduce_bandwidth) if allreduce_bandwidth > 0 else None,
+            hbm_size_GB=float(hbm_size) if hbm_size > 0 else None,
+        )
 
     try:
-        cost_model = _load_model(model_path, weight_bytes=2, kv_bytes=2)
-        device_caps = _load_device(device_path)
         results = _run_simulation(
             min_input=int(min_input),
             max_input=int(max_input),
@@ -303,10 +486,7 @@ def main() -> None:
         )
     except Exception as exc:  # pragma: no cover - user provided input
         st.error(f"Simulation failed: {exc}")
-        _cleanup_temp([model_path, device_path])
         return
-
-    _cleanup_temp([model_path, device_path])
 
     if not results:
         st.warning("No results generated.")
