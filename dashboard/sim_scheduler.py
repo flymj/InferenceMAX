@@ -778,6 +778,7 @@ class EngineSimulator:
         self.num_gpus = num_gpus
         self.cost_tracker = CostTracker(cost_model, tp)
         self.device_caps = device_caps
+        self._parallelism_scale = self._compute_parallelism_scale()
         requested_kv_capacity = max(1, int(config.kv_capacity_tokens))
         effective_kv_capacity = self._effective_kv_capacity(requested_kv_capacity)
         self.kv_tracker = KVCapacityTracker(effective_kv_capacity)
@@ -800,6 +801,43 @@ class EngineSimulator:
         self.total_decode_flops: float = 0.0
         self.total_prefill_hbm: float = 0.0
         self.total_decode_hbm: float = 0.0
+
+    def _compute_parallelism_scale(self) -> float:
+        """Estimate aggregate throughput scaling from parallelism settings."""
+
+        tp = max(1, int(self.tp))
+        dp = max(1, int(self.dp))
+        ep = max(1, int(self.ep)) if self.config.f_moe > 0 else 1
+
+        cap_tp = float(self.config.cap_tp(tp))
+        cap_dp = float(self.config.cap_dp(dp))
+        cap_ep = float(self.config.cap_ep(ep)) if self.config.f_moe > 0 else 1.0
+
+        tp_eff = cap_tp / float(tp) if tp > 0 else 1.0
+        dp_eff = cap_dp / float(dp) if dp > 0 else 1.0
+        ep_eff = cap_ep if self.config.f_moe > 0 else 1.0
+
+        scale = float(tp * dp * ep) * tp_eff * dp_eff * ep_eff
+        return max(1.0, scale)
+
+    def _effective_flops_per_ms(self) -> float:
+        if self.device_caps is None:
+            return 0.0
+        return float(self.device_caps.achievable_flops_per_ms) * self._parallelism_scale
+
+    def _effective_hbm_bytes_per_ms(self) -> float:
+        if self.device_caps is None:
+            return 0.0
+        return float(self.device_caps.achievable_hbm_bytes_per_ms) * self._parallelism_scale
+
+    def _step_time_ms(self, flops: float, hbm: float) -> float:
+        if self.device_caps is None:
+            return float("nan")
+        flops_per_ms = self._effective_flops_per_ms()
+        hbm_per_ms = self._effective_hbm_bytes_per_ms()
+        compute_ms = float(flops) / flops_per_ms if flops_per_ms > 0 else 0.0
+        bandwidth_ms = float(hbm) / hbm_per_ms if hbm_per_ms > 0 else 0.0
+        return max(compute_ms, bandwidth_ms) + float(self.device_caps.scheduler_overhead_ms)
 
     def _compute_effective_token_budget(self) -> float:
         cap = (
@@ -932,7 +970,7 @@ class EngineSimulator:
             self.step_compute_flops.append(step_compute)
             self.step_hbm_bytes.append(step_hbm)
             if self.device_caps is not None:
-                step_time_ms = self.device_caps.step_time_ms(step_compute, step_hbm)
+                step_time_ms = self._step_time_ms(step_compute, step_hbm)
                 self.step_times_ms.append(step_time_ms)
                 if plan.decode_plans:
                     decode_time_total_ms += step_time_ms
@@ -1064,8 +1102,8 @@ class EngineSimulator:
         decode_compute_ms = float("nan")
         decode_hbm_ms = float("nan")
         if self.device_caps is not None:
-            flops_per_ms = self.device_caps.achievable_flops_per_ms
-            hbm_per_ms = self.device_caps.achievable_hbm_bytes_per_ms
+            flops_per_ms = self._effective_flops_per_ms()
+            hbm_per_ms = self._effective_hbm_bytes_per_ms()
             compute_time_samples: List[float] = []
             hbm_time_samples: List[float] = []
             if flops_per_ms > 0:
@@ -1268,6 +1306,11 @@ class EngineSimulator:
     ) -> bool:
         tokens = min(int(desired_tokens), request.remaining_prompt_tokens)
         while tokens > 0:
+            if self._should_expand_prefill(plan, request):
+                expanded = request.remaining_prompt_tokens
+                if expanded > tokens:
+                    if plan.schedule_prefill(request, expanded, is_long=False):
+                        return True
             effective_long = is_long and tokens > self.config.long_prefill_token_threshold
             if plan.schedule_prefill(request, tokens, is_long=effective_long):
                 return True
@@ -1275,6 +1318,24 @@ class EngineSimulator:
                 break
             tokens = max(1, tokens // 2)
         return False
+
+    def _should_expand_prefill(self, plan: StepPlan, request: Request) -> bool:
+        if request.remaining_prompt_tokens <= 0:
+            return False
+        if request.req_id not in self.running:
+            return False
+        if len(self.running) != 1:
+            return False
+        running_req = next(iter(self.running.values()))
+        if running_req.req_id != request.req_id:
+            return False
+        if running_req.needs_decode_now:
+            return False
+        if plan.decode_plans:
+            return False
+        if plan.prefill_chunks:
+            return False
+        return True
 
     def _schedule_from_waiting(self, plan: StepPlan) -> None:
         concurrency_limit = int(self.target_concurrency * self.config.cap_dp(self.dp))
