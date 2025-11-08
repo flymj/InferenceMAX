@@ -147,6 +147,7 @@ class Request:
     is_running: bool = False
     kv_tokens_committed: int = 0
     completion_step: Optional[int] = None
+    dispatch_step: Optional[int] = None
 
     @property
     def remaining_prompt_tokens(self) -> int:
@@ -889,9 +890,12 @@ class EngineSimulator:
         decode_active_steps = 0
         decode_time_total_ms = 0.0
 
+        def _request_start_step(req: Request) -> int:
+            return req.dispatch_step if req.dispatch_step is not None else req.arrival_step
+
         while completed < total_requests and step < self.config.max_steps:
             self._admit_arrivals(step)
-            self._fill_running_pool()
+            self._fill_running_pool(step)
 
             plan = StepPlan(
                 compute_budget_remaining=self.compute_budget_per_step,
@@ -908,7 +912,7 @@ class EngineSimulator:
                     break
 
             self._schedule_carry_over_prefills(plan)
-            self._schedule_from_waiting(plan)
+            self._schedule_from_waiting(plan, step)
 
             if not plan.decode_plans and not plan.prefill_chunks:
                 # Nothing scheduled this step; advance to avoid infinite loop.
@@ -979,7 +983,7 @@ class EngineSimulator:
             step += 1
 
         ttft_samples = [
-            (req.first_token_step - req.arrival_step + 1)
+            (req.first_token_step - _request_start_step(req) + 1)
             for req in self.requests
             if req.first_token_step is not None
         ]
@@ -999,7 +1003,7 @@ class EngineSimulator:
                 tpot_avg = decode_active_steps / decode_tokens_generated
 
         completion_samples = [
-            float(req.completion_step - req.arrival_step + 1)
+            float(req.completion_step - _request_start_step(req) + 1)
             for req in self.requests
             if req.completion_step is not None
         ]
@@ -1017,9 +1021,10 @@ class EngineSimulator:
                     continue
                 end_idx = req.first_token_step
                 end_time = float(cumulative_times[end_idx])
+                start_step = _request_start_step(req)
                 start_time = (
-                    float(cumulative_times[req.arrival_step - 1])
-                    if req.arrival_step > 0
+                    float(cumulative_times[start_step - 1])
+                    if start_step > 0
                     else 0.0
                 )
                 ttft_times_ms.append(end_time - start_time)
@@ -1040,9 +1045,10 @@ class EngineSimulator:
                 if end_idx >= len(cumulative_times):
                     continue
                 end_time = float(cumulative_times[end_idx])
+                start_step = _request_start_step(req)
                 start_time = (
-                    float(cumulative_times[req.arrival_step - 1])
-                    if req.arrival_step > 0
+                    float(cumulative_times[start_step - 1])
+                    if start_step > 0
                     else 0.0
                 )
                 completion_times_ms.append(end_time - start_time)
@@ -1245,13 +1251,15 @@ class EngineSimulator:
             self.waiting.append(req)
             self.arrival_index += 1
 
-    def _fill_running_pool(self) -> None:
+    def _fill_running_pool(self, step: int) -> None:
         concurrency_limit = int(self.target_concurrency * self.config.cap_dp(self.dp))
         while len(self.running) < concurrency_limit and self.waiting:
             req = self.waiting.popleft()
             if req.finished:
                 continue
             req.is_running = True
+            if req.dispatch_step is None:
+                req.dispatch_step = step
             self.running[req.req_id] = req
 
     def _collect_decode_ready(self) -> List[Request]:
@@ -1337,7 +1345,7 @@ class EngineSimulator:
             return False
         return True
 
-    def _schedule_from_waiting(self, plan: StepPlan) -> None:
+    def _schedule_from_waiting(self, plan: StepPlan, step: int) -> None:
         concurrency_limit = int(self.target_concurrency * self.config.cap_dp(self.dp))
         while plan.can_continue():
             # Prioritize decode-ready requests that became runnable after admissions.
@@ -1361,6 +1369,8 @@ class EngineSimulator:
                 if candidate.finished:
                     continue
                 candidate.is_running = True
+                if candidate.dispatch_step is None:
+                    candidate.dispatch_step = step
                 self.running[candidate.req_id] = candidate
                 req = candidate
             else:
