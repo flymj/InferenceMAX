@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from services.llm_calcs import attn_family
+from ..services.llm_calcs import attn_family
 
 
 class AttentionFamily(str, Enum):

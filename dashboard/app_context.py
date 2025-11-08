@@ -14,7 +14,7 @@ from .components.header import render_header
 from .components.sidebar import render_sidebar
 from dashboard.features import bytes_to_time_ms
 from models import build_model
-from services.llm_calcs import (
+from .services.llm_calcs import (
     attn_family,
     combined_weight_flops_rows,
     per_token_decode_hbm_bytes_per_layer_per_gpu,

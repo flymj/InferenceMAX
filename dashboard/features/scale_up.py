@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from dashboard.models import build_model
-from services.llm_calcs import (
+from ..services.llm_calcs import (
     communication_breakdown,
     per_token_decode_hbm_bytes_per_layer_per_gpu,
     weights_bytes_per_gpu,
