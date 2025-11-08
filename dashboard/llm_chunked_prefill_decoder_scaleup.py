@@ -301,7 +301,7 @@ def simulate_discrete_timeline(
     requests = [
         {
             "prefill_remaining": workload.prompt_len,
-            "decode_remaining": workload.generation_len,
+            "decode_remaining": workload.gen_len,
             "ttft": None,
         }
         for _ in range(workload.concurrency)
@@ -584,7 +584,7 @@ def sidebar_inputs() -> Tuple[ModelConfig, HwConfig, SchedConfig, WorkloadConfig
 
     workload_cfg = WorkloadConfig(
         prompt_len=int(prompt_len),
-        generation_len=int(gen_len),
+        gen_len=int(gen_len),
         concurrency=int(concurrency),
     )
 
