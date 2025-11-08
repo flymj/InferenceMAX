@@ -12,7 +12,16 @@ from dashboard._paths import ensure_repo_root_on_path
 
 ensure_repo_root_on_path()
 
-from .services.llm_calcs import kv_capacity_tokens_per_gpu, weights_bytes_per_gpu
+try:  # pragma: no cover - allow running as a script
+    from dashboard.services.llm_calcs import (
+        kv_capacity_tokens_per_gpu,
+        weights_bytes_per_gpu,
+    )
+except ImportError:  # pragma: no cover - executed when imported as package module
+    from .services.llm_calcs import (
+        kv_capacity_tokens_per_gpu,
+        weights_bytes_per_gpu,
+    )
 
 from dashboard.app_context import DashboardActions, DashboardState, bootstrap
 
