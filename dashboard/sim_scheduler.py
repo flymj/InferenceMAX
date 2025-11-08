@@ -146,6 +146,7 @@ class Request:
     finished: bool = False
     is_running: bool = False
     kv_tokens_committed: int = 0
+    completion_step: Optional[int] = None
 
     @property
     def remaining_prompt_tokens(self) -> int:
@@ -690,6 +691,9 @@ class SimulationResult:
     step_decode_tokens: List[int]
     step_running_sizes: List[int]
     ttft_samples: List[float]
+    ttft_samples_ms: List[float]
+    completion_samples: List[float]
+    completion_samples_ms: List[float]
     prefill_flops_total: float
     decode_flops_total: float
     prefill_hbm_total: float
@@ -724,15 +728,18 @@ class SimulationResult:
     decode_hbm_time_ms: float
     kv_capacity_limit: int
     kv_capacity_requested: int
+    total_time_steps: int
+    total_time_ms: float
 
     def summary(self) -> str:
         device_part = f" device={self.device_name}" if self.device_name else ""
-        time_part = ""
+        time_bits: List[str] = []
         if not math.isnan(self.ttft_p95_ms):
-            time_part = (
-                f" ttft_p95_ms={self.ttft_p95_ms:.1f}"
-                f" tpot_ms={self.tpot_avg_ms:.3f}"
-            )
+            time_bits.append(f"ttft_p95_ms={self.ttft_p95_ms:.1f}")
+            time_bits.append(f"tpot_ms={self.tpot_avg_ms:.3f}")
+        if not math.isnan(self.total_time_ms):
+            time_bits.append(f"total_ms={self.total_time_ms:.1f}")
+        time_part = f" {' '.join(time_bits)}" if time_bits else ""
         return (
             f"C={self.target_concurrency} tp={self.tp} dp={self.dp} ep={self.ep}{device_part} "
             f"budget={self.effective_token_budget:.1f} steps={self.total_steps} "
@@ -904,6 +911,7 @@ class EngineSimulator:
             for req in list(self.running.values()):
                 if req.remaining_prompt_tokens == 0 and req.remaining_decode_tokens == 0:
                     req.finished = True
+                    req.completion_step = step
                     finished_ids.append(req.req_id)
                     self.kv_tracker.free(req.kv_tokens_committed)
 
@@ -951,11 +959,20 @@ class EngineSimulator:
             else:
                 tpot_avg = decode_active_steps / decode_tokens_generated
 
+        completion_samples = [
+            float(req.completion_step - req.arrival_step + 1)
+            for req in self.requests
+            if req.completion_step is not None
+        ]
+        completion_times_ms: List[float] = []
+        total_time_ms = float("nan")
         ttft_times_ms: List[float] = []
         ttft_avg_ms = ttft_p50_ms = ttft_p95_ms = ttft_max_ms = float("nan")
         tpot_avg_ms = float("nan")
         if self.device_caps is not None and self.step_times_ms:
             cumulative_times = np.cumsum(self.step_times_ms)
+            if len(cumulative_times) > 0:
+                total_time_ms = float(cumulative_times[-1])
             for req in self.requests:
                 if req.first_token_step is None:
                     continue
@@ -977,6 +994,19 @@ class EngineSimulator:
                     tpot_avg_ms = decode_time_total_ms / decode_tokens_generated
                 elif decode_tokens_generated > 0:
                     tpot_avg_ms = 0.0
+            for req in self.requests:
+                if req.completion_step is None:
+                    continue
+                end_idx = req.completion_step
+                if end_idx >= len(cumulative_times):
+                    continue
+                end_time = float(cumulative_times[end_idx])
+                start_time = (
+                    float(cumulative_times[req.arrival_step - 1])
+                    if req.arrival_step > 0
+                    else 0.0
+                )
+                completion_times_ms.append(end_time - start_time)
 
         ttft_count = len(ttft_samples)
         per_request_prefill_flops: List[float] = []
@@ -1157,6 +1187,11 @@ class EngineSimulator:
             decode_hbm_time_ms=decode_hbm_ms,
             kv_capacity_limit=self.kv_capacity_limit,
             kv_capacity_requested=self.kv_capacity_requested,
+            ttft_samples_ms=[float(x) for x in ttft_times_ms],
+            completion_samples=completion_samples,
+            completion_samples_ms=[float(x) for x in completion_times_ms],
+            total_time_steps=int(step),
+            total_time_ms=total_time_ms,
         )
 
     # ------------------------------------------------------------------

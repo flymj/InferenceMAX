@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import statistics
 from typing import Dict, List, Optional, Sequence
 
 import streamlit as st
@@ -29,6 +30,21 @@ from .sim_scheduler import (
     instantiate_requests,
     load_model_cost_model_from_config,
 )
+
+
+def _percentile(values: Sequence[float], percent: float) -> float:
+    if not values:
+        return float("nan")
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    position = percent / 100.0 * (len(ordered) - 1)
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(ordered[int(position)])
+    weight = position - lower
+    return float(ordered[lower] * (1 - weight) + ordered[upper] * weight)
 
 
 def _number_list_from_text(text: str, default: Sequence[int]) -> List[int]:
@@ -146,6 +162,10 @@ def _results_dataframe(results: Sequence[SimulationResult]):
             "tpot_avg_ms": res.tpot_avg_ms,
             "sla_ttft": res.sla_ttft_ok,
             "sla_tpot": res.sla_tpot_ok,
+            "total_time_steps": res.total_time_steps,
+            "total_time_ms": res.total_time_ms if not math.isnan(res.total_time_ms) else float("nan"),
+            "completion_p95": _percentile(res.completion_samples, 95.0),
+            "completion_p95_ms": _percentile(res.completion_samples_ms, 95.0),
         }
         rows.append(row)
     if pd is not None:
@@ -180,12 +200,32 @@ def _plot_running_size(result: SimulationResult):
 
 
 def _plot_ttft_hist(result: SimulationResult):
-    if plt is None or not result.ttft_samples:
+    if plt is None:
+        return None
+    samples = result.ttft_samples_ms or result.ttft_samples
+    if not samples:
         return None
     fig, ax = plt.subplots()
-    bins = min(20, max(5, len(result.ttft_samples) // 2))
-    ax.hist(result.ttft_samples, bins=bins)
-    ax.set_xlabel("TTFT (steps)")
+    bins = min(20, max(5, len(samples) // 2))
+    ax.hist(samples, bins=bins)
+    ax.set_xlabel("TTFT (ms)" if result.ttft_samples_ms else "TTFT (steps)")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    return fig
+
+
+def _plot_completion_hist(result: SimulationResult):
+    if plt is None:
+        return None
+    samples = result.completion_samples_ms or result.completion_samples
+    if not samples:
+        return None
+    fig, ax = plt.subplots()
+    bins = min(20, max(5, len(samples) // 2))
+    ax.hist(samples, bins=bins)
+    ax.set_xlabel(
+        "Completion time (ms)" if result.completion_samples_ms else "Completion time (steps)"
+    )
     ax.set_ylabel("Count")
     fig.tight_layout()
     return fig
@@ -306,13 +346,25 @@ def main() -> None:
         value=default_max_output,
         step=1,
     )
-    concurrency_choices = [32, 64, 128, 256]
-    default_concurrency = [64, 128]
-    selected_concurrency = st.sidebar.multiselect(
-        "Target concurrency", concurrency_choices, default=default_concurrency
+    conc_start = st.sidebar.number_input(
+        "Min concurrency", min_value=1, max_value=4096, value=1, step=1
     )
-    if not selected_concurrency:
-        selected_concurrency = default_concurrency
+    conc_end = st.sidebar.number_input(
+        "Max concurrency", min_value=int(conc_start), max_value=4096, value=256, step=1
+    )
+    conc_stride = st.sidebar.number_input(
+        "Concurrency stride", min_value=1, max_value=512, value=8, step=1
+    )
+    concurrency_values = list(
+        range(int(conc_start), int(conc_end) + 1, max(1, int(conc_stride)))
+    )
+    if concurrency_values:
+        st.sidebar.caption(
+            f"Sweep 并发度：{len(concurrency_values)} 个取值 "
+            f"({concurrency_values[0]}-{concurrency_values[-1]})"
+        )
+    else:
+        st.sidebar.error("并发度 sweep 未生成取值，请调整范围或步长。")
     times_per_concurrency = st.sidebar.number_input(
         "Times per concurrency", min_value=1, max_value=64, value=4
     )
@@ -504,6 +556,10 @@ def main() -> None:
         st.info("Configure parameters in the sidebar and click **Run Sweep**.")
         return
 
+    if not concurrency_values:
+        st.error("并发度 sweep 未生成取值，请调整范围或步长。")
+        return
+
     try:
         tp_values = _number_list_from_text(tp_text, [1])
         dp_values = _number_list_from_text(dp_text, [1])
@@ -588,7 +644,7 @@ def main() -> None:
             max_input=int(max_input),
             min_output=int(min_output),
             max_output=int(max_output),
-            concurrency_list=selected_concurrency,
+            concurrency_list=concurrency_values,
             times_per_concurrency=int(times_per_concurrency),
             num_gpus=int(num_gpus),
             tp_values=tp_values,
@@ -643,6 +699,26 @@ def main() -> None:
             st.warning(capacity_line + " —— 已根据设备 HBM 自动收紧。")
         else:
             st.caption(capacity_line)
+
+    st.subheader("整体完成情况")
+    completion_lines: List[str] = []
+    completion_summary = f"- 模拟共 {chosen.total_time_steps} 步"
+    if not math.isnan(chosen.total_time_ms):
+        completion_summary += f"，约 {chosen.total_time_ms:.1f} ms"
+    completion_lines.append(completion_summary)
+    if chosen.completion_samples:
+        avg_steps = statistics.mean(chosen.completion_samples)
+        completion_lines.append(f"- 平均完成时间：{avg_steps:.1f} 步")
+        p95_steps = _percentile(chosen.completion_samples, 95.0)
+        if not math.isnan(p95_steps):
+            completion_lines.append(f"  · P95：{p95_steps:.1f} 步")
+    if chosen.completion_samples_ms:
+        avg_ms = statistics.mean(chosen.completion_samples_ms)
+        completion_lines.append(f"- 平均完成时间：{avg_ms:.1f} ms")
+        p95_ms = _percentile(chosen.completion_samples_ms, 95.0)
+        if not math.isnan(p95_ms):
+            completion_lines.append(f"  · P95：{p95_ms:.1f} ms")
+    st.markdown("\n".join(completion_lines) or "- 无数据")
 
     st.subheader("Per-request cost breakdown")
     ttft_col, decode_col = st.columns(2)
@@ -714,7 +790,7 @@ def main() -> None:
     decode_col.markdown("**Decode (生成阶段)**")
     decode_col.markdown("\n".join(decode_lines) or "- 无数据")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     fig_tokens = _plot_step_tokens(chosen)
     if fig_tokens is not None:
         col1.pyplot(fig_tokens)
@@ -732,6 +808,12 @@ def main() -> None:
         col3.pyplot(fig_ttft)
     else:
         col3.info("TTFT samples unavailable or matplotlib missing")
+
+    fig_completion = _plot_completion_hist(chosen)
+    if fig_completion is not None:
+        col4.pyplot(fig_completion)
+    else:
+        col4.info("Completion samples unavailable or matplotlib missing")
 
 
 if __name__ == "__main__":  # pragma: no cover - manual execution entrypoint
