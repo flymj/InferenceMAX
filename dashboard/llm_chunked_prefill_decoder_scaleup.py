@@ -328,6 +328,7 @@ class TokenCostModel:
 
     model_cfg: ModelConfig
     hw_cfg: HwConfig
+    seq_len_kv: int
     base_prefill_ms: float = 114.18 / 922.0
     base_decode_ms: float = 9.3
     target_prefill_ms_c5: float = 118.9 / 922.0
@@ -336,13 +337,29 @@ class TokenCostModel:
     def __post_init__(self) -> None:
         self._prefill_alpha = self._compute_alpha(self.base_prefill_ms, self.target_prefill_ms_c5)
         self._decode_alpha = self._compute_alpha(self.base_decode_ms, self.target_decode_ms_c5)
-        self._dtype_bytes = self._infer_dtype_bytes(self.model_cfg.torch_dtype)
-        self._decode_weight_bytes = self._estimate_decode_weight_bytes()
-        bandwidth = self._effective_bandwidth_bytes_per_s()
-        if bandwidth <= 0.0:
-            self._decode_weight_seconds = 0.0
-        else:
-            self._decode_weight_seconds = self._decode_weight_bytes / bandwidth
+
+        self._compute_tflops = float(self.hw_cfg.tflops_ach)
+        self._hbm_tb_per_s = float(self.hw_cfg.hbm_peak_GBps) / 1000.0
+
+        self._prefill_flops_per_token = float(self.model_cfg.flops_per_token())
+        self._decode_flops_per_token = float(self._estimate_decode_flops_per_token(max(1, int(self.seq_len_kv))))
+
+        self._prefill_kv_bytes_per_token = float(self._prefill_kv_bytes())
+        self._decode_kv_bytes_per_token = float(self.model_cfg.kv_bytes_per_token(max(1, int(self.seq_len_kv))))
+
+        self._compute_util_prefill = self._solve_compute_util(
+            self._prefill_flops_per_token, self.base_prefill_ms
+        )
+        self._compute_util_decode = self._solve_compute_util(
+            self._decode_flops_per_token, self.base_decode_ms
+        )
+
+        self._mem_util_prefill = self._solve_mem_util(
+            self._prefill_kv_bytes_per_token, self.base_prefill_ms
+        )
+        self._mem_util_decode = self._solve_mem_util(
+            self._decode_kv_bytes_per_token * 4.0, self.base_decode_ms
+        )
 
     @staticmethod
     def _compute_alpha(base: float, target: float) -> float:
@@ -356,39 +373,89 @@ class TokenCostModel:
             return 0.0
         return (ratio - 1.0) / 4.0
 
-    @staticmethod
-    def _infer_dtype_bytes(dtype: str) -> float:
-        lowered = str(dtype).lower()
-        if any(token in lowered for token in ("16", "bf16", "fp16", "half")):
-            return 2.0
-        if "8" in lowered:
-            return 1.0
-        return 4.0
-
-    def _estimate_decode_weight_bytes(self) -> float:
-        """Approximate per-token weight traffic for decoder layers."""
-
+    def _estimate_decode_flops_per_token(self, seq_len: int) -> float:
         h = float(self.model_cfg.hidden_size)
         i = float(self.model_cfg.intermediate_size)
         layers = float(self.model_cfg.num_layers)
-        per_layer_params = 4.0 * h * h + 2.0 * h * i
-        return per_layer_params * layers * self._dtype_bytes
+        num_q_heads = float(self.model_cfg.num_q_heads)
+        num_kv_heads = float(self.model_cfg.num_kv_heads)
+        head_dim = float(self.model_cfg.head_dim)
+        kv = float(max(seq_len, 1))
 
-    def _effective_bandwidth_bytes_per_s(self) -> float:
-        effective_gbps = float(self.hw_cfg.hbm_peak_GBps) * float(self.hw_cfg.hbm_eff_base)
-        return effective_gbps * 1e9 if effective_gbps > 0.0 else 0.0
+        q_proj = 2.0 * h * (num_q_heads * head_dim)
+        k_proj = 2.0 * h * (num_kv_heads * head_dim)
+        v_proj = 2.0 * h * (num_kv_heads * head_dim)
+        scores = 2.0 * num_q_heads * head_dim * kv
+        attn_apply = 2.0 * num_q_heads * head_dim * kv
+        output_proj = 2.0 * (num_q_heads * head_dim) * h
+        mlp = 2.0 * 3.0 * h * i
+
+        per_layer = q_proj + k_proj + v_proj + scores + attn_apply + output_proj + mlp
+        return per_layer * layers
+
+    def _prefill_kv_bytes(self) -> float:
+        layers = float(self.model_cfg.num_layers)
+        kv_heads = float(self.model_cfg.num_kv_heads)
+        head_dim = float(self.model_cfg.head_dim)
+        bytes_per_kv = float(self.model_cfg.kv_bytes)
+        return layers * 2.0 * kv_heads * head_dim * bytes_per_kv
+
+    def _solve_compute_util(self, flops_per_token: float, time_ms: float) -> float:
+        time_s = max(time_ms / 1000.0, 1e-9)
+        denom = self._compute_tflops * 1e12 * time_s
+        if denom <= 0.0:
+            return 0.0
+        util = flops_per_token / denom
+        return float(min(max(util, 1e-5), 0.95))
+
+    def _solve_mem_util(self, bytes_per_token: float, time_ms: float) -> float:
+        time_s = max(time_ms / 1000.0, 1e-9)
+        denom = self._hbm_tb_per_s * 1e12 * time_s
+        if denom <= 0.0:
+            return 0.0
+        util = bytes_per_token / denom
+        return float(min(max(util, 1e-6), 0.95))
+
+    def _step_time_from_work(self, total_prefill_tokens: int, total_decode_tokens: int) -> float:
+        flops_prefill = float(total_prefill_tokens) * self._prefill_flops_per_token
+        flops_decode = float(total_decode_tokens) * self._decode_flops_per_token
+        flops_total = flops_prefill + flops_decode
+
+        compute_util = 0.0
+        if flops_total > 0.0:
+            weighted = (
+                flops_prefill * self._compute_util_prefill + flops_decode * self._compute_util_decode
+            )
+            compute_util = max(weighted / flops_total, 1e-6)
+        effective_tflops = self._compute_tflops * compute_util
+        t_compute = flops_total / (effective_tflops * 1e12) if effective_tflops > 0.0 else 0.0
+
+        bytes_prefill = float(total_prefill_tokens) * self._prefill_kv_bytes_per_token
+        bytes_decode = float(total_decode_tokens) * self._decode_kv_bytes_per_token * 4.0
+        bytes_total = bytes_prefill + bytes_decode
+
+        mem_util = 0.0
+        if bytes_total > 0.0:
+            weighted_mem = (
+                bytes_prefill * self._mem_util_prefill + bytes_decode * self._mem_util_decode
+            )
+            mem_util = max(weighted_mem / bytes_total, 1e-6)
+        effective_bw_tb = self._hbm_tb_per_s * mem_util
+        t_mem = bytes_total / (effective_bw_tb * 1e12) if effective_bw_tb > 0.0 else 0.0
+
+        return max(t_compute, t_mem)
 
     def prefill_s_per_token(self, concurrency: int) -> float:
         c = max(1, concurrency)
         factor = 1.0 + self._prefill_alpha * (c - 1)
-        return (self.base_prefill_ms * factor) / 1000.0
+        base_time = self._step_time_from_work(1, 0)
+        return base_time * factor
 
     def decode_s_per_token(self, concurrency: int) -> float:
         c = max(1, concurrency)
         factor = 1.0 + self._decode_alpha * (c - 1)
-        compute_s = (self.base_decode_ms * factor) / 1000.0
-        weight_s = self._decode_weight_seconds * factor
-        return max(compute_s, weight_s)
+        base_time = self._step_time_from_work(0, 1)
+        return base_time * factor
 
 
 @dataclass
@@ -434,7 +501,7 @@ def simulate_discrete_timeline(
     pd_available = pd is not None
 
     num_requests = max(int(total_queries), 0)
-    cost_model = TokenCostModel(model_cfg=model_cfg, hw_cfg=hw)
+    cost_model = TokenCostModel(model_cfg=model_cfg, hw_cfg=hw, seq_len_kv=seq_len_kv)
 
     prompt_iter = iter(prompt_samples)
     gen_iter = iter(gen_samples)
