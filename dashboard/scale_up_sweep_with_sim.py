@@ -156,6 +156,7 @@ def _results_dataframe(results: Sequence[SimulationResult]):
             "tp": res.tp,
             "dp": res.dp,
             "ep": res.ep,
+            "total_queries": res.num_requests,
             "device": res.device_name or "-",
             "budget": res.effective_token_budget,
             "steps": res.total_steps,
@@ -236,6 +237,57 @@ def _plot_completion_hist(result: SimulationResult):
     return fig
 
 
+def _plot_total_time_vs_concurrency(
+    results: Sequence[SimulationResult],
+) -> tuple[Optional["plt.Figure"], Optional[int]]:
+    if plt is None or not results:
+        return None, None
+
+    grouped: Dict[int, List[SimulationResult]] = {}
+    for res in results:
+        grouped.setdefault(res.target_concurrency, []).append(res)
+
+    if not grouped:
+        return None, None
+
+    all_have_ms = all(
+        not math.isnan(candidate.total_time_ms)
+        for group in grouped.values()
+        for candidate in group
+    )
+
+    concurrencies: List[int] = []
+    best_times: List[float] = []
+    for concurrency in sorted(grouped):
+        candidates = grouped[concurrency]
+        if all_have_ms:
+            best_value = min(candidate.total_time_ms for candidate in candidates)
+        else:
+            best_value = float(
+                min(candidate.total_time_steps for candidate in candidates)
+            )
+        concurrencies.append(concurrency)
+        best_times.append(best_value)
+
+    if not concurrencies:
+        return None, None
+
+    fig, ax = plt.subplots()
+    ax.plot(concurrencies, best_times, marker="o")
+    ax.set_xlabel("Target concurrency")
+    ax.set_ylabel("Total completion time (ms)" if all_have_ms else "Total completion time (steps)")
+
+    query_counts = {res.num_requests for res in results if res.num_requests > 0}
+    total_queries = query_counts.pop() if len(query_counts) == 1 else None
+    if total_queries is not None:
+        ax.set_title(f"完成 {total_queries:,} 请求的最短耗时")
+    else:
+        ax.set_title("完成全部请求的最短耗时")
+
+    fig.tight_layout()
+    return fig, total_queries
+
+
 def _run_simulation(
     *,
     min_input: int,
@@ -244,6 +296,7 @@ def _run_simulation(
     max_output: int,
     concurrency_list: Sequence[int],
     times_per_concurrency: int,
+    total_queries: Optional[int],
     num_gpus: int,
     tp_values: Sequence[int],
     dp_values: Sequence[int],
@@ -260,7 +313,10 @@ def _run_simulation(
 ) -> List[SimulationResult]:
     specs_by_concurrency = {}
     for concurrency in concurrency_list:
-        num_requests = concurrency * times_per_concurrency
+        if total_queries is not None and total_queries > 0:
+            num_requests = int(total_queries)
+        else:
+            num_requests = concurrency * times_per_concurrency
         specs_by_concurrency[concurrency] = build_request_specs(
             num_requests=num_requests,
             target_concurrency=concurrency,
@@ -373,6 +429,21 @@ def main() -> None:
     times_per_concurrency = st.sidebar.number_input(
         "Times per concurrency", min_value=1, max_value=64, value=4
     )
+    total_queries = st.sidebar.number_input(
+        "Total queries",
+        min_value=0,
+        max_value=1_048_576,
+        value=0,
+        help="设置为大于 0 的值时，针对每个并发度都模拟相同数量的请求。",
+    )
+    if total_queries > 0:
+        st.sidebar.caption(
+            f"当前将对每个并发度模拟 {int(total_queries):,} 个请求。"
+        )
+    else:
+        st.sidebar.caption(
+            "若保持 0，则每个并发度的总请求数 = concurrency × times per concurrency。"
+        )
     input_dist = st.sidebar.selectbox(
         "Input distribution", ["uniform", "lognormal", "fixed"], index=0
     )
@@ -651,6 +722,7 @@ def main() -> None:
             max_output=int(max_output),
             concurrency_list=concurrency_values,
             times_per_concurrency=int(times_per_concurrency),
+            total_queries=int(total_queries),
             num_gpus=int(num_gpus),
             tp_values=tp_values,
             dp_values=dp_values,
@@ -674,6 +746,19 @@ def main() -> None:
         return
 
     st.success(f"Generated {len(results)} result(s).")
+
+    total_time_fig, total_queries_used = _plot_total_time_vs_concurrency(results)
+    if total_time_fig is not None:
+        st.subheader("不同并发度完成全部请求所需时间")
+        st.pyplot(total_time_fig)
+        if total_queries_used is not None:
+            st.caption(
+                f"图表展示的是每个并发度完成 {total_queries_used:,} 个请求的最短耗时组合。"
+            )
+        else:
+            st.caption("图表展示的是每个并发度的最短完成时间。")
+    elif plt is None:
+        st.info("未安装 matplotlib，无法绘制并发度对比图。")
 
     table = _results_dataframe(results)
     if pd is not None and hasattr(table, "style"):

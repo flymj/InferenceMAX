@@ -674,6 +674,7 @@ class SimulationResult:
     tp: int
     dp: int
     ep: int
+    num_requests: int
     effective_token_budget: float
     total_steps: int
     decode_tokens: int
@@ -1136,6 +1137,7 @@ class EngineSimulator:
             tp=self.tp,
             dp=self.dp,
             ep=self.ep,
+            num_requests=len(self.requests),
             effective_token_budget=self.effective_token_budget,
             total_steps=step,
             decode_tokens=decode_tokens_generated,
