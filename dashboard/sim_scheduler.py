@@ -66,6 +66,7 @@ from dashboard.models.init import build_model
 from dashboard.services.llm_calcs import (
     attention_breakdown,
     flops_totals,
+    kv_capacity_tokens_per_gpu,
     weights_bytes_per_gpu,
 )
 
@@ -113,6 +114,7 @@ class SchedulerConfig:
     ep_baseline: int = 1
     sla: SLAConfig = field(default_factory=SLAConfig)
     max_steps: int = 20000
+    hbm_reserve_ratio: float = 0.10
 
     def cap_tp(self, tp: int) -> float:
         return max(1.0, self.tp_efficiency_fn(max(1, tp)) * max(1, tp))
@@ -701,6 +703,27 @@ class SimulationResult:
     ttft_p95_ms: float
     ttft_max_ms: float
     tpot_avg_ms: float
+    ttft_count: int
+    ttft_prefill_flops_per_request: float
+    ttft_prefill_hbm_per_request: float
+    ttft_prefill_compute_time_ms: float
+    ttft_prefill_hbm_time_ms: float
+    ttft_prefill_flops_p50: float
+    ttft_prefill_flops_p95: float
+    ttft_prefill_compute_time_ms_p50: float
+    ttft_prefill_compute_time_ms_p95: float
+    ttft_prefill_hbm_time_ms_p50: float
+    ttft_prefill_hbm_time_ms_p95: float
+    ttft_prefill_time_ms: float
+    ttft_prefill_time_ms_p50: float
+    ttft_prefill_time_ms_p95: float
+    decode_tokens_count: int
+    decode_flops_per_token: float
+    decode_hbm_per_token: float
+    decode_compute_time_ms: float
+    decode_hbm_time_ms: float
+    kv_capacity_limit: int
+    kv_capacity_requested: int
 
     def summary(self) -> str:
         device_part = f" device={self.device_name}" if self.device_name else ""
@@ -747,7 +770,11 @@ class EngineSimulator:
         self.num_gpus = num_gpus
         self.cost_tracker = CostTracker(cost_model, tp)
         self.device_caps = device_caps
-        self.kv_tracker = KVCapacityTracker(config.kv_capacity_tokens)
+        requested_kv_capacity = max(1, int(config.kv_capacity_tokens))
+        effective_kv_capacity = self._effective_kv_capacity(requested_kv_capacity)
+        self.kv_tracker = KVCapacityTracker(effective_kv_capacity)
+        self.kv_capacity_limit = self.kv_tracker.capacity_tokens
+        self.kv_capacity_requested = requested_kv_capacity
         self.running: Dict[int, Request] = {}
         self.waiting: Deque[Request] = deque()
         self.arrival_index = 0
@@ -775,6 +802,38 @@ class EngineSimulator:
             * self.config.cap_ep(self.ep)
         )
         return cap
+
+    def _effective_kv_capacity(self, requested: int) -> int:
+        limit = max(1, int(requested))
+        derived = self._derived_kv_capacity_from_device()
+        if derived is not None and derived > 0:
+            limit = min(limit, int(derived))
+        return limit
+
+    def _derived_kv_capacity_from_device(self) -> Optional[int]:
+        if (
+            self.device_caps is None
+            or self.device_caps.hbm_size_GB is None
+            or self.cost_tracker.cost_model is None
+        ):
+            return None
+        hbm_bytes_per_gpu = int(float(self.device_caps.hbm_size_GB) * (1024**3))
+        if hbm_bytes_per_gpu <= 0:
+            return None
+        weights_per_gpu = self.cost_tracker.cost_model.weights_per_gpu_bytes(self.tp, self.ep)
+        reserve_ratio = float(getattr(self.config, "hbm_reserve_ratio", 0.10))
+        per_gpu_tokens = kv_capacity_tokens_per_gpu(
+            self.cost_tracker.cost_model.model,
+            tp=self.tp,
+            kv_dtype_bytes=self.cost_tracker.cost_model.kv_dtype_bytes,
+            hbm_total_bytes=hbm_bytes_per_gpu,
+            reserve_ratio=reserve_ratio,
+            weights_per_gpu_bytes=weights_per_gpu,
+        )
+        if per_gpu_tokens <= 0:
+            return 0
+        dp_factor = max(1, int(self.config.cap_dp(self.dp)))
+        return int(per_gpu_tokens * dp_factor)
 
     def run(self) -> SimulationResult:
         total_requests = len(self.requests)
@@ -919,6 +978,103 @@ class EngineSimulator:
                 elif decode_tokens_generated > 0:
                     tpot_avg_ms = 0.0
 
+        ttft_count = len(ttft_samples)
+        per_request_prefill_flops: List[float] = []
+        per_request_prefill_hbm: List[float] = []
+        if ttft_count > 0:
+            for req in self.requests:
+                if req.first_token_step is None:
+                    continue
+                prompt_tokens = max(0, int(req.prompt_len))
+                if self.cost_tracker.cost_model is None:
+                    flops_cost = float(prompt_tokens)
+                    hbm_cost = float(prompt_tokens)
+                else:
+                    flops_cost, hbm_cost = self.cost_tracker.cost_model.prefill_chunk_cost(
+                        0, prompt_tokens, self.tp
+                    )
+                per_request_prefill_flops.append(float(flops_cost))
+                per_request_prefill_hbm.append(float(hbm_cost))
+
+        def _mean_filtered(values: Sequence[float]) -> float:
+            filtered = [v for v in values if not math.isnan(v)]
+            if not filtered:
+                return float("nan")
+            return statistics.mean(filtered)
+
+        def _percentile_filtered(values: Sequence[float], percent: float) -> float:
+            filtered = [v for v in values if not math.isnan(v)]
+            if not filtered:
+                return float("nan")
+            return float(np.percentile(filtered, percent))
+
+        ttft_prefill_flops_avg = _mean_filtered(per_request_prefill_flops)
+        ttft_prefill_flops_p50 = _percentile_filtered(per_request_prefill_flops, 50)
+        ttft_prefill_flops_p95 = _percentile_filtered(per_request_prefill_flops, 95)
+        ttft_prefill_hbm_avg = _mean_filtered(per_request_prefill_hbm)
+
+        decode_tokens_count = int(decode_tokens_generated)
+        decode_flops_avg = float("nan")
+        decode_hbm_avg = float("nan")
+        if decode_tokens_count > 0:
+            decode_flops_avg = self.total_decode_flops / decode_tokens_count
+            decode_hbm_avg = self.total_decode_hbm / decode_tokens_count
+
+        ttft_compute_ms = float("nan")
+        ttft_hbm_ms = float("nan")
+        ttft_compute_p50_ms = float("nan")
+        ttft_compute_p95_ms = float("nan")
+        ttft_hbm_p50_ms = float("nan")
+        ttft_hbm_p95_ms = float("nan")
+        ttft_prefill_time_samples: List[float] = []
+        ttft_prefill_time_ms = float("nan")
+        ttft_prefill_time_p50_ms = float("nan")
+        ttft_prefill_time_p95_ms = float("nan")
+        decode_compute_ms = float("nan")
+        decode_hbm_ms = float("nan")
+        if self.device_caps is not None:
+            flops_per_ms = self.device_caps.achievable_flops_per_ms
+            hbm_per_ms = self.device_caps.achievable_hbm_bytes_per_ms
+            compute_time_samples: List[float] = []
+            hbm_time_samples: List[float] = []
+            if flops_per_ms > 0:
+                compute_time_samples = [
+                    flops / flops_per_ms for flops in per_request_prefill_flops if not math.isnan(flops)
+                ]
+                ttft_compute_ms = _mean_filtered(compute_time_samples)
+                ttft_compute_p50_ms = _percentile_filtered(compute_time_samples, 50)
+                ttft_compute_p95_ms = _percentile_filtered(compute_time_samples, 95)
+                if not math.isnan(decode_flops_avg):
+                    decode_compute_ms = decode_flops_avg / flops_per_ms
+            if hbm_per_ms > 0:
+                hbm_time_samples = [
+                    hbm / hbm_per_ms for hbm in per_request_prefill_hbm if not math.isnan(hbm)
+                ]
+                ttft_hbm_ms = _mean_filtered(hbm_time_samples)
+                ttft_hbm_p50_ms = _percentile_filtered(hbm_time_samples, 50)
+                ttft_hbm_p95_ms = _percentile_filtered(hbm_time_samples, 95)
+                if not math.isnan(decode_hbm_avg):
+                    decode_hbm_ms = decode_hbm_avg / hbm_per_ms
+
+            if per_request_prefill_flops or per_request_prefill_hbm:
+                overhead = float(self.device_caps.scheduler_overhead_ms)
+                max_len = max(len(per_request_prefill_flops), len(per_request_prefill_hbm))
+                for idx in range(max_len):
+                    compute_val = compute_time_samples[idx] if idx < len(compute_time_samples) else float("nan")
+                    hbm_val = hbm_time_samples[idx] if idx < len(hbm_time_samples) else float("nan")
+                    candidate = 0.0
+                    if not math.isnan(compute_val):
+                        candidate = max(candidate, compute_val)
+                    if not math.isnan(hbm_val):
+                        candidate = max(candidate, hbm_val)
+                    if candidate == 0.0 and math.isnan(compute_val) and math.isnan(hbm_val):
+                        ttft_prefill_time_samples.append(float("nan"))
+                    else:
+                        ttft_prefill_time_samples.append(candidate + overhead)
+                ttft_prefill_time_ms = _mean_filtered(ttft_prefill_time_samples)
+                ttft_prefill_time_p50_ms = _percentile_filtered(ttft_prefill_time_samples, 50)
+                ttft_prefill_time_p95_ms = _percentile_filtered(ttft_prefill_time_samples, 95)
+
         sla_cfg = self.config.sla
         sla_ttft_ok = True
         if sla_cfg.ttft_p95_max_steps is not None:
@@ -980,6 +1136,27 @@ class EngineSimulator:
             ttft_p95_ms=ttft_p95_ms,
             ttft_max_ms=ttft_max_ms,
             tpot_avg_ms=tpot_avg_ms,
+            ttft_count=ttft_count,
+            ttft_prefill_flops_per_request=ttft_prefill_flops_avg,
+            ttft_prefill_hbm_per_request=ttft_prefill_hbm_avg,
+            ttft_prefill_compute_time_ms=ttft_compute_ms,
+            ttft_prefill_hbm_time_ms=ttft_hbm_ms,
+            ttft_prefill_flops_p50=ttft_prefill_flops_p50,
+            ttft_prefill_flops_p95=ttft_prefill_flops_p95,
+            ttft_prefill_compute_time_ms_p50=ttft_compute_p50_ms,
+            ttft_prefill_compute_time_ms_p95=ttft_compute_p95_ms,
+            ttft_prefill_hbm_time_ms_p50=ttft_hbm_p50_ms,
+            ttft_prefill_hbm_time_ms_p95=ttft_hbm_p95_ms,
+            ttft_prefill_time_ms=ttft_prefill_time_ms,
+            ttft_prefill_time_ms_p50=ttft_prefill_time_p50_ms,
+            ttft_prefill_time_ms_p95=ttft_prefill_time_p95_ms,
+            decode_tokens_count=decode_tokens_count,
+            decode_flops_per_token=decode_flops_avg,
+            decode_hbm_per_token=decode_hbm_avg,
+            decode_compute_time_ms=decode_compute_ms,
+            decode_hbm_time_ms=decode_hbm_ms,
+            kv_capacity_limit=self.kv_capacity_limit,
+            kv_capacity_requested=self.kv_capacity_requested,
         )
 
     # ------------------------------------------------------------------
