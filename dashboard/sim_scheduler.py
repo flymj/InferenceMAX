@@ -72,10 +72,12 @@ from dashboard.services.llm_calcs import (
 
 @dataclass
 class SLAConfig:
-    """Simple SLA envelope expressed in scheduler steps."""
+    """SLA envelope that can be expressed in steps and/or milliseconds."""
 
-    ttft_p95_max_steps: int
-    tpot_avg_max_steps: float
+    ttft_p95_max_steps: Optional[int] = None
+    tpot_avg_max_steps: Optional[float] = None
+    ttft_p95_max_ms: Optional[float] = None
+    tpot_avg_max_ms: Optional[float] = None
 
 
 def default_tp_efficiency(tp: int) -> float:
@@ -109,7 +111,7 @@ class SchedulerConfig:
     f_moe: float = 0.0
     router_topk: int = 1
     ep_baseline: int = 1
-    sla: SLAConfig = field(default_factory=lambda: SLAConfig(100, 2.0))
+    sla: SLAConfig = field(default_factory=SLAConfig)
     max_steps: int = 20000
 
     def cap_tp(self, tp: int) -> float:
@@ -917,11 +919,31 @@ class EngineSimulator:
                 elif decode_tokens_generated > 0:
                     tpot_avg_ms = 0.0
 
-        sla_ttft_ok = bool(ttft_samples) and ttft_p95 <= self.config.sla.ttft_p95_max_steps
-        sla_tpot_ok = (
-            decode_tokens_generated > 0
-            and tpot_avg <= self.config.sla.tpot_avg_max_steps
-        )
+        sla_cfg = self.config.sla
+        sla_ttft_ok = True
+        if sla_cfg.ttft_p95_max_steps is not None:
+            sla_ttft_ok = sla_ttft_ok and bool(ttft_samples) and ttft_p95 <= sla_cfg.ttft_p95_max_steps
+        if sla_cfg.ttft_p95_max_ms is not None:
+            sla_ttft_ok = sla_ttft_ok and (
+                not math.isnan(ttft_p95_ms)
+                and ttft_p95_ms <= sla_cfg.ttft_p95_max_ms
+            )
+        if sla_cfg.ttft_p95_max_steps is None and sla_cfg.ttft_p95_max_ms is None:
+            sla_ttft_ok = True
+
+        sla_tpot_ok = True
+        if sla_cfg.tpot_avg_max_steps is not None:
+            sla_tpot_ok = sla_tpot_ok and (
+                decode_tokens_generated > 0
+                and tpot_avg <= sla_cfg.tpot_avg_max_steps
+            )
+        if sla_cfg.tpot_avg_max_ms is not None:
+            sla_tpot_ok = sla_tpot_ok and (
+                not math.isnan(tpot_avg_ms)
+                and tpot_avg_ms <= sla_cfg.tpot_avg_max_ms
+            )
+        if sla_cfg.tpot_avg_max_steps is None and sla_cfg.tpot_avg_max_ms is None:
+            sla_tpot_ok = True
 
         return SimulationResult(
             target_concurrency=self.target_concurrency,
@@ -1367,6 +1389,8 @@ def run_sweep(args: argparse.Namespace) -> List[SimulationResult]:
         sla=SLAConfig(
             ttft_p95_max_steps=args.ttft_p95_max_steps,
             tpot_avg_max_steps=args.tpot_avg_max_steps,
+            ttft_p95_max_ms=args.ttft_p95_max_ms,
+            tpot_avg_max_ms=args.tpot_avg_max_ms,
         ),
         max_steps=args.max_steps,
     )
@@ -1466,8 +1490,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-long-partial-prefills", type=int, default=4)
     parser.add_argument("--kv-capacity-tokens", type=int, default=2_000_000)
     parser.add_argument("--util-headroom", type=float, default=0.85)
-    parser.add_argument("--ttft-p95-max-steps", type=int, default=64)
-    parser.add_argument("--tpot-avg-max-steps", type=float, default=1.5)
+    parser.add_argument("--ttft-p95-max-steps", type=int, default=64, help="TTFT p95 SLA expressed in scheduler steps")
+    parser.add_argument("--tpot-avg-max-steps", type=float, default=1.5, help="TPOT average SLA expressed in scheduler steps")
+    parser.add_argument("--ttft-p95-max-ms", type=float, default=None, help="TTFT p95 SLA in milliseconds (requires device caps)")
+    parser.add_argument("--tpot-avg-max-ms", type=float, default=None, help="TPOT average SLA in milliseconds/token (requires device caps)")
     parser.add_argument("--ramp-steps", type=int, default=8)
     parser.add_argument("--arrival-rate-per-step", type=float, default=None)
     parser.add_argument("--max-steps", type=int, default=20000)
