@@ -21,7 +21,12 @@ from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Opti
 
 try:  # pragma: no cover - allow running in minimal environments without pydantic
     from pydantic import BaseModel, Field, validator
+    try:
+        from pydantic import ConfigDict  # type: ignore[attr-defined]
+    except ImportError:  # pragma: no cover - pydantic < 2.0
+        ConfigDict = None  # type: ignore[assignment]
 except ModuleNotFoundError:  # pragma: no cover
+    ConfigDict = None  # type: ignore[assignment]
     class _FieldInfo:
         def __init__(self, default=..., default_factory=None, alias=None, **_kwargs):
             self.default = default
@@ -123,12 +128,22 @@ except ModuleNotFoundError:  # pragma: no cover
 spec_version = "1.0.0"
 
 
+class _PlannerBaseModel(BaseModel):
+    """Compat base model that works across Pydantic major versions."""
+
+    if ConfigDict is not None:  # pragma: no branch - simple version guard
+        model_config = ConfigDict(populate_by_name=True)  # type: ignore[call-arg]
+    else:  # pragma: no cover - exercised under pydantic v1 or fallback stub
+        class Config:
+            allow_population_by_field_name = True
+
+
 # ---------------------------------------------------------------------------
 # Pydantic configuration models
 # ---------------------------------------------------------------------------
 
 
-class ModelConfig(BaseModel):
+class ModelConfig(_PlannerBaseModel):
     """Minimal model characteristics required by the planner."""
 
     hidden_size: int = Field(..., ge=512, le=32768)
@@ -143,9 +158,6 @@ class ModelConfig(BaseModel):
     torch_dtype: str = Field("bfloat16")
     use_cache: bool = True
 
-    class Config:
-        allow_population_by_field_name = True
-        
     @property
     def num_hidden_layers(self) -> int:
         return self.num_layers
@@ -177,16 +189,13 @@ class ModelConfig(BaseModel):
         return layers * 2.0 * seq * kv_heads * head_dim * bytes_per_kv
 
 
-class HardwareConfig(BaseModel):
+class HardwareConfig(_PlannerBaseModel):
     """Hardware and calibration limits for compute and bandwidth."""
 
     tflops_ach: float = Field(..., gt=0, alias="tflops_achievable")
     hbm_peak_GBps: float = Field(..., gt=0, alias="hbm_peak_gbps")
     hbm_eff_base: float = Field(..., gt=0, le=1.0)
     mfu_table: Dict[int, float] = Field(default_factory=dict, alias="mfu_curve")
-
-    class Config:
-        allow_population_by_field_name = True
 
     @property
     def tflops_achievable(self) -> float:
@@ -210,7 +219,7 @@ class HardwareConfig(BaseModel):
         return dict(sorted(cleaned.items()))
 
 
-class SchedConfig(BaseModel):
+class SchedConfig(_PlannerBaseModel):
     """Scheduling knobs for chunked prefill planning."""
 
     enable_chunked_prefill: bool = True
@@ -222,7 +231,7 @@ class SchedConfig(BaseModel):
     decode_compute_flops_per_token: float = 0.0
 
 
-class WorkloadSnapshot(BaseModel):
+class WorkloadSnapshot(_PlannerBaseModel):
     """Snapshot of the currently active workload."""
 
     concurrency: int = Field(..., ge=0)
