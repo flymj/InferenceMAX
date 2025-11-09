@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import streamlit as st
 
 from dashboard.app_context import DashboardActions, DashboardState, bootstrap
-from dashboard.features.hardware import ChipSpec, flops_to_time_ms
+from dashboard.features.hardware import ChipSpec, bytes_to_time_ms, flops_to_time_ms
 
 
 @dataclass
@@ -27,6 +27,8 @@ class ComputeOnlyResult:
     prefill_flops: float
     decode_flops_per_token: float
     prefill_time_ms: float
+    decode_compute_time_per_token_ms: float
+    decode_hbm_time_per_token_ms: float
     decode_time_per_token_ms: float
     decode_total_time_ms: float
     tokens_prefill: int
@@ -55,6 +57,7 @@ def _build_chip_from_session(session_state: st.session_state) -> ChipSpec:
 def _compute_compute_only_breakdown(
     *,
     state: DashboardState,
+    actions: DashboardActions,
     batch_per_gpu: int,
     input_tokens: int,
     output_tokens: int,
@@ -68,6 +71,9 @@ def _compute_compute_only_breakdown(
 
     layers = int(getattr(model, "num_hidden_layers", 0) or 0)
     include_scores = bool(session_state.get("inc_scores", True))
+    tp = max(1, int(session_state.get("tp", 1)))
+    weight_dtype_bytes = int(session_state.get("weight_bytes", 2))
+    kv_dtype_bytes = int(session_state.get("kv_bytes", 2))
 
     rows_prefill = model.flops_component_rows(
         mode="prefill",
@@ -92,7 +98,41 @@ def _compute_compute_only_breakdown(
     )
 
     prefill_time_ms = flops_to_time_ms(flops_prefill, chip)
-    decode_time_per_token_ms = flops_to_time_ms(flops_decode_per_token, chip)
+    decode_compute_time_per_token_ms = flops_to_time_ms(flops_decode_per_token, chip)
+
+    weights_total_bytes = 0
+    if hasattr(model, "weights_totals"):
+        try:
+            weights_total_bytes = int(
+                model.weights_totals(weight_dtype_bytes=weight_dtype_bytes).get(
+                    "bytes_total", 0
+                )
+            )
+        except Exception:  # noqa: BLE001
+            weights_total_bytes = 0
+
+    per_token_decode_hbm = 0
+    if getattr(actions, "per_token_decode_hbm_bytes_per_layer_per_gpu", None):
+        try:
+            per_token_decode_hbm = actions.per_token_decode_hbm_bytes_per_layer_per_gpu(
+                model,
+                tp=tp,
+                kv_len=int(kv_len_decode),
+                dtype_bytes=kv_dtype_bytes,
+            )
+        except Exception:  # noqa: BLE001
+            per_token_decode_hbm = 0
+
+    per_token_decode_hbm = float(per_token_decode_hbm) * max(1, layers)
+    per_token_decode_hbm += float(weights_total_bytes)
+    per_token_decode_hbm *= max(1, int(batch_per_gpu))
+
+    decode_hbm_time_per_token_ms = bytes_to_time_ms(
+        int(per_token_decode_hbm), float(chip.hbm_bw_GBs)
+    )
+    decode_time_per_token_ms = (
+        decode_compute_time_per_token_ms + decode_hbm_time_per_token_ms
+    )
     decode_total_time_ms = decode_time_per_token_ms * max(1, output_tokens)
 
     tokens_prefill = int(batch_per_gpu) * int(input_tokens)
@@ -101,6 +141,8 @@ def _compute_compute_only_breakdown(
         prefill_flops=flops_prefill,
         decode_flops_per_token=flops_decode_per_token,
         prefill_time_ms=prefill_time_ms,
+        decode_compute_time_per_token_ms=decode_compute_time_per_token_ms,
+        decode_hbm_time_per_token_ms=decode_hbm_time_per_token_ms,
         decode_time_per_token_ms=decode_time_per_token_ms,
         decode_total_time_ms=decode_total_time_ms,
         tokens_prefill=tokens_prefill,
@@ -127,12 +169,12 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
     st = state.st
     session_state = state.session_state
-    del actions
 
     st.markdown(
         "### Compute-only runtime estimator"
-        "\n在此页面中，我们仅考虑模型结构（FLOPs）与所选算力（TFLOPs × MFU），"
-        "忽略 HBM、通信等因素，用于快速评估预填充与单 token 解码的理想延迟下界。"
+        "\n在此页面中，我们关注模型结构（FLOPs）与所选算力（TFLOPs × MFU），"
+        "忽略通信等因素，并在解码阶段额外计入 HBM 访问带来的时间开销，用于"
+        "快速评估预填充与单 token 解码的理论延迟。"
     )
 
     defaults_input = int(session_state.get("seq_len_in", 2048))
@@ -168,6 +210,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
     result = _compute_compute_only_breakdown(
         state=state,
+        actions=actions,
         batch_per_gpu=int(batch_per_gpu),
         input_tokens=int(input_tokens),
         output_tokens=int(output_tokens),
@@ -177,7 +220,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     chip = _build_chip_from_session(session_state)
     st.info(
         f"以 {chip.tflops:.0f} TFLOPs × MFU={chip.mfu:.2f} 的有效算力为基准，"
-        "上述结果代表理论最佳 compute-only 延迟。"
+        "预填充保持 compute-only 下界，解码时间额外计入单 token 的 HBM 访问成本。"
     )
 
     metric_col1, metric_col2, metric_col3 = st.columns(3)
@@ -189,7 +232,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     metric_col2.metric(
         "Decode latency / token",
         f"{result.decode_time_per_token_ms:.3f} ms",
-        help="生成单个 token 所需的 compute-only 时间。",
+        help="生成单个 token 所需的 compute+HBM 理论时间。",
     )
     metric_col3.metric(
         "Decode throughput",
@@ -211,6 +254,8 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             "**Decode FLOPs**"
             f"\n· Tokens generated: {result.tokens_decode:,}"
             f"\n· FLOPs per token: {_format_flops(result.decode_flops_per_token)}"
+            f"\n· Compute time/token (ms): {result.decode_compute_time_per_token_ms:.3f}"
+            f"\n· HBM time/token (ms): {result.decode_hbm_time_per_token_ms:.3f}"
             f"\n· Total time (ms): {result.decode_total_time_ms:,.2f}"
         )
 
