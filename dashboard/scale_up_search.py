@@ -322,7 +322,23 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
 
 def main() -> None:
-    state, actions = bootstrap("Scale-up Search")
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 以给定模型/硬件配置为基础，估算在不同并发与分片策略下的 TTFT、TPOT 与吞吐。\n"
+        "- 支持 MoE / GQA / MLA 等多种注意力变体，并整合 chunked prefill、并发修正等逻辑。\n\n"
+        "**主要可调参数**\n\n"
+        "- **模型推断**：自动解析 cfg 中的 H、D、L 等参数，也可通过侧边栏调整 dtype 与 KV 长度。\n"
+        "- **Search 配置**：包含 SLA 目标、平均 prompt/output 长度、并发度、KV cache 命中率、spec decode speedup 等。\n"
+        "- **Chunked Prefill 设置**：在界面中设定 chunk 大小、prefill 并行度以及是否启用 PD 合并。\n"
+        "- **并发修正**：自定义 alpha_conc、decode priority、causal mask、attention 实现，影响最终吞吐估计。"
+    )
+
+    state, actions = bootstrap(
+        "Scale-up Search",
+        header_description="搜索满足 SLA 的并发/分片配置，并估算算力与带宽需求。",
+        help_title="Scale-up Search 帮助",
+        help_markdown=help_markdown,
+    )
     render(state, actions)
 
 

@@ -17,21 +17,35 @@ def _format_metric(label: str, value: Optional[float], suffix: str) -> str:
     return f"**{label}**\n\n{formatted}{suffix}"
 
 
-def render_header(hardware_summary: Optional[Mapping[str, float]] = None) -> None:
+def render_header(
+    title: str,
+    description: Optional[str] = None,
+    *,
+    hardware_summary: Optional[Mapping[str, tuple[float | None, str]]] = None,
+    help_title: Optional[str] = None,
+    help_markdown: Optional[str] = None,
+    help_expanded: bool = False,
+) -> None:
     """Render the dashboard header section.
 
     Args:
+        title: The main heading for the page.
+        description: Optional caption providing additional context.
         hardware_summary: Optional mapping describing the active hardware
-            configuration. When provided, the header surfaces a compact
-            overview so that users can quickly confirm the baseline used for
-            the model comparisons.
+            configuration. Each entry should map to a tuple of the numeric
+            value and the suffix displayed after the formatted number.
+        help_title: Optional label for the collapsible help panel.
+        help_markdown: Optional Markdown body shown inside the help panel.
+        help_expanded: Whether the help panel is expanded by default.
     """
 
-    st.title("LLM Multi-Model Comparison Dashboard")
-    st.caption(
-        "Interactively explore the compute, memory, and throughput trade-offs "
-        "for different large language models under a shared hardware setup."
-    )
+    st.title(title)
+    if description:
+        st.caption(description)
+
+    if help_markdown:
+        with st.expander(help_title or "How to use this page", expanded=help_expanded):
+            st.markdown(help_markdown)
 
     if hardware_summary:
         cols = st.columns(len(hardware_summary))

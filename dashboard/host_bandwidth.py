@@ -326,7 +326,23 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
 
 def main() -> None:
-    state, actions = bootstrap("Host Bandwidth Planner")
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 评估在 MoE 专家重平衡或 KV cache 回灌场景下，Host↔Device ↔DDR 通道的带宽需求。\n"
+        "- 根据设定窗口与并发参数，计算单卡/全局需要迁移的字节量与耗时。\n\n"
+        "**主要可调参数**\n\n"
+        "- **Host I/O & SLA knobs**：设置 CPU↔GPU/DDR 有效带宽、重平衡窗口长度以及重叠系数 φ。\n"
+        "- **MoE Controls**：配置 TP/DP、专家数偏斜（Zipf s）、自动/手动 φ_move、利用率带宽等，决定需迁移专家比例。\n"
+        "- **KV Offload**：下方表单可设定要回灌的 KV token 数、冷热 prompt 分布等，以估算 Host→GPU 的读写量。\n"
+        "- **结果表格与图表**：展示 PCIe/DDR 路径的吞吐、时间拆解以及分层 KV 压力。"
+    )
+
+    state, actions = bootstrap(
+        "Host Bandwidth Planner",
+        header_description="规划 MoE 重平衡与 KV 回灌时的 Host ↔ Device 带宽需求。",
+        help_title="Host Bandwidth Planner 帮助",
+        help_markdown=help_markdown,
+    )
     render(state, actions)
 
 
