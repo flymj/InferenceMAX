@@ -2,7 +2,7 @@ import pytest
 
 pd = pytest.importorskip("pandas")
 
-from state.app_state import (
+from dashboard.state.app_state import (
     APP_STATE_DEFAULTS,
     AppState,
     AppStateManager,

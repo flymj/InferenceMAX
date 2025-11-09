@@ -18,9 +18,6 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     session_state = state.session_state
     model = state.model
 
-    st.title("InferenceMax v2 — Scenario Composer")
-    st.caption("批量比较多种推理场景，洞察瓶颈切换与缩放趋势。")
-
     with st.expander("Hardware profile", expanded=True):
         c1, c2, c3 = st.columns(3)
         tensor_tflops = c1.number_input(
@@ -191,7 +188,23 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
 
 def main() -> None:
-    state, actions = bootstrap("InferenceMax v2")
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 通过数据表一次性定义多个推理场景，并比较 Prefill/Decode 各组件的延迟拆解。\n"
+        "- 借助堆叠柱状图观察不同场景的瓶颈切换与缩放趋势。\n\n"
+        "**主要可调参数**\n\n"
+        "- **Hardware profile**：在折叠面板设置 TFLOPs、MFU、Overlap 以及带宽假设。\n"
+        "- **Scenario table**：直接编辑/新增行，填写每个场景的 TP、DP、batch、seq_len、decode_tokens、grad_accum 等。\n"
+        "- **Include weight reads**：控制 decode 阶段是否重新加载权重，从而影响带宽拆解。"
+    )
+
+    state, actions = bootstrap(
+        "InferenceMax v2",
+        header_title="InferenceMax v2 — Scenario Composer",
+        header_description="批量构建多种推理场景并比较 Prefill / Decode 瓶颈。",
+        help_title="InferenceMax v2 帮助",
+        help_markdown=help_markdown,
+    )
     render(state, actions)
 
 

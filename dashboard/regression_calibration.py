@@ -23,9 +23,6 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     session_state = state.session_state
     model = state.model
 
-    st.title("Regression Calibration")
-    st.caption("利用测量数据回归求解真实的算力/带宽折减。")
-
     col1, col2, col3 = st.columns(3)
     tensor_tflops = col1.number_input(
         "Tensor-core TFLOPs (baseline)",
@@ -197,7 +194,23 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
 
 def main() -> None:
-    state, actions = bootstrap("Regression Calibration")
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 将离线测量得到的 prefill/decode 延迟与理论拆解拟合，反推出真实的算力/带宽折减因子。\n"
+        "- 根据回归结果给出建议的 MFU、HBM、网络带宽设定，用于后续模型估算。\n\n"
+        "**主要可调参数**\n\n"
+        "- **Tensor-core TFLOPs / MFU / Overlap**：基线硬件能力的初始假设。\n"
+        "- **HBM / Interconnect 带宽**：用于拆解通信部分的理论耗时。\n"
+        "- **Decode includes weight reads**：是否考虑解码阶段重新读取权重。\n"
+        "- **Measurements**：粘贴包含 tp、dp、batch、seq_len、decode_tokens、实测延迟等列的 CSV/TSV 数据。"
+    )
+
+    state, actions = bootstrap(
+        "Regression Calibration",
+        header_description="利用测量样本回归 MFU 与带宽折减，校准后续估算。",
+        help_title="Regression Calibration 帮助",
+        help_markdown=help_markdown,
+    )
     render(state, actions)
 
 

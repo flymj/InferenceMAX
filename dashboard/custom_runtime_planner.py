@@ -267,7 +267,23 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 def main() -> None:
     """Entrypoint when the script is launched via ``streamlit run``."""
 
-    state, actions = bootstrap("Compute-only Prefill & Decode")
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 在不考虑调度与网络通信的前提下估算 prefill / decode 的纯计算耗时。\n"
+        "- 根据模型 FLOPs 拆解和硬件算力推导每阶段的 token 吞吐。\n\n"
+        "**主要可调参数**\n\n"
+        "- **Batch / Input / Output tokens**：分别控制每卡批量、prefill token 数、decode 生成长度。\n"
+        "- **Decode KV length**：设定解码阶段可见的 KV cache 长度，影响 FLOPs 与 HBM。\n"
+        "- **Include scores / dtype**：沿用共享侧边栏的模型 dtype、是否计算注意力 score。\n"
+        "- **Hardware summary**：由侧边栏芯片参数决定的 TFLOPs、MFU、HBM 带宽等能力。"
+    )
+
+    state, actions = bootstrap(
+        "Compute-only Prefill & Decode",
+        header_description="快速评估单模型的纯计算耗时与解码吞吐。",
+        help_title="Compute-only Planner 帮助",
+        help_markdown=help_markdown,
+    )
     render(state, actions)
 
 

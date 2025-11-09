@@ -389,7 +389,24 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
 
 def main() -> None:
-    state, actions = bootstrap("Quick Estimation")
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 使用精简模型拆解快速估算单一配置下的 prefill / decode 延迟与带宽压力。\n"
+        "- 通过可选的 overlap φ 曲线比较不同重叠假设对时间线的影响。\n\n"
+        "**主要可调参数**\n\n"
+        "- **Local hardware spec**：设置 Tensor-core 峰值、MFU、HBM/网络带宽、Overlap φ，用于 Quick estimate 的时间计算。\n"
+        "- **Include full-model weight read**：控制解码阶段是否计入整模权重的 HBM 读取。\n"
+        "- **Overlap φ (show multiple effective times)**：选择需要展示的重叠比，用于绘制多条参考曲线。\n"
+        "- **Workload inputs**：页面下方的 TP、DP、batch、seq_len、decode tokens、梯度累积等，决定负载规模。\n"
+        "- **KV dtype / include scores**：沿用共享 sidebar 的 dtype、是否计算注意力得分，对 HBM/FLOPs 有影响。"
+    )
+
+    state, actions = bootstrap(
+        "Quick Estimation",
+        header_description="快速估算单场景的 Prefill/Decode 时间拆解与重叠曲线。",
+        help_title="Quick Estimation 帮助",
+        help_markdown=help_markdown,
+    )
     render(state, actions)
 
 

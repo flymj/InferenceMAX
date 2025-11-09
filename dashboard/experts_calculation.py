@@ -126,7 +126,23 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
 
 def main() -> None:
-    state, actions = bootstrap("Experts Calcuation")
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 根据目标延迟预算，估算 MoE 模型中可从 DDR/PCIe 热加载到 HBM 的专家数量。\n"
+        "- 反向计算加载指定数量专家所需的时间。\n\n"
+        "**主要可调参数**\n\n"
+        "- **TP / DP**：确定集群总 GPU 数（TP×DP），影响可并行加载的专家数量。\n"
+        "- **Latency budget (ms)**：期望完成一次专家加载的最大时间窗口。\n"
+        "- **Usable PCIe / DDR bandwidth**：Host ↔ Device 的有效带宽假设，取两者最小值作为瓶颈。\n"
+        "- **K experts (per GPU)**：在反向计算部分指定要加载的专家数，以得到所需时间。"
+    )
+
+    state, actions = bootstrap(
+        "Experts Calcuation",
+        header_description="评估在延迟预算下可热加载的 MoE 专家规模。",
+        help_title="Experts Calculation 使用指南",
+        help_markdown=help_markdown,
+    )
     render(state, actions)
 
 

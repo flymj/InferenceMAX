@@ -273,7 +273,26 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
 
 def main() -> None:
-    state, actions = bootstrap("Detailed Attention versus HeadDim")
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 扫描 head_dim 变化时 FlashAttention-3 各组件的 FLOPs 与推理耗时。\n"
+        "- 对比 keep_H / keep_D 策略下的头数、隐藏维度变化趋势。\n\n"
+        "**主要可调参数**\n\n"
+        "- **Per-GPU batch (B)**：设定每卡参与 attention 的序列数。\n"
+        "- **Head-dim sweep mode**：选择固定头数或固定隐藏维度的扫描方式。\n"
+        "- **FA3 tile Br/Bc**：配置 FlashAttention-3 中块大小，影响 FLOPs 拆分。\n"
+        "- **Sequence length**：prefill 阶段的 token 数。\n"
+        "- **Tensor/VALU/SFU peak TFLOPs**：分别用于 GEMM、点运算与归一化阶段的算力上限。\n"
+        "- **Figure height**：调节主图表高度，方便在不同分辨率下浏览。\n"
+        "- **Refresh plots**：使用当前参数重新计算并刷新曲线。"
+    )
+
+    state, actions = bootstrap(
+        "Detailed Attention versus HeadDim",
+        header_description="探索 head_dim 扫描对注意力组件 FLOPs 与耗时的影响。",
+        help_title="Attention vs HeadDim 帮助",
+        help_markdown=help_markdown,
+    )
     render(state, actions)
 
 

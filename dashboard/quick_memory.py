@@ -93,7 +93,23 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
 
 def main() -> None:
-    state, actions = bootstrap("Quick per-GPU memory & KV capacity")
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 快速查看当前模型在指定并行度下的 per-GPU 权重占用与 KV cache 容量上限。\n"
+        "- 辅助判断 HBM 预算是否足够支撑推理上下文长度。\n\n"
+        "**主要可调参数**\n\n"
+        "- **TP / DP**：设置张量并行与数据并行规模，界面自动计算 EP。\n"
+        "- **Weight / KV dtype**：沿用共享 sidebar 的 dtype 选择，影响权重与 KV 字节数。\n"
+        "- **HBM capacity / reserve ratio**：在 sidebar 指定每卡显存与预留比例，从而得出可用于 KV 的容量。\n"
+        "- **MoE 配置**：若模型启用 MoE，将基于专家数推导权重分片。"
+    )
+
+    state, actions = bootstrap(
+        "Quick per-GPU memory & KV capacity",
+        header_description="估算 per-GPU 权重内存与 KV cache Token 容量。",
+        help_title="Quick Memory 帮助",
+        help_markdown=help_markdown,
+    )
     render(state, actions)
 
 

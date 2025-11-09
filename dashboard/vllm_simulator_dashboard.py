@@ -157,12 +157,6 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     model = state.model
     session_state = state.session_state
 
-    st.title("vLLM Scheduler Simulator")
-    st.caption(
-        "利用 `vllm_simulator.py` 的 greedy chunked prefill + decode 调度逻辑，"
-        "结合模型与硬件配置快速估算 TTFT / TPOT / TPS。"
-    )
-
     weight_bytes = int(session_state.get("weight_bytes", 2))
     kv_bytes = int(session_state.get("kv_bytes", 2))
     seq_len_ref = int(session_state.get("seq_len_in", 2048))
@@ -536,7 +530,23 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
 
 def main() -> None:
-    state, actions = bootstrap("vLLM Scheduler Simulator")
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 使用 vLLM chunked prefill + decode 模拟器评估调度吞吐与延迟指标。\n"
+        "- 结合硬件/模型特征，查看并发搜索下的 TTFT、TPOT、TPS 与有效算力。\n\n"
+        "**主要可调参数**\n\n"
+        "- **Time model calibration**：在表单中输入 Prefill/Decode token/s、上下文惩罚等经验数据，构建时间模型。\n"
+        "- **Simulation parameters**：设置批处理容量、prefill chunk size、并发度、随机种子等调度超参。\n"
+        "- **Scheduler knobs**：控制 partial prefill、长上下文阈值等模拟行为。\n"
+        "- **Concurrency sweep**：可选地定义并发列表，对多个并发点批量求解指标。"
+    )
+
+    state, actions = bootstrap(
+        "vLLM Scheduler Simulator",
+        header_description="利用 vLLM 调度模型估算 TTFT/TPOT/TPS 与有效算力。",
+        help_title="vLLM Simulator 帮助",
+        help_markdown=help_markdown,
+    )
     render(state, actions)
 
 

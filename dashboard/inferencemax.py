@@ -15,9 +15,6 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     session_state = state.session_state
     model = state.model
 
-    st.title("InferenceMax Overview")
-    st.caption("统一查看模型拓扑、关键路径与延迟拆解。")
-
     with st.expander("Workload configuration", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
         tp = c1.number_input(
@@ -147,7 +144,23 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
 
 def main() -> None:
-    state, actions = bootstrap("InferenceMax Overview")
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 基于模型配置、批大小以及硬件能力，估算 prefill / decode 的延迟拆解与 Token 吞吐。\n"
+        "- 通过 Plotly 图快速比较不同阶段的瓶颈组件。\n\n"
+        "**主要可调参数**\n\n"
+        "- **Workload configuration**：TP、DP、Per-GPU batch、Grad accumulation、Prefill seq length、Decode tokens，"
+        "用于控制批处理规模与长短序列设定。\n"
+        "- **Hardware profile**：Tensor-core TFLOPs、MFU、Overlap φ、HBM/Interconnect 带宽，决定算力与通信瓶颈。\n"
+        "- **Decode includes full weight reads**：是否在 decode 阶段重新加载权重，用于衡量带宽压力。"
+    )
+
+    state, actions = bootstrap(
+        "InferenceMax Overview",
+        header_description="统一查看模型拓扑、关键路径与延迟拆解。",
+        help_title="InferenceMax Overview 使用指南",
+        help_markdown=help_markdown,
+    )
     render(state, actions)
 
 

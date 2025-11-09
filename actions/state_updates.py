@@ -1,4 +1,4 @@
-"""Helpers to mutate :class:`~state.app_state.AppState` instances.
+"""Helpers to mutate :class:`~dashboard.state.app_state.AppState` instances.
 
 The goal is to mimic the write semantics of ``st.session_state`` so that other
 modules can be tested without importing Streamlit.
@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from state.app_state import AppState, AppStateManager
+from dashboard.state.app_state import AppState, AppStateManager
 
 
 def set_state_value(manager: AppStateManager, key: str, value: Any) -> AppState:

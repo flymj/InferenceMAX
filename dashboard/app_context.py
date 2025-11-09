@@ -20,7 +20,7 @@ from .services.llm_calcs import (
     per_token_decode_hbm_bytes_per_layer_per_gpu,
     per_token_kv_bytes_per_layer_per_gpu,
 )
-from state.app_state import ensure_session_state_defaults
+from dashboard.state.app_state import ensure_session_state_defaults
 
 ensure_repo_root_on_path()
 
@@ -419,8 +419,25 @@ def _render_model_overview(model: Any) -> None:
     st.dataframe(pd.DataFrame(combined), use_container_width=True, height=320)
 
 
-def bootstrap(page_title: str) -> tuple[DashboardState, DashboardActions]:
-    """Initialise shared layout, returning the state/action context."""
+def bootstrap(
+    page_title: str,
+    *,
+    header_title: str | None = None,
+    header_description: str | None = None,
+    help_title: str | None = None,
+    help_markdown: str | None = None,
+    help_expanded: bool = False,
+) -> tuple[DashboardState, DashboardActions]:
+    """Initialise shared layout, returning the state/action context.
+
+    Args:
+        page_title: Title used for ``st.set_page_config``.
+        header_title: Optional override for the visible page header (默认等于 ``page_title``)。
+        header_description: Caption text rendered under the header title。
+        help_title: Label for the collapsible help panel。
+        help_markdown: Markdown body shown inside the help panel; skipped when 为空。
+        help_expanded: Whether the help panel should be expanded by default。
+    """
 
     st.set_page_config(page_title=page_title, layout="wide")
     ensure_session_state_defaults(st.session_state)
@@ -437,7 +454,14 @@ def bootstrap(page_title: str) -> tuple[DashboardState, DashboardActions]:
             "HBM BW": (float(getattr(chip, "hbm_bw_GBs", 0.0)), " GB/s"),
             "Network BW": (float(getattr(chip, "net_bw_GBs", 0.0)), " GB/s"),
         }
-    render_header(header_summary)
+    render_header(
+        header_title or page_title,
+        header_description,
+        hardware_summary=header_summary,
+        help_title=help_title,
+        help_markdown=help_markdown,
+        help_expanded=help_expanded,
+    )
 
     overview_col, config_col = st.columns((1.8, 1.2))
     with config_col:

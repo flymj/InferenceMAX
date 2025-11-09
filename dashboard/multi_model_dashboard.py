@@ -787,7 +787,22 @@ def main() -> None:
         "Tensor parallel": (float(hardware["tensor_parallel"]), "x"),
         "Data parallel": (float(hardware.get("data_parallel", 1)), "x"),
     }
-    render_header(hardware_summary)
+    help_markdown = (
+        "**可以做什么**\n\n"
+        "- 对比多种模型在统一硬件与 workload 下的 token 吞吐、HBM 占用与成本指标。\n"
+        "- 可视化并行策略影响下的吞吐与显存曲线。\n\n"
+        "**主要可调参数**\n\n"
+        "- **Workload controls**：设置 prompt/token 长度、并发度与 batch。\n"
+        "- **Hardware sidebar**：选择预设或自定义芯片 TFLOPs、HBM、并行策略。\n"
+        "- **Model forms**：为每个模型填写权重大小、参数量、推理模式等信息。"
+    )
+    render_header(
+        "LLM Multi-Model Comparison Dashboard",
+        "比较多模型在共享硬件下的吞吐与显存指标。",
+        hardware_summary=hardware_summary,
+        help_title="Model Comparison 帮助",
+        help_markdown=help_markdown,
+    )
 
     models = _get_model_state()
     _render_model_forms(models, hardware)
