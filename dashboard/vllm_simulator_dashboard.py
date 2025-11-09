@@ -19,12 +19,34 @@ from dashboard._paths import ensure_repo_root_on_path
 ensure_repo_root_on_path()
 
 from dashboard.app_context import DashboardActions, DashboardState, bootstrap
-from dashboard.services.llm_calcs import ModelProfile
+from dashboard.services.llm_calcs import (
+    ModelProfile,
+    kv_capacity_tokens_per_gpu,
+    weights_bytes_per_gpu,
+)
 from dashboard.vllm_simulator import BatchMeta, BatchPlan, simulate_once
 
 
 def _safe_div(num: float, denom: float) -> float:
     return num / denom if denom else 0.0
+
+
+def _infer_ep_group(model: Any, tp: int, data_parallel: int) -> int:
+    cfg = getattr(model, "cfg", {}) or {}
+    for key in ("expert_parallel_size", "ep_size", "moe_ep_size", "ep_group_size", "ep_world_size"):
+        value = cfg.get(key)
+        if value:
+            try:
+                return max(1, int(value))
+            except (TypeError, ValueError):
+                continue
+
+    is_moe = bool(getattr(model, "is_moe_enabled", lambda: False)())
+    num_experts = int(getattr(model, "n_routed_experts", getattr(model, "num_experts", 0)) or 0)
+    if is_moe and num_experts > 0:
+        return max(1, int(tp) * int(data_parallel))
+
+    return max(1, int(tp))
 
 
 def _build_time_model(
@@ -164,6 +186,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     chip = hardware_config.get("chip_spec")
     tensor_parallel = int(hardware_config.get("tensor_parallel", 1))
     total_gpus = int(hardware_config.get("num_gpus", tensor_parallel))
+    data_parallel = int(hardware_config.get("data_parallel", 1))
 
     chip_tflops = float(getattr(chip, "tflops", 0.0)) if chip else 0.0
     chip_mfu = float(getattr(chip, "mfu", 0.0)) if chip else 0.0
@@ -191,12 +214,30 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         v for v in [base_decode_token_tps_compute, base_decode_token_tps_hbm] if v > 0
     ) if any(v > 0 for v in [base_decode_token_tps_compute, base_decode_token_tps_hbm]) else 0.0
 
+    hbm_capacity_gb = float(session_state.get("hbm_capacity_GB", hardware_config.get("hbm_per_gpu_gb", 80.0)))
+    default_reserve = float(session_state.get("hbm_reserve_ratio", 0.10))
+    usage_default = float(session_state.get("kv_hbm_usage_ratio", 1.0 - default_reserve))
+
     metrics_container = st.container()
     results_container = st.container()
     sweep_container = st.container()
 
     with metrics_container:
         st.subheader("Derived per-token costs & hardware budget")
+        usage_col, _, _ = st.columns(3)
+        hbm_usage_ratio = float(
+            usage_col.slider(
+                "HBM usage target (weights + activations + KV)",
+                min_value=0.50,
+                max_value=0.99,
+                value=max(0.50, min(0.99, usage_default)),
+                step=0.01,
+                help="控制可用于模型与 KV cache 的 HBM 占比，剩余留作系统与冗余。",
+            )
+        )
+        session_state["kv_hbm_usage_ratio"] = hbm_usage_ratio
+        session_state["hbm_reserve_ratio"] = max(0.0, 1.0 - hbm_usage_ratio)
+
         mc1, mc2, mc3 = st.columns(3)
         mc1.metric("Prefill FLOPs / token", f"{prefill_flops_per_token/1e9:.2f} GFLOPs")
         mc2.metric("Decode FLOPs / token", f"{decode_flops_per_token/1e9:.2f} GFLOPs")
@@ -226,6 +267,110 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             "上面 throughput 估算基于当前模型配置、TP 分片及单引擎硬件算力 (MFU 已计入)。"
             "Decode throughput 取 compute/HBM 中的较小值。" + cluster_note
         )
+
+        human_bytes = getattr(actions, "human_bytes", lambda n: f"{int(n)} B")
+        hbm_total_bytes = int(hbm_capacity_gb * (1024**3))
+        usable_hbm_bytes = hbm_total_bytes * hbm_usage_ratio
+        ep_group = _infer_ep_group(model, tensor_parallel, data_parallel)
+        weights_per_gpu_bytes = weights_bytes_per_gpu(
+            model,
+            tp=int(tensor_parallel),
+            ep_group=int(ep_group),
+            weight_dtype_bytes=weight_bytes,
+        )
+        activation_snapshot_bytes = profile.activation_bytes(seq_len=seq_len_ref)
+        base_memory_bytes = int(weights_per_gpu_bytes + activation_snapshot_bytes)
+        kv_budget_bytes = max(0.0, usable_hbm_bytes - base_memory_bytes)
+        kv_per_token_bytes = profile.kv_write_bytes(tokens=1, tp=tensor_parallel)
+
+        reserve_ratio = max(0.0, 1.0 - hbm_usage_ratio)
+        kv_capacity_tokens = kv_capacity_tokens_per_gpu(
+            model,
+            tp=int(tensor_parallel),
+            kv_dtype_bytes=kv_bytes,
+            hbm_total_bytes=hbm_total_bytes,
+            reserve_ratio=reserve_ratio,
+            weights_per_gpu_bytes=int(base_memory_bytes),
+        )
+
+        kv_tokens_per_request = max(1, kv_len_ref)
+        kv_bytes_per_token_display = human_bytes(int(kv_per_token_bytes))
+        usable_hbm_display = human_bytes(int(usable_hbm_bytes))
+        weights_pct = 100.0 * _safe_div(weights_per_gpu_bytes, usable_hbm_bytes)
+        activations_pct = 100.0 * _safe_div(activation_snapshot_bytes, usable_hbm_bytes)
+        kv_pct = max(0.0, 100.0 * _safe_div(kv_budget_bytes, usable_hbm_bytes))
+
+        kv_capacity_unbounded = kv_per_token_bytes <= 0
+        if kv_capacity_unbounded:
+            kv_capacity_display = "∞"
+            kv_batch_limit_display = "∞"
+        else:
+            kv_capacity_display = f"{int(kv_capacity_tokens):,}" if kv_capacity_tokens > 0 else "0"
+            kv_batch_limit = int(kv_capacity_tokens) // kv_tokens_per_request if kv_capacity_tokens > 0 else 0
+            kv_batch_limit_display = f"{kv_batch_limit:,}"
+
+        mm1, mm2, mm3, mm4 = st.columns(4)
+        mm1.metric(
+            "Usable HBM / GPU",
+            usable_hbm_display,
+            delta=f"目标 {hbm_usage_ratio * 100:.0f}%",
+        )
+        mm2.metric(
+            "Weights / GPU",
+            human_bytes(int(weights_per_gpu_bytes)),
+            delta=f"{weights_pct:.1f}% of usable",
+        )
+        mm3.metric(
+            f"Activations (seq={seq_len_ref})",
+            human_bytes(int(activation_snapshot_bytes)),
+            delta=f"{activations_pct:.1f}% of usable",
+        )
+        mm4.metric(
+            "KV budget",
+            human_bytes(int(kv_budget_bytes)),
+            delta=f"{kv_pct:.1f}% of usable",
+        )
+
+        mk1, mk2, mk3 = st.columns(3)
+        mk1.metric("KV bytes / token / GPU", kv_bytes_per_token_display)
+        mk2.metric("KV capacity (tokens / GPU)", kv_capacity_display)
+        mk3.metric(
+            "Batch size limit (≈KV len per req)",
+            kv_batch_limit_display,
+            delta=f"{kv_tokens_per_request:,} tok/req",
+        )
+
+        breakdown_rows = [
+            {
+                "Component": "Weights",
+                "Bytes": human_bytes(int(weights_per_gpu_bytes)),
+                "Share (%)": f"{weights_pct:.1f}",
+            },
+            {
+                "Component": f"Activations (seq={seq_len_ref})",
+                "Bytes": human_bytes(int(activation_snapshot_bytes)),
+                "Share (%)": f"{activations_pct:.1f}",
+            },
+            {
+                "Component": "KV cache budget",
+                "Bytes": human_bytes(int(kv_budget_bytes)),
+                "Share (%)": f"{kv_pct:.1f}",
+            },
+        ]
+        breakdown_df = pd.DataFrame(breakdown_rows)
+        st.dataframe(breakdown_df, hide_index=True, use_container_width=True)
+        if kv_capacity_unbounded:
+            st.caption(
+                "线性注意力的 KV bytes/token≈0，因此 KV cache 不构成容量瓶颈。"
+            )
+        else:
+            st.caption(
+                "KV 容量 ≈ ⌊(HBM × 使用率 − Weights − Activations) / KV_bytes/token⌋。"
+                f" 代入当前配置：⌊({usable_hbm_display} − {human_bytes(int(weights_per_gpu_bytes))} − "
+                f"{human_bytes(int(activation_snapshot_bytes))}) / {kv_bytes_per_token_display}⌋ ≈ "
+                f"{kv_capacity_display} tokens/GPU。若每个请求持有约 {kv_tokens_per_request:,} 个 KV token，"
+                f"则批大小上限 ≈ {kv_batch_limit_display}，超过时 KV cache 将耗尽。"
+            )
 
     with st.form("vllm-sim-form"):
         st.subheader("Simulation parameters")
