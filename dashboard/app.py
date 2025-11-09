@@ -19,6 +19,7 @@ _APP_SCRIPTS = [
     ("InferenceMax Overview", "dashboard/inferencemax.py"),
     ("InferenceMax v2", "dashboard/inferencemax_v2.py"),
     ("Compute-only Prefill & Decode", "dashboard/custom_runtime_planner.py"),
+    ("vLLM Scheduler Simulator", "dashboard/vllm_simulator_dashboard.py"),
 ]
 
 
