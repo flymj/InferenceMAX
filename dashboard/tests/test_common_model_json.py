@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from dashboard.common import DEFAULT_MODEL_JSON, DEFAULT_MODEL_JSON_TEXT, format_model_json, load_model_json
 

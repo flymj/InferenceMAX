@@ -16,8 +16,12 @@ project.
   visualisation.
 - `services/` – pure-Python analytics such as FLOP estimators, bandwidth models,
   and the chunked prefill planning module.
+- `actions/` – state update helpers extracted from the Streamlit callbacks to
+  simplify unit testing.
 - `llm_chunked_prefill_decoder_scaleup.py` – the single-page scale-up explorer
   requested in the specification; runnable on its own with `streamlit run`.
+- `tests/` – pytest suites that exercise the analytics and state management
+  logic without launching Streamlit.
 
 ## Getting started
 
@@ -46,7 +50,8 @@ The analytical helpers ship with lightweight unit tests that validate critical
 behaviour without needing GPU access.  From the repository root, run:
 
 ```bash
-pytest tests/test_llm_chunked_prefill_decoder_scaleup.py tests/test_services_llm_calcs.py
+pytest dashboard/tests/test_llm_chunked_prefill_decoder_scaleup.py \
+    dashboard/tests/test_services_llm_calcs.py
 ```
 
 These tests rely only on the pure-Python modules under `dashboard/services` and
