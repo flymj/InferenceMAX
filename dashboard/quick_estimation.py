@@ -335,7 +335,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
                     base=cumulative,
                     width=0.3,
                     marker_color=colors.get(key, None),
-                    hovertemplate=f"{key}: %{x:.3f} ms<extra></extra>",
+                    hovertemplate=f"{key}: %{{x:.3f}} ms<extra></extra>",
                 )
             )
             cumulative += value
