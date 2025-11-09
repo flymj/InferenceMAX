@@ -8,7 +8,11 @@ from dashboard.state.app_state import (
     AppStateManager,
     ensure_session_state_defaults,
 )
-from actions.state_updates import bump_refresh_token, set_state_value, update_state
+from dashboard.actions.state_updates import (
+    bump_refresh_token,
+    set_state_value,
+    update_state,
+)
 
 
 def test_app_state_defaults_match_previous_session_defaults():

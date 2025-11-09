@@ -46,7 +46,8 @@ The analytical helpers ship with lightweight unit tests that validate critical
 behaviour without needing GPU access.  From the repository root, run:
 
 ```bash
-pytest tests/test_llm_chunked_prefill_decoder_scaleup.py tests/test_services_llm_calcs.py
+pytest dashboard/tests/test_llm_chunked_prefill_decoder_scaleup.py \
+    dashboard/tests/test_services_llm_calcs.py
 ```
 
 These tests rely only on the pure-Python modules under `dashboard/services` and

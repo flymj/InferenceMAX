@@ -29,8 +29,8 @@ InferenceMAX/
 │   ├── features/                  # 计算 FLOPs/带宽等核心业务逻辑
 │   ├── services/                  # 进一步封装的推理建模与模拟工具
 │   ├── *.py                       # 各个独立的分析页面（见下表）
-├── actions/                       # 纯 Python 的状态更新助手（便于测试）
-├── tests/                         # 单元测试
+│   ├── actions/                   # 纯 Python 的状态更新助手（便于测试）
+│   ├── tests/                     # 单元测试
 └── utils/, benchmarks/, runners/  # 其他辅助脚本与实验工具
 ```
 
