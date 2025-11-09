@@ -18,6 +18,7 @@ _APP_SCRIPTS = [
     ("Regression Calibration", "dashboard/regression_calibration.py"),
     ("InferenceMax Overview", "dashboard/inferencemax.py"),
     ("InferenceMax v2", "dashboard/inferencemax_v2.py"),
+    ("Compute-only Prefill & Decode", "dashboard/custom_runtime_planner.py"),
 ]
 
 
