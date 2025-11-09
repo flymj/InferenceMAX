@@ -195,6 +195,9 @@ class HardwareConfig(_PlannerBaseModel):
     tflops_ach: float = Field(..., gt=0, alias="tflops_achievable")
     hbm_peak_GBps: float = Field(..., gt=0, alias="hbm_peak_gbps")
     hbm_eff_base: float = Field(..., gt=0, le=1.0)
+    hbm_total_gb: float | None = Field(None, ge=0.0)
+    kv_cache_fraction: float | None = Field(None, ge=0.0, le=1.0)
+    non_kv_fraction: float | None = Field(None, ge=0.0, le=1.0)
     mfu_table: Dict[int, float] = Field(default_factory=dict, alias="mfu_curve")
 
     @property
