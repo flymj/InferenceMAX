@@ -19,8 +19,8 @@ def _format_metric(label: str, value: Optional[float], suffix: str) -> str:
 
 def render_header(
     title: str,
-    description: Optional[str] = None,
     *,
+    description: Optional[str] = None,
     hardware_summary: Optional[Mapping[str, tuple[float | None, str]]] = None,
     help_title: Optional[str] = None,
     help_markdown: Optional[str] = None,
