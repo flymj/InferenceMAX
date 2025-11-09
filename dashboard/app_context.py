@@ -456,7 +456,7 @@ def bootstrap(
         }
     render_header(
         header_title or page_title,
-        header_description,
+        description=header_description,
         hardware_summary=header_summary,
         help_title=help_title,
         help_markdown=help_markdown,

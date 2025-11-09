@@ -798,7 +798,7 @@ def main() -> None:
     )
     render_header(
         "LLM Multi-Model Comparison Dashboard",
-        "比较多模型在共享硬件下的吞吐与显存指标。",
+        description="比较多模型在共享硬件下的吞吐与显存指标。",
         hardware_summary=hardware_summary,
         help_title="Model Comparison 帮助",
         help_markdown=help_markdown,
