@@ -779,15 +779,19 @@ def plot_step_token_bars(step_stats: List[List[Dict]]):
 # 单次模拟
 # ============================================================
 
-def simulate_once(args,
-                  concurrency: Optional[int] = None,
-                  debug: bool = False,
-                  print_summary: bool = True) -> Tuple[Dict[str, float], List[List[Dict]]]:
+def simulate_once(
+    args,
+    concurrency: Optional[int] = None,
+    time_model: Optional[Callable[[BatchPlan, BatchMeta], float]] = None,
+    debug: bool = False,
+    print_summary: bool = True,
+) -> Tuple[Dict[str, float], List[List[Dict]]]:
     """
     跑一次模拟，返回 (metrics dict, step_stats)
     concurrency: 覆盖 args.concurrency（用于 sweep）
     debug: 是否打印 trace + tail 分析
     print_summary: 是否打印 Summary
+    time_model: 可选的 batch -> elapsed_ms 函数，用于自定义每 step 时间模型
     """
     if concurrency is None:
         concurrency = args.concurrency
@@ -852,7 +856,7 @@ def simulate_once(args,
         else:
             return 0.0
 
-    executor = Executor(time_model=default_time_model)
+    executor = Executor(time_model=time_model if time_model is not None else default_time_model)
 
     active_requests: set[str] = set()
     total_generated = 0
@@ -948,15 +952,23 @@ def simulate_once(args,
 # 正常模式 & sweep 模式
 # ============================================================
 
-def run_simulation(args):
+def run_simulation(args, time_model: Optional[Callable[[BatchPlan, BatchMeta], float]] = None):
     # 正常模式：单次模拟
-    metrics, step_stats = simulate_once(args, debug=args.debug, print_summary=True)
+    metrics, step_stats = simulate_once(
+        args,
+        time_model=time_model,
+        debug=args.debug,
+        print_summary=True,
+    )
     # 如果需要 per-step 柱状图
     if args.plot_steps and step_stats:
         plot_step_token_bars(step_stats)
 
 
-def run_sweep(args):
+def run_sweep(
+    args,
+    time_model: Optional[Callable[[BatchPlan, BatchMeta], float]] = None,
+):
     """
     sweep 模式：
     - 从 concurrency = 1 .. args.concurrency
@@ -970,7 +982,13 @@ def run_sweep(args):
     print(f"Running sweep from concurrency=1 to {max_c} ...")
 
     for c in range(1, max_c + 1):
-        metrics, _ = simulate_once(args, concurrency=c, debug=False, print_summary=False)
+        metrics, _ = simulate_once(
+            args,
+            concurrency=c,
+            time_model=time_model,
+            debug=False,
+            print_summary=False,
+        )
         if not metrics:
             continue
         rows.append((
