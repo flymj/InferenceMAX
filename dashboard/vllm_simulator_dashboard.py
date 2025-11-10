@@ -22,6 +22,7 @@ ensure_repo_root_on_path()
 from dashboard.app_context import DashboardActions, DashboardState, bootstrap
 from dashboard.services.llm_calcs import (
     ModelProfile,
+    communication_breakdown,
     kv_capacity_tokens_per_gpu,
     weights_bytes_per_gpu,
 )
@@ -191,6 +192,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     chip_tflops = float(getattr(chip, "tflops", 0.0)) if chip else 0.0
     chip_mfu = float(getattr(chip, "mfu", 0.0)) if chip else 0.0
     chip_hbm = float(getattr(chip, "hbm_bw_GBs", 0.0)) if chip else 0.0
+    chip_net = float(getattr(chip, "net_bw_GBs", 0.0)) if chip else 0.0
 
     effective_tflops_per_engine = chip_tflops * chip_mfu * max(1, tensor_parallel)
     effective_tflops_cluster = chip_tflops * chip_mfu * max(1, total_gpus)
@@ -301,6 +303,28 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         base_memory_bytes = int(weights_per_gpu_bytes + activation_snapshot_bytes)
         kv_budget_bytes = max(0.0, usable_hbm_bytes - base_memory_bytes)
         kv_per_token_bytes = profile.kv_write_bytes(tokens=1, tp=tensor_parallel)
+        decode_kv_bytes = profile.kv_decode_bytes(tp=tensor_parallel, kv_len=kv_len_ref)
+        decode_hbm_bytes_per_token = int(weights_per_gpu_bytes + decode_kv_bytes)
+
+        num_layers = int(getattr(model, "num_hidden_layers", 0) or 0)
+        hidden_size = int(getattr(model, "hidden_size", 0) or 0)
+        is_moe = bool(getattr(model, "is_moe_enabled", lambda: False)())
+        experts_per_tok = int(
+            getattr(getattr(model, "cfg", {}), "get", lambda k, d=None: d)("num_experts_per_tok", 0)
+            or 0
+        )
+        comm = communication_breakdown(
+            tp=int(tensor_parallel),
+            tokens_prefill=int(seq_len_ref),
+            tokens_decode=1,
+            hidden_size=int(hidden_size),
+            dtype_bytes=int(weight_bytes),
+            top_k=int(experts_per_tok),
+            ep_group=int(ep_group),
+            layers=int(num_layers),
+            moe_enabled=bool(is_moe),
+        )
+        decode_network_bytes = int(comm.tp_decode_bytes + comm.ep_decode_bytes)
 
         reserve_ratio = max(0.0, 1.0 - hbm_usage_ratio)
         kv_capacity_tokens = kv_capacity_tokens_per_gpu(
@@ -358,6 +382,12 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             kv_batch_limit_display,
             delta=f"{kv_tokens_per_request:,} tok/req",
         )
+        mk4, mk5 = st.columns(2)
+        mk4.metric("Decode HBM / token / GPU", human_bytes(int(decode_hbm_bytes_per_token)))
+        mk5.metric(
+            "Decode network bytes / token / GPU",
+            human_bytes(int(decode_network_bytes)),
+        )
 
         breakdown_rows = [
             {
@@ -389,6 +419,73 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
                 f"{human_bytes(int(activation_snapshot_bytes))}) / {kv_bytes_per_token_display}⌋ ≈ "
                 f"{kv_capacity_display} tokens/GPU。若每个请求持有约 {kv_tokens_per_request:,} 个 KV token，"
                 f"则批大小上限 ≈ {kv_batch_limit_display}，超过时 KV cache 将耗尽。"
+            )
+
+        if decode_hbm_bytes_per_token > 0 or decode_network_bytes > 0:
+            st.markdown("### Decode per-token memory & bandwidth estimate")
+
+            def _flops_to_time_ms(flops: float) -> float:
+                eff = max(1e-9, float(chip_tflops) * float(chip_mfu) * 1e12)
+                return float(flops) / eff * 1e3 if eff > 0 else 0.0
+
+            def _bytes_to_time_ms(nbytes: int, bw_gbs: float) -> float:
+                eff = max(1e-9, float(bw_gbs) * 1e9)
+                return float(nbytes) / eff * 1e3 if eff > 0 else 0.0
+
+            t_comp_decode = _flops_to_time_ms(decode_flops_per_token)
+            t_hbm_decode = _bytes_to_time_ms(decode_hbm_bytes_per_token, chip_hbm)
+            t_net_decode = _bytes_to_time_ms(decode_network_bytes, chip_net)
+
+            dc1, dc2, dc3 = st.columns(3)
+            dc1.metric("Compute time / token", f"{t_comp_decode:.3f} ms")
+            dc2.metric("HBM time / token", f"{t_hbm_decode:.3f} ms")
+            dc3.metric("Network time / token", f"{t_net_decode:.3f} ms")
+
+            import plotly.graph_objects as go
+
+            components = {
+                "Compute": t_comp_decode,
+                "HBM": t_hbm_decode,
+                "Network": t_net_decode,
+            }
+
+            def _plot_decode_timeline(entries: Dict[str, float]):
+                fig = go.Figure()
+                offset = 0.0
+                for name, value in entries.items():
+                    value = max(0.0, float(value))
+                    if value <= 0:
+                        continue
+                    fig.add_trace(
+                        go.Bar(
+                            x=[value],
+                            y=[""],
+                            name=name,
+                            orientation="h",
+                            base=offset,
+                            width=0.3,
+                            hovertemplate=f"{name}: %{{x:.3f}} ms<extra></extra>",
+                        )
+                    )
+                    offset += value
+                fig.update_layout(
+                    title="Decode per-token timeline",
+                    barmode="stack",
+                    height=120,
+                    xaxis_title="Time (ms)",
+                    showlegend=True,
+                    legend=dict(orientation="h", y=-0.3, x=0.0),
+                    margin=dict(l=40, r=20, t=40, b=20),
+                    xaxis=dict(showgrid=True, gridwidth=0.3, gridcolor="#E0E0E0"),
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                )
+                return fig
+
+            st.plotly_chart(_plot_decode_timeline(components), use_container_width=True)
+            st.caption(
+                "时间估算 = FLOPs ÷ (TFLOPs·MFU) + Bytes ÷ 带宽，其中解码 HBM 包含权重与 KV cache "
+                "读写，网络字节为 TP/EP AllReduce/AllToAll 之和。"
             )
 
     with st.form("vllm-sim-form"):
