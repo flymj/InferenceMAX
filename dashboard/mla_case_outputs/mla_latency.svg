@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="560" viewBox="0 0 960 560">
+<rect width="100%" height="100%" fill="white"/>
+<text x="480.0" y="35.0" text-anchor="middle" font-size="22" font-weight="bold">FlashMLA Estimated Latency per Case</text>
+<text transform="translate(30.0,255.0) rotate(-90)" text-anchor="middle" font-size="16">Time (ms)</text>
+<line x1="90" y1="440.0" x2="920" y2="440.0" stroke="#E0E0E0" stroke-width="1"/>
+<text x="80" y="445.0" text-anchor="end" font-size="14">0</text>
+<line x1="90" y1="366.0" x2="920" y2="366.0" stroke="#E0E0E0" stroke-width="1"/>
+<text x="80" y="371.0" text-anchor="end" font-size="14">546.42</text>
+<line x1="90" y1="292.0" x2="920" y2="292.0" stroke="#E0E0E0" stroke-width="1"/>
+<text x="80" y="297.0" text-anchor="end" font-size="14">1.09K</text>
+<line x1="90" y1="218.0" x2="920" y2="218.0" stroke="#E0E0E0" stroke-width="1"/>
+<text x="80" y="223.0" text-anchor="end" font-size="14">1.64K</text>
+<line x1="90" y1="144.0" x2="920" y2="144.0" stroke="#E0E0E0" stroke-width="1"/>
+<text x="80" y="149.0" text-anchor="end" font-size="14">2.19K</text>
+<line x1="90" y1="70.0" x2="920" y2="70.0" stroke="#E0E0E0" stroke-width="1"/>
+<text x="80" y="75.0" text-anchor="end" font-size="14">2.73K</text>
+<rect x="131.5" y="439.9958027638813" width="124.5" height="0.004197236118746659" fill="#54A24B" stroke="white" stroke-width="1"/>
+<rect x="131.5" y="439.9905831062171" width="124.5" height="0.00521965766412799" fill="#EECA3B" stroke="white" stroke-width="1"/>
+<text x="193.75" y="465" text-anchor="middle" font-size="14">B=2 · s_q=4 · s_k=53410</text>
+<rect x="339.0" y="439.9949083237565" width="124.5" height="0.005091676243506998" fill="#54A24B" stroke="white" stroke-width="1"/>
+<rect x="339.0" y="439.98857883689345" width="124.5" height="0.006329486863049368" fill="#EECA3B" stroke="white" stroke-width="1"/>
+<text x="401.25" y="465" text-anchor="middle" font-size="14">B=2 · s_q=4 · s_k=64792</text>
+<rect x="546.5" y="304.02633869708325" width="124.5" height="135.97366130291678" fill="#54A24B" stroke="white" stroke-width="1"/>
+<rect x="546.5" y="134.93030900999287" width="124.5" height="169.09602968709038" fill="#EECA3B" stroke="white" stroke-width="1"/>
+<text x="608.75" y="465" text-anchor="middle" font-size="14">B=64792 · s_q=4 · s_k=53410</text>
+<rect x="754.0" y="275.0500564153473" width="124.5" height="164.94994358465271" fill="#54A24B" stroke="white" stroke-width="1"/>
+<rect x="754.0" y="70.0" width="124.5" height="205.05005641534729" fill="#EECA3B" stroke="white" stroke-width="1"/>
+<text x="816.25" y="465" text-anchor="middle" font-size="14">B=64792 · s_q=4 · s_k=64792</text>
+<rect x="90" y="458" width="18" height="18" fill="#54A24B" stroke="black" stroke-width="0.5"/>
+<text x="114" y="472" font-size="14">Compute</text>
+<rect x="230" y="458" width="18" height="18" fill="#EECA3B" stroke="black" stroke-width="0.5"/>
+<text x="254" y="472" font-size="14">Memory</text>
+</svg>
