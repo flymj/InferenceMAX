@@ -1,0 +1,83 @@
+data:
+  path: sample_data.csv
+  kind: csv
+columns:
+  workload:
+    role: category
+    dtype: str
+  batch_size:
+    role: dimension
+    dtype: int
+  gpu_type:
+    role: category
+    dtype: str
+  mfu:
+    role: metric
+    dtype: float
+  latency_ms:
+    role: metric
+    dtype: float
+  throughput:
+    role: metric
+    dtype: float
+views:
+  - id: latency_by_batch
+    title: 不同 GPU 的批大小延迟对比
+    filter_expr: "workload == 'resnet50'"
+    groupby:
+      - gpu_type
+      - batch_size
+    aggregations:
+      latency_ms: mean
+      throughput: mean
+    comparison:
+      baseline_filter: "gpu_type == 'A100'"
+      on:
+        - batch_size
+      metrics:
+        latency_ms:
+          - diff
+          - pct
+        throughput:
+          - diff
+      diff: _delta
+      pct: _pct
+      baseline: _baseline
+      keep_baseline: true
+    postprocess: engine.plugins_example.sort_by_latency_delta
+    chart:
+      kind: line
+      x: batch_size
+      y:
+        - latency_ms
+      color: gpu_type
+      layout:
+        title: "ResNet50 延迟对比"
+        yaxis_title: "Latency (ms)"
+        xaxis_title: "Batch Size"
+  - id: throughput_summary
+    title: 吞吐量与 MFU 摘要
+    filter_expr: "workload == 'gpt-3'"
+    groupby:
+      - gpu_type
+    aggregations:
+      throughput: mean
+      mfu: mean
+    comparison:
+      baseline_filter: "gpu_type == 'A100'"
+      metrics:
+        throughput:
+          - diff
+          - ratio
+        mfu:
+          - diff
+      keep_baseline: false
+    postprocess: engine.plugins_example.highlight_top_throughput
+    chart:
+      kind: bar
+      x: gpu_type
+      y:
+        - throughput
+      layout:
+        title: "GPT-3 吞吐量对比"
+        yaxis_title: "Throughput (samples/s)"
