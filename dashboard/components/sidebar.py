@@ -7,13 +7,29 @@ from typing import Dict
 import streamlit as st
 
 from dashboard.features.hardware import ChipSpec
+from dashboard.hardware import load_hardware_presets
 
 
+_DEFAULT_CHIP = ChipSpec(tflops=600.0, mfu=0.5, hbm_bw_GBs=2000.0, net_bw_GBs=400.0)
+
+
+def _chip_from_metrics(metrics: Dict[str, float]) -> ChipSpec:
+    tflops = float(metrics.get("fp16_tflops", _DEFAULT_CHIP.tflops))
+    mfu = float(metrics.get("tensor_mfu", _DEFAULT_CHIP.mfu))
+    hbm_bw = float(metrics.get("hbm_bandwidth", _DEFAULT_CHIP.hbm_bw_GBs))
+    net_candidates = [
+        metrics.get("allreduce_bandwidth"),
+        metrics.get("alltoall_bandwidth"),
+        metrics.get("network_bandwidth"),
+    ]
+    net_values = [float(val) for val in net_candidates if isinstance(val, (int, float))]
+    net_bw = max(net_values) if net_values else float(_DEFAULT_CHIP.net_bw_GBs)
+    return ChipSpec(tflops=tflops, mfu=mfu, hbm_bw_GBs=hbm_bw, net_bw_GBs=net_bw)
+
+
+_PRESET_METRICS = {name: preset.as_dict() for name, preset in load_hardware_presets().items()}
 _PRESET_CHIPS: Dict[str, ChipSpec] = {
-    "NVIDIA H100 (80GB)": ChipSpec(tflops=989, mfu=0.55, hbm_bw_GBs=3350, net_bw_GBs=900),
-    "NVIDIA A100 (80GB)": ChipSpec(tflops=624, mfu=0.5, hbm_bw_GBs=2039, net_bw_GBs=600),
-    "AMD MI300X": ChipSpec(tflops=1230, mfu=0.5, hbm_bw_GBs=5120, net_bw_GBs=800),
-    "Custom": ChipSpec(tflops=500, mfu=0.5, hbm_bw_GBs=2000, net_bw_GBs=400),
+    name: _chip_from_metrics(metrics) for name, metrics in _PRESET_METRICS.items()
 }
 
 
@@ -33,6 +49,7 @@ def render_sidebar() -> Dict[str, object]:
         st.header("Hardware Configuration")
         preset_name = st.selectbox("GPU Preset", list(_PRESET_CHIPS.keys()), index=0)
         preset = _PRESET_CHIPS[preset_name]
+        preset_metrics = _PRESET_METRICS.get(preset_name, {})
 
         col1, col2 = st.columns(2)
         with col1:
@@ -45,7 +62,11 @@ def render_sidebar() -> Dict[str, object]:
         num_gpus = int(st.number_input("Total GPU Count", min_value=1, value=8))
         tensor_parallel = int(st.number_input("Tensor Parallelism", min_value=1, value=1))
         data_parallel = int(st.number_input("Data Parallelism", min_value=1, value=1))
-        hbm_capacity = st.number_input("HBM per GPU (GB)", min_value=10.0, value=80.0)
+        hbm_capacity = st.number_input(
+            "HBM per GPU (GB)",
+            min_value=10.0,
+            value=float(preset_metrics.get("hbm_size", 80.0)),
+        )
         dtype = st.selectbox("Default Model Weight DType", list(_DTYPE_BYTES.keys()), index=1)
 
         st.markdown(

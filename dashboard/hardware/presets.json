@@ -1,0 +1,54 @@
+[
+  {
+    "name": "NVIDIA H100 (80GB)",
+    "metrics": {
+      "fp16_tflops": 989.0,
+      "fp8_tflops": 1979.0,
+      "hbm_bandwidth": 3350.0,
+      "alltoall_bandwidth": 900.0,
+      "allreduce_bandwidth": 900.0,
+      "hbm_size": 80.0,
+      "tensor_mfu": 0.55,
+      "hbm_efficiency": 0.6
+    }
+  },
+  {
+    "name": "NVIDIA A100 (80GB)",
+    "metrics": {
+      "fp16_tflops": 624.0,
+      "fp8_tflops": 1248.0,
+      "hbm_bandwidth": 2039.0,
+      "alltoall_bandwidth": 600.0,
+      "allreduce_bandwidth": 600.0,
+      "hbm_size": 80.0,
+      "tensor_mfu": 0.5,
+      "hbm_efficiency": 0.55
+    }
+  },
+  {
+    "name": "AMD MI300X",
+    "metrics": {
+      "fp16_tflops": 1230.0,
+      "fp8_tflops": 2450.0,
+      "hbm_bandwidth": 5120.0,
+      "alltoall_bandwidth": 800.0,
+      "allreduce_bandwidth": 800.0,
+      "hbm_size": 192.0,
+      "tensor_mfu": 0.5,
+      "hbm_efficiency": 0.6
+    }
+  },
+  {
+    "name": "Custom",
+    "metrics": {
+      "fp16_tflops": 800.0,
+      "fp8_tflops": 1600.0,
+      "hbm_bandwidth": 2500.0,
+      "alltoall_bandwidth": 700.0,
+      "allreduce_bandwidth": 700.0,
+      "hbm_size": 120.0,
+      "tensor_mfu": 0.5,
+      "hbm_efficiency": 0.55
+    }
+  }
+]

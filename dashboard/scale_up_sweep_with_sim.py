@@ -24,6 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover - pandas is optional
     pd = None  # type: ignore[assignment]
 
 from dashboard.common import DEFAULT_MODEL_JSON, DEFAULT_MODEL_JSON_TEXT, load_model_json
+from dashboard.hardware import load_hardware_presets
 from dashboard.sim_scheduler import (
     DeviceCapabilities,
     EngineSimulator,
@@ -80,51 +81,14 @@ def _optional_positive_float(text: str) -> Optional[float]:
 
 
 HARDWARE_PRESETS: Dict[str, Dict[str, float]] = {
-    "NVIDIA H100 (80GB)": {
-        "fp16_tflops": 989.0,
-        "fp8_tflops": 1979.0,
-        "hbm_bandwidth": 3350.0,
-        "alltoall_bandwidth": 900.0,
-        "allreduce_bandwidth": 900.0,
-        "hbm_size": 80.0,
-        "tensor_mfu": 0.55,
-        "hbm_efficiency": 0.60,
-    },
-    "NVIDIA A100 (80GB)": {
-        "fp16_tflops": 624.0,
-        "fp8_tflops": 1248.0,
-        "hbm_bandwidth": 2039.0,
-        "alltoall_bandwidth": 600.0,
-        "allreduce_bandwidth": 600.0,
-        "hbm_size": 80.0,
-        "tensor_mfu": 0.50,
-        "hbm_efficiency": 0.55,
-    },
-    "AMD MI300X": {
-        "fp16_tflops": 1230.0,
-        "fp8_tflops": 2450.0,
-        "hbm_bandwidth": 5120.0,
-        "alltoall_bandwidth": 800.0,
-        "allreduce_bandwidth": 800.0,
-        "hbm_size": 192.0,
-        "tensor_mfu": 0.50,
-        "hbm_efficiency": 0.60,
-    },
-    "Custom": {
-        "fp16_tflops": 800.0,
-        "fp8_tflops": 1600.0,
-        "hbm_bandwidth": 2500.0,
-        "alltoall_bandwidth": 700.0,
-        "allreduce_bandwidth": 700.0,
-        "hbm_size": 120.0,
-        "tensor_mfu": 0.50,
-        "hbm_efficiency": 0.55,
-    },
+    name: preset.as_dict() for name, preset in load_hardware_presets().items()
 }
 
 
 def _ensure_hardware_defaults(preset_name: str) -> None:
-    preset = HARDWARE_PRESETS[preset_name]
+    preset = HARDWARE_PRESETS.get(preset_name)
+    if preset is None:
+        return
     if st.session_state.get("hardware_active_preset") == preset_name:
         return
     for field, value in preset.items():
