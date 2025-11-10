@@ -1,8 +1,8 @@
-# InferenceMAX Dashboard Suite
+# Modeling Dashboard Suite
 
 ## 设计理念
 
-InferenceMAX Dashboard Suite 将所有推理分析页面统一在 `dashboard/` 目录下，形成“公共基座 + 独立页面”的分层结构：
+Modeling Dashboard Suite 将所有推理分析页面统一在 `dashboard/` 目录下，形成“公共基座 + 独立页面”的分层结构：
 
 - **公共基座（Common Foundation）**：
   - `app_context.py` 暴露 `bootstrap()`，负责初始化 Streamlit 会话状态、装载模型 JSON、渲染统一的页眉/侧边栏/帮助面板。
@@ -23,7 +23,7 @@ InferenceMAX Dashboard Suite 将所有推理分析页面统一在 `dashboard/` �
 ## 目录支撑关系
 
 ```
-InferenceMAX/
+modeling/
 ├── dashboard/
 │   ├── app.py, llm_dashboard.py      # 统一入口与向后兼容封装
 │   ├── app_context.py                # bootstrap/state 注入
