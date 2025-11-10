@@ -533,6 +533,9 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
                     "Avg TPOT (ms/token)": metrics.get("avg_tpot_ms", 0.0),
                     "Decode TPS (tok/s)": metrics.get("tps", 0.0),
                     "Avg request time (ms)": metrics.get("avg_request_time_ms", 0.0),
+                    "Token throughput / GPU (tok/s)": _safe_div(
+                        metrics.get("tps", 0.0), max(1, total_gpus)
+                    ),
                     "Prefill avg TFLOPs": eff["prefill_avg_tflops"],
                     "Decode avg TFLOPs": eff["decode_avg_tflops"],
                     "Overall TFLOPs": eff["overall_tflops"],
@@ -551,23 +554,42 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
                 st.line_chart(df[["Decode TPS (tok/s)"]])
                 st.line_chart(df[["Prefill avg TFLOPs", "Decode avg TFLOPs", "Overall TFLOPs"]])
                 scatter_source = df.reset_index().rename(columns={"index": "Concurrency"})
-                scatter_chart = (
+                throughput_field = "Token throughput / GPU (tok/s)"
+                tpot_scatter = (
                     alt.Chart(scatter_source)
                     .mark_circle(size=80)
                     .encode(
                         x=alt.X("Avg TPOT (ms/token)", title="Avg TPOT (ms/token)"),
-                        y=alt.Y("Avg request time (ms)", title="Avg request time (ms)"),
+                        y=alt.Y(throughput_field, title="Token throughput per GPU (tok/s)"),
                         color=alt.Color("Concurrency:N", title="Concurrency"),
                         tooltip=[
                             alt.Tooltip("Concurrency:N", title="Concurrency"),
                             alt.Tooltip("Avg TPOT (ms/token):Q", format=".2f"),
                             alt.Tooltip("Avg request time (ms):Q", format=".2f"),
+                            alt.Tooltip(throughput_field + ":Q", format=".2f"),
                         ],
                     )
                 )
-                st.altair_chart(scatter_chart, use_container_width=True)
+                request_scatter = (
+                    alt.Chart(scatter_source)
+                    .mark_circle(size=80)
+                    .encode(
+                        x=alt.X("Avg request time (ms)", title="Avg request time (ms)"),
+                        y=alt.Y(throughput_field, title="Token throughput per GPU (tok/s)"),
+                        color=alt.Color("Concurrency:N", title="Concurrency"),
+                        tooltip=[
+                            alt.Tooltip("Concurrency:N", title="Concurrency"),
+                            alt.Tooltip("Avg request time (ms):Q", format=".2f"),
+                            alt.Tooltip("Avg TPOT (ms/token):Q", format=".2f"),
+                            alt.Tooltip(throughput_field + ":Q", format=".2f"),
+                        ],
+                    )
+                )
+                st.altair_chart(tpot_scatter, use_container_width=True)
+                st.altair_chart(request_scatter, use_container_width=True)
                 st.caption(
-                    "Sweep 结果展示不同并发下的平均 TTFT/TPOT、TPS 及对应的有效算力。"
+                    "Sweep 结果展示不同并发下的平均 TTFT/TPOT、TPS 及对应的有效算力，同时对比 "
+                    "Token throughput/GPU 与 Decode TPOT、E2E request time 的关系。"
                 )
 
 
