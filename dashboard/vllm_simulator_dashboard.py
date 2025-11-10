@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import altair as alt
 import streamlit as st
 
 from dashboard._paths import ensure_repo_root_on_path
@@ -180,7 +181,12 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     chip = hardware_config.get("chip_spec")
     tensor_parallel = int(hardware_config.get("tensor_parallel", 1))
     total_gpus = int(hardware_config.get("num_gpus", tensor_parallel))
-    data_parallel = int(hardware_config.get("data_parallel", 1))
+    data_parallel_config = hardware_config.get("data_parallel")
+    if data_parallel_config is None:
+        dp_default = max(1, total_gpus // max(1, tensor_parallel))
+        data_parallel = dp_default
+    else:
+        data_parallel = max(1, int(data_parallel_config))
 
     chip_tflops = float(getattr(chip, "tflops", 0.0)) if chip else 0.0
     chip_mfu = float(getattr(chip, "mfu", 0.0)) if chip else 0.0
@@ -189,9 +195,24 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     effective_tflops_per_engine = chip_tflops * chip_mfu * max(1, tensor_parallel)
     effective_tflops_cluster = chip_tflops * chip_mfu * max(1, total_gpus)
 
-    base_prefill_token_tps = (
+    base_prefill_token_tps_compute = (
         effective_tflops_per_engine * 1e12 / prefill_flops_per_token
         if prefill_flops_per_token > 0 and effective_tflops_per_engine > 0
+        else 0.0
+    )
+    prefill_bytes_per_token = profile.kv_write_bytes(tokens=1, tp=tensor_parallel)
+    base_prefill_token_tps_hbm = (
+        chip_hbm * 1e9 / prefill_bytes_per_token
+        if prefill_bytes_per_token > 0 and chip_hbm > 0
+        else 0.0
+    )
+    base_prefill_token_tps = (
+        min(
+            v
+            for v in [base_prefill_token_tps_compute, base_prefill_token_tps_hbm]
+            if v > 0
+        )
+        if any(v > 0 for v in [base_prefill_token_tps_compute, base_prefill_token_tps_hbm])
         else 0.0
     )
     base_decode_token_tps_compute = (
@@ -239,16 +260,20 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             "Per-engine effective TFLOPs",
             f"{effective_tflops_per_engine:.1f} TFLOPs" if effective_tflops_per_engine > 0 else "-",
         )
-        mc4, mc5, mc6 = st.columns(3)
+        mc4, mc5, mc6, mc7 = st.columns(4)
         mc4.metric(
-            "Prefill throughput baseline",
-            f"{base_prefill_token_tps:,.0f} tok/s" if base_prefill_token_tps > 0 else "-",
+            "Prefill throughput (compute)",
+            f"{base_prefill_token_tps_compute:,.0f} tok/s" if base_prefill_token_tps_compute > 0 else "-",
         )
         mc5.metric(
+            "Prefill throughput (HBM)",
+            f"{base_prefill_token_tps_hbm:,.0f} tok/s" if base_prefill_token_tps_hbm > 0 else "-",
+        )
+        mc6.metric(
             "Decode throughput (compute)",
             f"{base_decode_token_tps_compute:,.0f} tok/s" if base_decode_token_tps_compute > 0 else "-",
         )
-        mc6.metric(
+        mc7.metric(
             "Decode throughput (HBM)",
             f"{base_decode_token_tps_hbm:,.0f} tok/s" if base_decode_token_tps_hbm > 0 else "-",
         )
@@ -259,7 +284,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         )
         st.caption(
             "上面 throughput 估算基于当前模型配置、TP 分片及单引擎硬件算力 (MFU 已计入)。"
-            "Decode throughput 取 compute/HBM 中的较小值。" + cluster_note
+            "Prefill/Decode throughput 均取 compute/HBM 中的较小值作为默认瓶颈。" + cluster_note
         )
 
         human_bytes = getattr(actions, "human_bytes", lambda n: f"{int(n)} B")
@@ -507,6 +532,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
                     "Avg TTFT (ms)": metrics.get("avg_ttft_ms", 0.0),
                     "Avg TPOT (ms/token)": metrics.get("avg_tpot_ms", 0.0),
                     "Decode TPS (tok/s)": metrics.get("tps", 0.0),
+                    "Avg request time (ms)": metrics.get("avg_request_time_ms", 0.0),
                     "Prefill avg TFLOPs": eff["prefill_avg_tflops"],
                     "Decode avg TFLOPs": eff["decode_avg_tflops"],
                     "Overall TFLOPs": eff["overall_tflops"],
@@ -524,6 +550,22 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
                 st.line_chart(df[["Avg TTFT (ms)", "Avg TPOT (ms/token)"]])
                 st.line_chart(df[["Decode TPS (tok/s)"]])
                 st.line_chart(df[["Prefill avg TFLOPs", "Decode avg TFLOPs", "Overall TFLOPs"]])
+                scatter_source = df.reset_index().rename(columns={"index": "Concurrency"})
+                scatter_chart = (
+                    alt.Chart(scatter_source)
+                    .mark_circle(size=80)
+                    .encode(
+                        x=alt.X("Avg TPOT (ms/token)", title="Avg TPOT (ms/token)"),
+                        y=alt.Y("Avg request time (ms)", title="Avg request time (ms)"),
+                        color=alt.Color("Concurrency:N", title="Concurrency"),
+                        tooltip=[
+                            alt.Tooltip("Concurrency:N", title="Concurrency"),
+                            alt.Tooltip("Avg TPOT (ms/token):Q", format=".2f"),
+                            alt.Tooltip("Avg request time (ms):Q", format=".2f"),
+                        ],
+                    )
+                )
+                st.altair_chart(scatter_chart, use_container_width=True)
                 st.caption(
                     "Sweep 结果展示不同并发下的平均 TTFT/TPOT、TPS 及对应的有效算力。"
                 )
