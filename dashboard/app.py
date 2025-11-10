@@ -16,6 +16,7 @@ _APP_SCRIPTS = [
     ("Experts Calcuation", "dashboard/experts_calculation.py"),
     ("Scale-up Search", "dashboard/scale_up_search.py"),
     ("Regression Calibration", "dashboard/regression_calibration.py"),
+    ("MLA Attention Estimator", "dashboard/mla_dashboard.py"),
     ("InferenceMax Overview", "dashboard/inferencemax.py"),
     ("InferenceMax v2", "dashboard/inferencemax_v2.py"),
     ("Compute-only Prefill & Decode", "dashboard/custom_runtime_planner.py"),
