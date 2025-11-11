@@ -421,6 +421,7 @@ def _build_case_record(
     result: MLACalculationResult,
     *,
     sm_clock_ghz: float,
+    sm_clock_reference_ghz: float,
     tp_degree_default: int,
     tp_collectives_default: int,
     collective_bandwidth_gbs: float,
@@ -431,7 +432,7 @@ def _build_case_record(
         case.tp_collectives if case.tp_collectives is not None and case.tp_collectives >= 0 else tp_collectives_default
     )
 
-    compute_time_ms = float(result.compute_time_ms)
+    base_compute_time_ms = float(result.compute_time_ms)
     memory_time_ms = float(result.memory_time_ms)
     dtype_bytes = _dtype_bytes(case.dtype)
     tokens_per_device = case.batch_size * case.seq_len_q
@@ -452,9 +453,11 @@ def _build_case_record(
         comm_time_ms = (comm_bytes / bandwidth_bps) * 1e3
         comm_time_ms += tp_collectives * (collective_latency_us * 1e-3)
 
-    total_time_ms = max(compute_time_ms, comm_time_ms)
+    reference_clock = max(1e-9, sm_clock_reference_ghz)
     sm_clock = max(1e-9, sm_clock_ghz)
-    compute_cycles = compute_time_ms * sm_clock * 1e6
+    compute_cycles = base_compute_time_ms * reference_clock * 1e6
+    compute_time_ms = compute_cycles / (sm_clock * 1e6)
+    total_time_ms = max(compute_time_ms, comm_time_ms)
     comm_cycles = comm_time_ms * sm_clock * 1e6
     total_cycles = total_time_ms * sm_clock * 1e6
 
@@ -531,16 +534,25 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         step=10.0,
     )
 
-    hw_col4, hw_col5, hw_col6 = st.columns(3)
-    sm_clock_ghz = hw_col4.number_input(
+    hw_col4, hw_col5, hw_col6, hw_col7 = st.columns(4)
+    sm_clock_reference_ghz = hw_col4.number_input(
+        "Peak TFLOPs 标称 SM 时钟 (GHz)",
+        min_value=0.1,
+        max_value=5.0,
+        value=float(session_state.get("mla_sm_clock_reference", session_state.get("mla_sm_clock", 1.8))),
+        step=0.01,
+        key="mla_sm_clock_reference",
+    )
+    sm_clock_ghz = hw_col5.number_input(
         "SM 时钟 (GHz)",
         min_value=0.1,
         max_value=5.0,
         value=float(session_state.get("mla_sm_clock", 1.8)),
         step=0.01,
+        key="mla_sm_clock",
     )
     tp_default = int(
-        hw_col5.number_input(
+        hw_col6.number_input(
             "TP degree (默认)",
             min_value=1,
             max_value=256,
@@ -549,7 +561,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         )
     )
     tp_collectives_default = int(
-        hw_col6.number_input(
+        hw_col7.number_input(
             "TP collective 数",
             min_value=0,
             max_value=16,
@@ -558,15 +570,15 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         )
     )
 
-    hw_col7, hw_col8 = st.columns(2)
-    collective_bandwidth = hw_col7.number_input(
+    hw_col8, hw_col9 = st.columns(2)
+    collective_bandwidth = hw_col8.number_input(
         "互联带宽 (GB/s)",
         min_value=1.0,
         max_value=20000.0,
         value=float(session_state.get("mla_collective_bw", 900.0)),
         step=10.0,
     )
-    collective_latency_us = hw_col8.number_input(
+    collective_latency_us = hw_col9.number_input(
         "Collective latency (µs)",
         min_value=0.0,
         max_value=1000.0,
@@ -603,6 +615,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             case,
             result,
             sm_clock_ghz=sm_clock_ghz,
+            sm_clock_reference_ghz=sm_clock_reference_ghz,
             tp_degree_default=tp_default,
             tp_collectives_default=tp_collectives_default,
             collective_bandwidth_gbs=collective_bandwidth,
