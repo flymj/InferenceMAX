@@ -129,26 +129,58 @@ def _parse_value(raw: str) -> Any:
     text = raw.strip()
     if not text:
         return text
+
+    # 列表语法：支持 [a,b]，也支持区间 [1:40,80:90,101]
     if text.startswith("[") and text.endswith("]"):
         inner = text[1:-1]
         if not inner.strip():
             return []
+
+        # 先按你原来的逻辑，把逗号拆成若干 item
         items: list[Any] = []
         depth = 0
-        current = []
+        current: list[str] = []
         for ch in inner:
             if ch == "[":
                 depth += 1
             elif ch == "]":
                 depth = max(0, depth - 1)
             if ch == "," and depth == 0:
-                items.append(_parse_scalar("".join(current)))
+                token = "".join(current).strip()
+                if token:
+                    items.append(_parse_scalar(token))
                 current = []
             else:
                 current.append(ch)
+
         if current:
-            items.append(_parse_scalar("".join(current)))
-        return items
+            token = "".join(current).strip()
+            if token:
+                items.append(_parse_scalar(token))
+
+        # 然后在 item 级别上做区间展开：
+        # - 若 item 是字符串并包含 ":"，且两侧都是 int，则展开成闭区间 [start, end]
+        # - 否则保持原样
+        expanded: list[Any] = []
+        for v in items:
+            if isinstance(v, str) and ":" in v:
+                start_s, end_s = [p.strip() for p in v.split(":", 1)]
+                try:
+                    start = int(start_s)
+                    end = int(end_s)
+                except ValueError:
+                    # 不是纯整数区间，比如 "1.5:2.5" 或别的：当普通字符串处理
+                    expanded.append(v)
+                    continue
+
+                step = 1 if end >= start else -1
+                expanded.extend(range(start, end + step, step))
+            else:
+                expanded.append(v)
+
+        return expanded
+
+    # 非列表：走原有 scalar 解析逻辑
     return _parse_scalar(text)
 
 
@@ -252,12 +284,20 @@ def _extract_label(segment: str) -> str:
 
 
 def _payload_after_marker(segment: str) -> str:
-    marker_match = re.search(r"mla\s*:", segment, re.IGNORECASE)
+    # 先找到 flash_mla:，后面的才是我们关心的内容
+    flash_match = re.search(r"flash_mla\s*:", segment, re.IGNORECASE)
+    if flash_match:
+        tail = segment[flash_match.end():]
+        # 在 flash_mla 之后再找一次独立的 "MLA:" 作为真正 payload 开头
+        mla_match = re.search(r"\bMLA\s*:", tail, re.IGNORECASE)
+        if mla_match:
+            return tail[mla_match.end():]
+        return tail
+
+    # 如果日志里根本没有 flash_mla:，退化为旧逻辑（防御用）
+    marker_match = re.search(r"\bMLA\s*:", segment, re.IGNORECASE)
     if marker_match:
-        return segment[marker_match.end() :]
-    match = re.search(r"flash_mla\s*:", segment, re.IGNORECASE)
-    if match:
-        return segment[match.end() :]
+        return segment[marker_match.end():]
     return segment
 
 
@@ -676,6 +716,7 @@ def main() -> None:
         help_title="MLA Dashboard 帮助",
         help_markdown=help_markdown,
         help_expanded=False,
+        render_model_overview=False,
     )
     render(state, actions)
 

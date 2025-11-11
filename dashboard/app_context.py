@@ -427,6 +427,7 @@ def bootstrap(
     help_title: str | None = None,
     help_markdown: str | None = None,
     help_expanded: bool = False,
+    render_model_overview: bool = True,
 ) -> tuple[DashboardState, DashboardActions]:
     """Initialise shared layout, returning the state/action context.
 
@@ -437,6 +438,7 @@ def bootstrap(
         help_title: Label for the collapsible help panel。
         help_markdown: Markdown body shown inside the help panel; skipped when 为空。
         help_expanded: Whether the help panel should be expanded by default。
+        render_model_overview: Whether to render the model overview from config.json
     """
 
     st.set_page_config(page_title=page_title, layout="wide")
@@ -463,18 +465,21 @@ def bootstrap(
         help_expanded=help_expanded,
     )
 
-    overview_col, config_col = st.columns((1.8, 1.2))
-    with config_col:
-        cfg = _render_model_config_controls()
+    if render_model_overview:
+        overview_col, config_col = st.columns((1.8, 1.2))
+        with config_col:
+            cfg = _render_model_config_controls()
 
-    try:
-        model = build_model(cfg)
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Failed to build model: {exc}")
-        st.stop()
+        try:
+            model = build_model(cfg)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Failed to build model: {exc}")
+            st.stop()
 
-    with overview_col:
-        _render_model_overview(model)
+        with overview_col:
+            _render_model_overview(model)
+    else:
+        model=""
 
     state = DashboardState(st=st, session_state=st.session_state, model=model)
     actions = DashboardActions(
