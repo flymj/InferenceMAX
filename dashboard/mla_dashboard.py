@@ -67,6 +67,14 @@ _KEY_ALIASES = {
     "collectives": "tp_collectives",
 }
 
+_REQUIRED_NUMERIC_FIELDS: tuple[tuple[str, str], ...] = (
+    ("batch_size", "batch_size"),
+    ("seq_len_q", "seqlen_q"),
+    ("seq_len_k", "seqlen_k"),
+    ("num_heads_q", "num_heads"),
+    ("head_dim_k", "head_dim"),
+)
+
 
 @dataclass
 class ParsedCase:
@@ -90,6 +98,14 @@ class ParsedCase:
 def _normalise_key(raw: str) -> str:
     key = raw.strip().lower().replace(" ", "_")
     return _KEY_ALIASES.get(key, key)
+
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    return False
 
 
 def _parse_scalar(token: str) -> Any:
@@ -273,6 +289,17 @@ def parse_flash_mla_cases(text: str) -> tuple[list[ParsedCase], list[str]]:
             continue
 
         for combo_idx, combo in enumerate(combos, start=1):
+            missing_fields = [
+                display
+                for key, display in _REQUIRED_NUMERIC_FIELDS
+                if _is_missing(combo.get(key))
+            ]
+            if missing_fields:
+                warnings.append(
+                    f"第 {seg_index} 个片段的 case #{combo_idx} 缺少必需字段：{', '.join(missing_fields)}。"
+                )
+                continue
+
             try:
                 batch = float(combo.get("batch_size"))
                 seq_q = float(combo.get("seq_len_q"))
