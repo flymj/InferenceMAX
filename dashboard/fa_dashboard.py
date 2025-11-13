@@ -168,42 +168,259 @@ def lower_tri_pairs(nq: int, nk: int) -> int:
     return nk * (nk + 1) // 2 + (nq - nk) * nk
 
 
-def mask_usage_ratio(nq: int, nk: int, enabled: bool) -> float:
+MASK_NONE = "none"
+MASK_CAUSAL_LT = "causal_lower_triangle"
+_MASK_LABELS = {
+    MASK_NONE: "None (dense)",
+    MASK_CAUSAL_LT: "Causal lower-triangle",
+}
+
+
+def mask_usage_ratio(nq: int, nk: int, mask_type: str) -> float:
     """Return ratio of useful compute vs. dense compute under the mask."""
 
     total = max(0, int(nq)) * max(0, int(nk))
     if total == 0:
         return 0.0
-    if not enabled:
+    if mask_type != MASK_CAUSAL_LT:
         return 1.0
     valid = lower_tri_pairs(nq, nk)
     return min(1.0, valid / total) if valid > 0 else 0.0
 
 
-def estimate_mask_tile_execution_ratio(nq: int, nk: int, tile_M: int, tile_N: int, enabled: bool) -> float:
-    """Return ratio of compute executed with tiling vs. dense compute when masking."""
+def flops_attention_masked(
+    L_q: int,
+    L_k: int,
+    d: int,
+    d_v: int,
+    mask_type: str,
+    skip_masked_gemm: bool,
+):
+    """Return FLOPs accounting for masking strategy."""
+
+    L_q = max(0, int(L_q))
+    L_k = max(0, int(L_k))
+    d = max(0, int(d))
+    d_v = max(0, int(d_v))
+
+    total_pairs = L_q * L_k
+    fl_qk_full = 2 * L_q * L_k * d
+    fl_pv_full = 2 * L_q * L_k * d_v
+    fl_full = fl_qk_full + fl_pv_full
+
+    if total_pairs == 0 or d == 0 or d_v == 0:
+        return {
+            "flops_qk_full": 0.0,
+            "flops_pv_full": 0.0,
+            "flops_full": 0.0,
+            "flops_qk_effective": 0.0,
+            "flops_pv_effective": 0.0,
+            "flops_effective": 0.0,
+            "flops_qk_hw": 0.0,
+            "flops_pv_hw": 0.0,
+            "flops_hw": 0.0,
+            "density": 0.0,
+            "hw_density": 0.0,
+            "valid_pairs": 0,
+            "total_pairs": total_pairs,
+        }
+
+    if mask_type == MASK_CAUSAL_LT:
+        valid_pairs = lower_tri_pairs(L_q, L_k)
+        density = valid_pairs / total_pairs if total_pairs > 0 else 0.0
+    else:
+        valid_pairs = total_pairs
+        density = 1.0
+
+    fl_qk_effective = fl_qk_full * density
+    fl_pv_effective = fl_pv_full * density
+    fl_effective = fl_qk_effective + fl_pv_effective
+
+    if skip_masked_gemm:
+        fl_qk_hw = fl_qk_effective
+        fl_pv_hw = fl_pv_effective
+        hw_density = density
+    else:
+        fl_qk_hw = fl_qk_full
+        fl_pv_hw = fl_pv_full
+        hw_density = 1.0
+    fl_hw = fl_qk_hw + fl_pv_hw
+
+    return {
+        "flops_qk_full": fl_qk_full,
+        "flops_pv_full": fl_pv_full,
+        "flops_full": fl_full,
+        "flops_qk_effective": fl_qk_effective,
+        "flops_pv_effective": fl_pv_effective,
+        "flops_effective": fl_effective,
+        "flops_qk_hw": fl_qk_hw,
+        "flops_pv_hw": fl_pv_hw,
+        "flops_hw": fl_hw,
+        "density": density,
+        "hw_density": hw_density,
+        "valid_pairs": valid_pairs,
+        "total_pairs": total_pairs,
+    }
+
+
+def causal_tile_density_lower_triangle(i: int, j: int, M: int, N: int, L_q=None, L_k=None) -> float:
+    """Return fractional density of a tile under a causal lower-tri mask."""
+
+    if M <= 0 or N <= 0:
+        return 0.0
+    i = max(0, int(i))
+    j = max(0, int(j))
+    M = int(M)
+    N = int(N)
+
+    q_min = i * M
+    k_min = j * N
+    q_max = (i + 1) * M - 1
+    k_max = (j + 1) * N - 1
+    if L_q is not None:
+        q_max = min(q_max, max(0, int(L_q)) - 1)
+    if L_k is not None:
+        k_max = min(k_max, max(0, int(L_k)) - 1)
+
+    q_rows = q_max - q_min + 1
+    k_cols = k_max - k_min + 1
+    if q_rows <= 0 or k_cols <= 0:
+        return 0.0
+
+    # Tile fully above diagonal
+    if q_max < k_min:
+        return 0.0
+
+    # Tile fully below diagonal
+    if k_max <= q_min:
+        return 1.0
+
+    valid = 0
+    for q in range(q_min, q_max + 1):
+        right = min(q, k_max)
+        if right >= k_min:
+            valid += right - k_min + 1
+    tile_area = q_rows * k_cols
+    if tile_area <= 0:
+        return 0.0
+    return min(1.0, valid / float(tile_area))
+
+
+def flops_tile_qk_pv_causal(
+    M: int,
+    N: int,
+    d: int,
+    d_v: int,
+    i: int,
+    j: int,
+    mask_type: str,
+    skip_masked_gemm: bool,
+    L_q: int = None,
+    L_k: int = None,
+):
+    """Return per-tile FLOPs (hw/effective) under the given mask."""
+
+    M = max(0, int(M))
+    N = max(0, int(N))
+    d = max(0, int(d))
+    d_v = max(0, int(d_v))
+
+    if M == 0 or N == 0 or d == 0 or d_v == 0:
+        return {
+            "flops_qk_hw": 0.0,
+            "flops_pv_hw": 0.0,
+            "flops_qk_effective": 0.0,
+            "flops_pv_effective": 0.0,
+            "density": 0.0,
+            "tile_area": 0,
+        }
+
+    density = 1.0
+    if mask_type == MASK_CAUSAL_LT:
+        density = causal_tile_density_lower_triangle(i, j, M, N, L_q=L_q, L_k=L_k)
+
+    q_min = i * M
+    k_min = j * N
+    q_max = (i + 1) * M
+    k_max = (j + 1) * N
+    if L_q is not None:
+        q_max = min(q_max, max(0, int(L_q)))
+    if L_k is not None:
+        k_max = min(k_max, max(0, int(L_k)))
+    rows = max(0, q_max - q_min)
+    cols = max(0, k_max - k_min)
+    tile_area = rows * cols
+    if tile_area == 0:
+        return {
+            "flops_qk_hw": 0.0,
+            "flops_pv_hw": 0.0,
+            "flops_qk_effective": 0.0,
+            "flops_pv_effective": 0.0,
+            "density": 0.0,
+            "tile_area": 0,
+        }
+
+    full_qk = 2 * rows * cols * d
+    full_pv = 2 * rows * cols * d_v
+    effective_qk = full_qk * density
+    effective_pv = full_pv * density
+
+    if skip_masked_gemm:
+        hw_qk = effective_qk
+        hw_pv = effective_pv
+    else:
+        hw_qk = full_qk
+        hw_pv = full_pv
+
+    return {
+        "flops_qk_hw": hw_qk,
+        "flops_pv_hw": hw_pv,
+        "flops_qk_effective": effective_qk,
+        "flops_pv_effective": effective_pv,
+        "density": density,
+        "tile_area": tile_area,
+    }
+
+
+def estimate_mask_tile_execution_ratio(
+    nq: int,
+    nk: int,
+    tile_M: int,
+    tile_N: int,
+    mask_type: str,
+    skip_masked_gemm: bool,
+) -> float:
+    """Return ratio of compute executed vs. dense compute for tiled masking."""
 
     total = max(0, int(nq)) * max(0, int(nk))
     if total == 0:
         return 0.0
-    if not enabled:
+    if mask_type == MASK_NONE or tile_M <= 0 or tile_N <= 0:
         return 1.0
-    if tile_M <= 0 or tile_N <= 0:
-        return 0.0
+    if not skip_masked_gemm:
+        return 1.0
 
-    row_ranges = _segment_ranges(nq, tile_M)
-    col_ranges = _segment_ranges(nk, tile_N)
-    if not row_ranges or not col_ranges:
-        return 0.0
-
-    executed = 0
-    for q_start, q_end in row_ranges:
-        q_len = q_end - q_start
-        q_max = q_end - 1
-        for k_start, k_end in col_ranges:
-            if q_max < k_start:
-                break
-            executed += q_len * (k_end - k_start)
+    q_tiles = math.ceil(nq / tile_M) if tile_M > 0 else 0
+    k_tiles = math.ceil(nk / tile_N) if tile_N > 0 else 0
+    executed = 0.0
+    for i in range(q_tiles):
+        for j in range(k_tiles):
+            tile_stats = flops_tile_qk_pv_causal(
+                tile_M,
+                tile_N,
+                1,
+                1,
+                i,
+                j,
+                mask_type,
+                skip_masked_gemm,
+                L_q=nq,
+                L_k=nk,
+            )
+            tile_area = tile_stats["tile_area"]
+            if tile_area <= 0:
+                continue
+            executed += tile_stats["density"] * tile_area
     return min(1.0, executed / total)
 
 
@@ -326,11 +543,15 @@ with col_p1:
         st.session_state.update({
             "batch": 1, "nq": 32768, "nk": 32768, "heads": 32, "kv_heads": 32,
             "d": 128, "dv": 128, "dropout": 0.0, "custom_mask": 0,
+            "mask_type": MASK_NONE,
+            "skip_masked_gemm": False,
         })
     if st.button("Case B: 1K×1K, d=64, H=16, drop=0.1 (bf16)"):
         st.session_state.update({
             "batch": 4, "nq": 1024, "nk": 1024, "heads": 16, "kv_heads": 16,
             "d": 64, "dv": 64, "dropout": 0.1, "custom_mask": 1,
+            "mask_type": MASK_CAUSAL_LT,
+            "skip_masked_gemm": True,
         })
 
 with col_p2:
@@ -354,16 +575,25 @@ with col_p2:
             "head_dim_value": ("dv", int),
             "dropout": ("dropout", float),
             "custom_mask": ("custom_mask", int),
+            "mask_type": ("mask_type", str),
+            "skip_masked_gemm": ("skip_masked_gemm", int),
         }
         for k, (sk, caster) in mapping.items():
             if k in kv:
                 st.session_state[sk] = caster(kv[k]) if caster else kv[k]
+        if "custom_mask" in kv and "mask_type" not in kv:
+            enabled = bool(int(kv["custom_mask"]))
+            st.session_state["mask_type"] = MASK_CAUSAL_LT if enabled else MASK_NONE
+        if "skip_masked_gemm" in kv:
+            st.session_state["skip_masked_gemm"] = bool(int(kv["skip_masked_gemm"]))
         st.success("Applied from string.")
 
 # ----------------------- Workload Inputs -----------------------
 for k, v in {
     "batch": 1, "nq": 32768, "nk": 32768, "heads": 32, "kv_heads": 32,
     "d": 128, "dv": 128, "dropout": 0.0, "custom_mask": 0,
+    "mask_type": MASK_NONE,
+    "skip_masked_gemm": False,
 }.items():
     st.session_state.setdefault(k, v)
 
@@ -380,28 +610,41 @@ with c3:
 with c4:
     nq = st.number_input("Seq Q (Nq)", min_value=1, value=int(st.session_state["nq"]))
     nk = st.number_input("Seq K (Nk)", min_value=1, value=int(st.session_state["nk"]))
-custom_mask_enabled = st.checkbox(
-    "Enable Custom Mask (lower-triangular)",
-    value=bool(int(st.session_state.get("custom_mask", 0))),
-    help="Apply a lower-triangular (causal) mask to QK scores.",
+mask_type_options = list(_MASK_LABELS.keys())
+default_mask_type = st.session_state.get("mask_type", MASK_NONE)
+if default_mask_type not in mask_type_options:
+    default_mask_type = MASK_CAUSAL_LT if int(st.session_state.get("custom_mask", 0)) else MASK_NONE
+mask_type = st.selectbox(
+    "Mask Type",
+    options=mask_type_options,
+    index=mask_type_options.index(default_mask_type),
+    format_func=lambda x: _MASK_LABELS.get(x, x),
 )
+skip_masked_gemm = st.checkbox(
+    "Skip masked tiles in GEMM",
+    value=bool(st.session_state.get("skip_masked_gemm", False)),
+    help="If enabled, assume the kernel skips masked tiles/entries when computing QK^T and P·V.",
+)
+st.session_state["mask_type"] = mask_type
+st.session_state["skip_masked_gemm"] = skip_masked_gemm
+custom_mask_enabled = mask_type != MASK_NONE
 st.session_state["custom_mask"] = int(custom_mask_enabled)
 
 # ----------------------- Core Model -----------------------
 bytes_per_el = 1 if dtype == "fp8" else 2
 
 total_pairs = max(0, nq * nk)
-mask_ratio = mask_usage_ratio(nq, nk, custom_mask_enabled)
+mask_ratio = mask_usage_ratio(nq, nk, mask_type)
 mask_valid_pairs = lower_tri_pairs(nq, nk) if custom_mask_enabled else total_pairs
+mask_flops = flops_attention_masked(nq, nk, d, dv, mask_type, skip_masked_gemm)
+mask_hw_ratio = mask_flops["hw_density"]
 
 def _scale_by_mask(value: float) -> float:
     return value * mask_ratio if mask_ratio > 0 else 0.0
 
 # FLOPs (Tensor Core dominated): QK^T and P*V
-fl_qk = 2 * nq * nk * d           # per head
-fl_pv = 2 * nq * nk * dv          # per head
-fl_per_head = fl_qk + fl_pv
-tensor_flops = _scale_by_mask(batch * heads * fl_per_head)
+tensor_flops = batch * heads * mask_flops["flops_hw"]
+tensor_flops_effective = batch * heads * mask_flops["flops_effective"]
 
 # VALU ops (approx): max + sum (+ dropout scale) per score element
 per_elem = 2 + (1 if dropout > 0 else 0)
@@ -498,8 +741,10 @@ with col_m5:
 
 if custom_mask_enabled:
     st.caption(
-        f"Custom mask keeps {mask_ratio*100:.2f}% of score pairs "
-        f"({mask_valid_pairs:,} / {total_pairs:,}); ops scale accordingly."
+        f"{_MASK_LABELS.get(mask_type, mask_type)} keeps {mask_ratio*100:.2f}% "
+        f"of score pairs ({mask_valid_pairs:,} / {total_pairs:,}). "
+        f"Hardware GEMM density = {mask_hw_ratio*100:.2f}% "
+        f"(skip masked GEMM: {'Yes' if skip_masked_gemm else 'No'})."
     )
 
 # ----------------------- Charts -----------------------
@@ -545,8 +790,13 @@ with st.expander("Formulas (General)", expanded=False):
 
 with st.expander("Formulas (Instantiated with Current Params)", expanded=True):
     per_elem_str = f"2 + {1 if dropout>0 else 0}"
-    mask_expr = f" * {mask_ratio:.4f}" if custom_mask_enabled else ""
-    tensor_expr = f"2*{nq}*{nk}*({d}+{dv})*{heads}*{batch}{mask_expr}"
+    mask_expr = f" * {mask_ratio:.4f}" if (custom_mask_enabled and mask_ratio not in (0.0, 1.0)) else ""
+    mask_hw_expr = (
+        f" * {mask_hw_ratio:.4f}"
+        if (custom_mask_enabled and mask_hw_ratio not in (0.0, 1.0))
+        else ""
+    )
+    tensor_expr = f"2*{nq}*{nk}*({d}+{dv})*{heads}*{batch}{mask_hw_expr}"
     valu_expr   = f"{batch}*{heads}*{nq}*{nk}*({per_elem_str}){mask_expr}"
     sfu_expr    = f"{batch}*{heads}*{nq}*{nk}{mask_expr}"
     bytes_expr  = f"{batch}*( {heads}*{nq}*{d} + {kv_heads}*{nk}*{d} + {kv_heads}*{nk}*{dv} + {heads}*{nq}*{dv} )*{1 if dtype=='fp8' else 2}"
@@ -554,7 +804,10 @@ with st.expander("Formulas (Instantiated with Current Params)", expanded=True):
     mask_line = []
     if custom_mask_enabled:
         mask_line.append(
-            f"Mask ratio = {mask_valid_pairs:,} / {total_pairs:,} = {mask_ratio:.4f} (useful score pairs vs. dense)"
+            f"Mask ratio (effective) = {mask_valid_pairs:,} / {total_pairs:,} = {mask_ratio:.4f}"
+        )
+        mask_line.append(
+            f"Mask ratio (hardware GEMM) = {mask_hw_ratio:.4f}"
         )
     lines = [
         *mask_line,
@@ -633,10 +886,12 @@ with col_gpu3:
     )
 
 tile_b = DTYPE_BYTES.get(tile_dtype, 2)
-tile_mask_exec_ratio = estimate_mask_tile_execution_ratio(nq, nk, tile_M, tile_N, custom_mask_enabled)
+tile_mask_exec_ratio = estimate_mask_tile_execution_ratio(
+    nq, nk, tile_M, tile_N, mask_type, skip_masked_gemm
+)
 mask_waste_factor = (
     (tile_mask_exec_ratio / mask_ratio)
-    if custom_mask_enabled and mask_ratio > 0
+    if (custom_mask_enabled and mask_ratio > 0)
     else 1.0
 )
 smem_info = estimate_smem(
@@ -695,9 +950,13 @@ summary_rows = [
 if custom_mask_enabled:
     summary_rows.extend(
         [
-            ("Mask util (global)", f"{mask_ratio*100:.2f}%"),
+            ("Mask type", _MASK_LABELS.get(mask_type, mask_type)),
+            ("Skip masked GEMM", "Yes" if skip_masked_gemm else "No"),
+            ("Mask util (effective)", f"{mask_ratio*100:.2f}%"),
+            ("Mask util (hardware)", f"{mask_hw_ratio*100:.2f}%"),
             ("Mask exec (tile avg)", f"{tile_mask_exec_ratio*100:.2f}%"),
             ("Mask overhead", f"{mask_waste_factor:.2f}× vs. ideal"),
+            ("Tensor FLOPs (effective)", fmt_num(tensor_flops_effective)),
         ]
     )
 st.dataframe(pd.DataFrame(summary_rows, columns=["Metric", "Value"]), hide_index=True)
@@ -712,6 +971,42 @@ if regs_info["regs_thread"] > max_regs_per_thread:
     )
 with st.expander("Register breakdown", expanded=False):
     st.write(pd.DataFrame(list(regs_info["E_breakdown"].items()), columns=["Fragment", "Elements"]))
+
+if custom_mask_enabled:
+    with st.expander("Mask tile density preview", expanded=False):
+        max_tiles_display = 12
+        q_tiles = min(max_tiles_display, math.ceil(nq / tile_M)) if tile_M > 0 else 0
+        k_tiles = min(max_tiles_display, math.ceil(nk / tile_N)) if tile_N > 0 else 0
+        if q_tiles == 0 or k_tiles == 0:
+            st.info("Tile size exceeds sequence length; nothing to display.")
+        else:
+            density_matrix = []
+            for i in range(q_tiles):
+                row = []
+                for j in range(k_tiles):
+                    row.append(
+                        causal_tile_density_lower_triangle(
+                            i, j, tile_M, tile_N, L_q=nq, L_k=nk
+                        )
+                        if mask_type == MASK_CAUSAL_LT
+                        else 1.0
+                    )
+                density_matrix.append(row)
+            fig_density = px.imshow(
+                density_matrix,
+                color_continuous_scale="Blues",
+                origin="upper",
+                aspect="auto",
+                zmin=0,
+                zmax=1,
+                labels=dict(x="K tile j", y="Q tile i", color="r_ij"),
+                title="Per-tile valid density r_ij (first tiles)",
+                text_auto=True,
+            )
+            st.plotly_chart(fig_density, use_container_width=True)
+            st.caption(
+                "Values show fraction of valid Q-K pairs within each tile under the causal mask."
+            )
 
 with st.expander("Tile Sweep (optional)", expanded=False):
     st.write("Sweep over multiple tile shapes to find resource-feasible winners.")
@@ -762,7 +1057,7 @@ with st.expander("Tile Sweep (optional)", expanded=False):
                     e_misc,
                 )
                 mask_exec_ratio_c = estimate_mask_tile_execution_ratio(
-                    nq, nk, M_candidate, N_candidate, custom_mask_enabled
+                    nq, nk, M_candidate, N_candidate, mask_type, skip_masked_gemm
                 )
                 mask_overhead_c = (
                     (mask_exec_ratio_c / mask_ratio)
@@ -784,19 +1079,20 @@ with st.expander("Tile Sweep (optional)", expanded=False):
                     smem_c["smem_total"] <= smem_limit_bytes
                     and regs_c["regs_thread"] <= max_regs_per_thread
                 )
-                rows.append(
-                    {
-                        "M": M_candidate,
-                        "N": N_candidate,
-                        "SMEM_KB": smem_c["smem_total"] / 1024.0,
-                        "Regs/thread": regs_c["regs_thread"],
-                        "AI": ai_c["AI"],
-                        "Roofline_TFLOPs": ai_c["attainable_TFLOPs"],
-                        "Mask_exec_%": mask_exec_ratio_c * 100.0,
-                        "Mask_overhead_x": mask_overhead_c,
-                        "Valid": valid,
-                    }
-                )
+                    rows.append(
+                        {
+                            "M": M_candidate,
+                            "N": N_candidate,
+                            "SMEM_KB": smem_c["smem_total"] / 1024.0,
+                            "Regs/thread": regs_c["regs_thread"],
+                            "AI": ai_c["AI"],
+                            "Roofline_TFLOPs": ai_c["attainable_TFLOPs"],
+                            "Mask_effective_%": mask_ratio * 100.0 if custom_mask_enabled else 100.0,
+                            "Mask_hw_%": mask_exec_ratio_c * 100.0,
+                            "Mask_overhead_x": mask_overhead_c,
+                            "Valid": valid,
+                        }
+                    )
         sweep_df = pd.DataFrame(rows)
         if sweep_df.empty:
             st.info("No tiles evaluated (check ranges).")
