@@ -56,6 +56,7 @@ modeling/
 | `host_bandwidth.py` | 分析 CPU↔GPU↔DDR 之间搬运字节，评估 MoE 冷热专家回灌/回写的带宽瓶颈。 | PCIe/NVLink 带宽、MoE 偏斜、回灌窗口、KV 回写参数 | 各通道字节量、耗时、吞吐曲线与瓶颈提示。 |
 | `experts_calculation.py` | 反推在给定带宽与延迟预算下可支持的 MoE 专家数量与加载时间。 | TP/DP、窗口长度、PCIe/DDR 带宽、专家权重大小 | 可并发专家数、加载耗时、是否满足 SLA 的判定。 |
 | `scale_up_search.py` | 针对固定模型参数与 SLA，搜索满足延迟/吞吐约束的 TP/DP/并发组合。 | 模型规模、SLA 目标（TTFT/TPS）、chunked prefill 配置、并发候选 | 满足约束的配置表、Plotly 交互图、失败原因解释。 |
+| `scale_up_search_pd_disaggregate.py` | 面向 Prefill/Decode 分离场景的 Scale-up 搜索，与 PD 合并版保持一致的交互体验。 | 模型规模、PD 分离策略、SLA 目标、chunked prefill 设置 | 满足 SLA 的组合、PD 分离效率指标、Plotly 交互图。 |
 | `regression_calibration.py` | 使用实测延迟对理论算力/带宽进行折减校准，使后续估算更贴近真机。 | CSV/TSV 测量数据、基线硬件规格、回归模型选项 | 计算-带宽折减系数、拟合优度、建议 MFU/带宽。 |
 | `inferencemax.py` | 单场景 InferenceMAX 总览：拆解 Prefill/Decode 各阶段耗时与算力利用率。 | Workload 设置（batch、序列、KV 长度）、硬件 profile | Prefill/Decode 表格、堆叠柱状图、算力/带宽占比。 |
 | `inferencemax_v2.py` | 多场景聚合分析：同时评估多个配置并进行堆叠对比。 | 可编辑场景表（TP/DP/batch/seq_len 等）、组合策略 | 多场景对比表、堆叠柱状图、总吞吐与 SLA 统计。 |
