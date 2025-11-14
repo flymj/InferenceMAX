@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 if __package__ is None or __package__ == "":
     import sys
     from pathlib import Path
@@ -15,6 +17,35 @@ ensure_repo_root_on_path()
 import pandas as pd
 
 from dashboard.app_context import DashboardActions, DashboardState, bootstrap
+from dashboard.services.llm_calcs import expert_parallel_a2a_bytes, weights_bytes_per_gpu
+
+
+def _config_ep_group(model: Any) -> int | None:
+    cfg = getattr(model, "cfg", {}) or {}
+    for key in ("expert_parallel_size", "ep_size", "moe_ep_size", "ep_group_size", "ep_world_size"):
+        value = cfg.get(key)
+        if value:
+            try:
+                return max(1, int(value))
+            except (TypeError, ValueError):  # pragma: no cover - config hygiene
+                continue
+    return None
+
+
+def _effective_ep_group(
+    *,
+    is_moe: bool,
+    requested_ep: int,
+    config_ep: int | None,
+    dp: int,
+) -> int:
+    if not is_moe:
+        return max(1, int(requested_ep))
+    if requested_ep and requested_ep > 0:
+        return int(requested_ep)
+    if config_ep and config_ep > 0:
+        return int(config_ep)
+    return max(1, int(dp))
 
 
 def render(state: DashboardState, actions: DashboardActions) -> None:
@@ -24,6 +55,8 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     session_state = state.session_state
     model = state.model
     is_moe = bool(getattr(model, "is_moe_enabled", lambda: False)())
+
+    config_ep_group = _config_ep_group(model)
 
     st.markdown("### Quick runtime estimate — local hardware only")
     with st.container():
@@ -120,7 +153,9 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         )
         ep_default = defaults.get("ep")
         if ep_default is None:
-            ep_default = int(session_state.get("inspect_ep", int(tp_default) * int(dp_default)))
+            inferred = config_ep_group if is_moe else None
+            base_default = int(session_state.get("inspect_ep", int(tp_default) * int(dp_default)))
+            ep_default = int(inferred or base_default)
         if link_ep_to_tpdp and not is_moe:
             ep_default = int(tp_val) * int(dp_val)
         ep_val = col_ep.number_input(
@@ -190,8 +225,28 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     tp_decode = max(1, int(tp_decode))
     dp_decode = max(1, int(dp_decode))
     ep_decode = max(1, int(ep_decode))
-    total_devices_prefill = tp_prefill * dp_prefill * ep_prefill
-    total_devices_decode = tp_decode * dp_decode * ep_decode
+    ep_group_prefill = _effective_ep_group(
+        is_moe=is_moe,
+        requested_ep=ep_prefill,
+        config_ep=config_ep_group,
+        dp=dp_prefill,
+    )
+    ep_group_decode = _effective_ep_group(
+        is_moe=is_moe,
+        requested_ep=ep_decode,
+        config_ep=config_ep_group,
+        dp=dp_decode,
+    )
+    total_devices_prefill = (
+        tp_prefill * max(dp_prefill, ep_group_prefill)
+        if is_moe
+        else tp_prefill * dp_prefill * ep_prefill
+    )
+    total_devices_decode = (
+        tp_decode * max(dp_decode, ep_group_decode)
+        if is_moe
+        else tp_decode * dp_decode * ep_decode
+    )
     batch = max(1, int(batch_per_gpu))
     experts_per_tok = int(getattr(getattr(model, "cfg", {}), "get", lambda k, d=None: d)("num_experts_per_tok", 0) or 0)
     weight_dtype_b = int(session_state.get("weight_bytes", 2))
@@ -220,8 +275,22 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     flops_prefill_total = flops_prefill_per_layer * layers / max(1, tp_prefill)
     flops_decode_total = flops_decode_per_layer * layers / max(1, tp_decode)
 
-    weight_totals = model.weights_totals(weight_dtype_bytes=weight_dtype_b)
-    weights_total_bytes = int(weight_totals.get("bytes_total", 0))
+    weights_prefill_bytes = int(
+        weights_bytes_per_gpu(
+        model,
+        tp=tp_prefill,
+        ep_group=ep_group_prefill,
+        weight_dtype_bytes=weight_dtype_b,
+    )
+    )
+    weights_decode_bytes = int(
+        weights_bytes_per_gpu(
+        model,
+        tp=tp_decode,
+        ep_group=ep_group_decode,
+        weight_dtype_bytes=weight_dtype_b,
+    )
+    )
 
     per_tok_kv_layer_bytes = actions.per_token_kv_bytes_per_layer_per_gpu(
         model,
@@ -231,7 +300,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     kv_layers = int(getattr(model, "num_hidden_layers", 0) or layers)
 
     tokens_prefill_per_device = batch * int(seq_len_run)
-    hbm_bytes_prefill_weights = weights_total_bytes
+    hbm_bytes_prefill_weights = int(weights_prefill_bytes)
     hbm_bytes_prefill_kv_write = int(per_tok_kv_layer_bytes) * kv_layers * tokens_prefill_per_device
     hbm_bytes_prefill_result = int(tokens_prefill_per_device * hidden_size * kv_dtype_b)
     hbm_bytes_prefill_total = hbm_bytes_prefill_weights + hbm_bytes_prefill_kv_write + hbm_bytes_prefill_result
@@ -245,7 +314,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
     hbm_bytes_per_token = per_token_decode_kv
     if include_weight_read_in_decode_hbm_local:
-        hbm_bytes_per_token += weights_total_bytes
+        hbm_bytes_per_token += int(weights_decode_bytes)
     hbm_bytes_decode_result = int(hidden_size * kv_dtype_b)
     hbm_bytes_per_token += hbm_bytes_decode_result
 
@@ -257,16 +326,16 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         else 0
     )
     ep_bytes_prefill = (
-        int(
-            2
-            * (batch * int(seq_len_run))
-            * hidden_size
-            * experts_per_tok
-            * (1 - 1 / max(1, total_devices_prefill))
-            * weight_dtype_b
+        expert_parallel_a2a_bytes(
+            tokens_per_device=batch * int(seq_len_run),
+            hidden_size=hidden_size,
+            dtype_bytes=weight_dtype_b,
+            top_k=experts_per_tok,
+            ep_group=ep_group_prefill,
+            layers=layers,
+            enabled=is_moe,
         )
-        * layers
-        if (is_moe and experts_per_tok > 0 and total_devices_prefill > 1)
+        if experts_per_tok > 0
         else 0
     )
     tp_bytes_decode = (
@@ -275,15 +344,16 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         else 0
     )
     ep_bytes_decode = (
-        int(
-            2
-            * hidden_size
-            * experts_per_tok
-            * (1 - 1 / max(1, total_devices_decode))
-            * weight_dtype_b
+        expert_parallel_a2a_bytes(
+            tokens_per_device=1,
+            hidden_size=hidden_size,
+            dtype_bytes=weight_dtype_b,
+            top_k=experts_per_tok,
+            ep_group=ep_group_decode,
+            layers=layers,
+            enabled=is_moe,
         )
-        * layers
-        if (is_moe and experts_per_tok > 0 and total_devices_decode > 1)
+        if experts_per_tok > 0
         else 0
     )
 
@@ -305,7 +375,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             "Unit": "Per pass / device",
             "TP": tp_prefill,
             "DP": dp_prefill,
-            "EP": ep_prefill,
+            "EP": ep_group_prefill,
             "Devices": total_devices_prefill,
             "B_per_gpu": batch,
             "Concurrency": batch * dp_prefill * int(grad_accum),
@@ -323,7 +393,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             "Unit": "Per token / device",
             "TP": tp_decode,
             "DP": dp_decode,
-            "EP": ep_decode,
+            "EP": ep_group_decode,
             "Devices": total_devices_decode,
             "B_per_gpu": 1,
             "Concurrency": dp_decode * int(grad_accum),
@@ -331,7 +401,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             "EP_bytes_net": ep_bytes_decode,
             "FLOPs_per_layer": flops_decode_per_layer,
             "FLOPs_total": flops_decode_total,
-            "HBM_weight_bytes": weights_total_bytes if include_weight_read_in_decode_hbm_local else 0,
+            "HBM_weight_bytes": int(weights_decode_bytes) if include_weight_read_in_decode_hbm_local else 0,
             "HBM_kv_bytes": per_token_decode_kv,
             "HBM_result_bytes": hbm_bytes_decode_result,
             "HBM_total_bytes": hbm_bytes_per_token,
@@ -416,7 +486,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     t_kv_prefill = actions.bytes_to_time_ms(int(hbm_bytes_prefill_kv_write), float(hbm_bw_local))
     t_result_prefill = actions.bytes_to_time_ms(int(hbm_bytes_prefill_result), float(hbm_bw_local))
     t_weight_decode = actions.bytes_to_time_ms(
-        int(weights_total_bytes if include_weight_read_in_decode_hbm_local else 0), float(hbm_bw_local)
+        int(weights_decode_bytes if include_weight_read_in_decode_hbm_local else 0), float(hbm_bw_local)
     )
     t_kv_decode = actions.bytes_to_time_ms(int(per_token_decode_kv), float(hbm_bw_local))
     t_result_decode = actions.bytes_to_time_ms(int(hbm_bytes_decode_result), float(hbm_bw_local))
