@@ -15,6 +15,7 @@ _APP_SCRIPTS = [
     ("Host Bandwidth Planner", "dashboard/host_bandwidth.py"),
     ("Experts Calcuation", "dashboard/experts_calculation.py"),
     ("Scale-up Search", "dashboard/scale_up_search.py"),
+    ("Scale-up Search (PD 分离)", "dashboard/scale_up_search_pd_disaggregate.py"),
     ("Regression Calibration", "dashboard/regression_calibration.py"),
     ("MLA Attention Estimator", "dashboard/mla_dashboard.py"),
     ("InferenceMax Overview", "dashboard/inferencemax.py"),
