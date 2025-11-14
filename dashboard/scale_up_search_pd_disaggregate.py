@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Dict, Iterable, List, Tuple
 
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
 
 # Ensure the repository root is importable even when the script is executed directly.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,17 +28,17 @@ from dashboard.features import (
 try:  # pragma: no cover - allow running as a script
     from dashboard.services.llm_calcs import (
         ModelProfile,
+        MemoryTraffic,
         concurrency_adjusted_times,
         effective_compute_tflops,
-        kv_cache_memory_traffic,
         prefill_decode_time_breakdown,
     )
 except ImportError:  # pragma: no cover - executed when imported as package module
     from .services.llm_calcs import (
         ModelProfile,
+        MemoryTraffic,
         concurrency_adjusted_times,
         effective_compute_tflops,
-        kv_cache_memory_traffic,
         prefill_decode_time_breakdown,
     )
 
@@ -61,6 +62,322 @@ class _SearchConfig:
     spec_speedup: float
     causal_mask: bool
     attn_impl: str
+    hbm_eff: float
+
+
+@dataclass(frozen=True)
+class _ParallelConfig:
+    prefill_tp: int
+    prefill_dp: int
+    prefill_ep: int
+    decode_tp: int
+    decode_dp: int
+    decode_ep: int
+
+    def stage_signature(self, stage: str) -> str:
+        if stage == "prefill":
+            return f"TP={self.prefill_tp} · DP={self.prefill_dp} · EP={self.prefill_ep}"
+        return f"TP={self.decode_tp} · DP={self.decode_dp} · EP={self.decode_ep}"
+
+
+def _module_class(name: str) -> str:
+    lname = str(name or "").lower()
+    if "attention" in lname:
+        return "attention"
+    if "moe" in lname or "expert" in lname:
+        return "moe"
+    return "other"
+
+
+def _stage_flops(module_totals: Dict[str, Dict[str, float]], stage_key: str) -> Tuple[float, float, float]:
+    attn = 0.0
+    moe = 0.0
+    other = 0.0
+    for module, stats in module_totals.items():
+        flops = float(stats.get(stage_key, 0.0) or 0.0)
+        if flops <= 0:
+            continue
+        kind = _module_class(module)
+        if kind == "attention":
+            attn += flops
+        elif kind == "moe":
+            moe += flops
+        else:
+            other += flops
+    return attn, moe, other
+
+
+def _apply_parallel_to_flops(
+    total_flops: float,
+    module_totals: Dict[str, Dict[str, float]],
+    *,
+    stage: str,
+    parallel_cfg: _ParallelConfig,
+) -> float:
+    stage_key = "flops_prefill" if stage == "prefill" else "flops_decode"
+    attn, moe, other_listed = _stage_flops(module_totals, stage_key)
+    other = max(0.0, float(total_flops) - attn - moe)
+    if other_listed > 0:
+        other = max(other, other_listed)
+    if stage == "prefill":
+        tp = max(1, int(parallel_cfg.prefill_tp))
+        ep = max(1, int(parallel_cfg.prefill_ep))
+    else:
+        tp = max(1, int(parallel_cfg.decode_tp))
+        ep = max(1, int(parallel_cfg.decode_ep))
+    attn_eff = attn / tp if attn > 0 else 0.0
+    moe_eff = moe / ep if moe > 0 else 0.0
+    return float(attn_eff + moe_eff + other)
+
+
+def _prefill_decode_adjusted_flops(
+    profile: ModelProfile,
+    module_totals: Dict[str, Dict[str, float]],
+    parallel_cfg: _ParallelConfig,
+) -> Tuple[float, float]:
+    flops_prefill = float(profile.prefill_totals.get("total", 0.0))
+    flops_decode = float(profile.decode_totals.get("total", 0.0))
+    adj_prefill = _apply_parallel_to_flops(
+        flops_prefill,
+        module_totals,
+        stage="prefill",
+        parallel_cfg=parallel_cfg,
+    )
+    adj_decode = _apply_parallel_to_flops(
+        flops_decode,
+        module_totals,
+        stage="decode",
+        parallel_cfg=parallel_cfg,
+    )
+    return adj_prefill, adj_decode
+
+
+def _pd_memory_traffic(
+    profile: ModelProfile,
+    *,
+    input_tokens: int,
+    kv_len_decode: int,
+    kv_cache_hit: float,
+    tp_prefill: int,
+    tp_decode: int,
+) -> MemoryTraffic:
+    hit = max(0.0, min(1.0, float(kv_cache_hit)))
+    weight_bytes = int(profile.weights_total_bytes)
+    activation_bytes = int(profile.activation_bytes(seq_len=int(input_tokens)))
+    base_kv_prefill = profile.kv_write_bytes(tokens=int(input_tokens), tp=int(tp_prefill))
+    kv_prefill_bytes = int(base_kv_prefill * (2.0 if hit < 1.0 else 1.0))
+    base_kv_decode = profile.kv_decode_bytes(tp=int(tp_decode), kv_len=int(kv_len_decode))
+    kv_decode_bytes = int(base_kv_decode * (1.0 - hit))
+    return MemoryTraffic(
+        weight_bytes=weight_bytes,
+        activation_bytes=activation_bytes,
+        kv_prefill_bytes=kv_prefill_bytes,
+        kv_decode_bytes=kv_decode_bytes,
+    )
+
+
+def _plot_concurrency_vs_parallel(df: pd.DataFrame) -> go.Figure:
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.update_layout(title="Concurrency vs TTFT/TPOT (mean)")
+        return fig
+    data = df.dropna(subset=["concurrent", "TTFT_ms", "TPOT_ms", "TP", "DP", "EP"]).copy()
+    if data.empty:
+        fig = go.Figure()
+        fig.update_layout(title="Concurrency vs TTFT/TPOT (mean)")
+        return fig
+    data["parallel_key"] = data.apply(
+        lambda r: f"TP={int(r['TP'])}·DP={int(r['DP'])}·EP={int(r['EP'])}", axis=1
+    )
+    grouped = (
+        data.groupby(["parallel_key", "concurrent"], as_index=False)
+        .agg({"TTFT_ms": "mean", "TPOT_ms": "mean"})
+        .sort_values(["parallel_key", "concurrent"])
+    )
+    fig = go.Figure()
+    for key, sub in grouped.groupby("parallel_key"):
+        fig.add_trace(
+            go.Scatter(
+                x=sub["concurrent"],
+                y=sub["TTFT_ms"],
+                mode="lines+markers",
+                name=f"{key} · TTFT",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=sub["concurrent"],
+                y=sub["TPOT_ms"],
+                mode="lines+markers",
+                name=f"{key} · TPOT",
+                yaxis="y2",
+                line=dict(dash="dot"),
+            )
+        )
+    fig.update_layout(
+        title="Concurrency vs TTFT/TPOT (mean)",
+        xaxis_title="Effective concurrency (B×DP)",
+        yaxis=dict(title="TTFT (ms)"),
+        yaxis2=dict(title="TPOT (ms/token)", overlaying="y", side="right"),
+        legend=dict(orientation="h"),
+    )
+    return fig
+
+
+def _parse_seq_list(value: str) -> List[int]:
+    tokens: List[int] = []
+    for part in value.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            num = int(part)
+        except ValueError:
+            continue
+        if num > 0:
+            tokens.append(num)
+    return sorted(set(tokens))
+
+
+def _plot_seq_sweep(df: pd.DataFrame) -> go.Figure:
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.update_layout(title="Seq-length Sweep · TTFT/TPOT")
+        return fig
+    fig = go.Figure()
+    for output_len, sub in df.groupby("output_tokens"):
+        ordered = sub.sort_values("input_tokens")
+        fig.add_trace(
+            go.Scatter(
+                x=ordered["input_tokens"],
+                y=ordered["ttft_ms"],
+                mode="lines+markers",
+                name=f"TTFT · out={output_len}",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=ordered["input_tokens"],
+                y=ordered["tpot_ms"],
+                mode="lines+markers",
+                name=f"TPOT · out={output_len}",
+                yaxis="y2",
+                line=dict(dash="dot"),
+            )
+        )
+    mean_df = (
+        df.groupby("input_tokens", as_index=False)[["ttft_ms", "tpot_ms"]].mean()
+        if "input_tokens" in df.columns
+        else None
+    )
+    if mean_df is not None and not mean_df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=mean_df["input_tokens"],
+                y=mean_df["ttft_ms"],
+                mode="lines",
+                name="TTFT · mean",
+                line=dict(color="black", width=3),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=mean_df["input_tokens"],
+                y=mean_df["tpot_ms"],
+                mode="lines",
+                name="TPOT · mean",
+                yaxis="y2",
+                line=dict(color="black", width=3, dash="dash"),
+            )
+        )
+    fig.update_layout(
+        title="Seq-length Sweep · TTFT/TPOT",
+        xaxis_title="Input tokens",
+        yaxis=dict(title="TTFT (ms)"),
+        yaxis2=dict(title="TPOT (ms/token)", overlaying="y", side="right"),
+        legend=dict(orientation="h"),
+    )
+    return fig
+
+
+def _run_seq_sweep(
+    model: Any,
+    *,
+    chip: ChipSpec,
+    search_cfg: _SearchConfig,
+    parallel_cfg: _ParallelConfig,
+    input_lengths: Iterable[int],
+    output_lengths: Iterable[int],
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    cache: Dict[Tuple[int, int], ModelProfile] = {}
+
+    def profile_for_lengths(seq_in: int, kv_len: int) -> ModelProfile:
+        key = (int(seq_in), int(kv_len))
+        if key not in cache:
+            cache[key] = ModelProfile(
+                model,
+                weight_dtype_bytes=search_cfg.dtype_bytes,
+                kv_dtype_bytes=search_cfg.dtype_bytes,
+                seq_len_in=int(seq_in),
+                kv_len_in=int(kv_len),
+                include_scores=True,
+                top_k=None,
+            )
+        return cache[key]
+
+    eff_compute = effective_compute_tflops(float(chip.tflops), float(chip.mfu))
+    hbm_eff_adj = search_cfg.chunked_prefill.adjust_hbm_efficiency(float(search_cfg.hbm_eff))
+
+    for input_len in input_lengths:
+        for output_len in output_lengths:
+            if input_len <= 0 or output_len < 0:
+                continue
+            kv_len = max(1, int(input_len + output_len))
+            profile = profile_for_lengths(int(input_len), int(kv_len))
+            module_totals = profile.module_totals()
+            adj_prefill, adj_decode = _prefill_decode_adjusted_flops(
+                profile, module_totals, parallel_cfg
+            )
+            memory = _pd_memory_traffic(
+                profile,
+                input_tokens=int(input_len),
+                kv_len_decode=int(kv_len),
+                kv_cache_hit=float(search_cfg.kv_cache_hit),
+                tp_prefill=int(parallel_cfg.prefill_tp),
+                tp_decode=int(parallel_cfg.decode_tp),
+            )
+            times = prefill_decode_time_breakdown(
+                flops_prefill=float(adj_prefill),
+                flops_decode=float(adj_decode),
+                effective_tflops=float(eff_compute),
+                memory=memory,
+                hbm_bw_GBs=float(chip.hbm_bw_GBs),
+                hbm_eff=float(hbm_eff_adj),
+            )
+            conc_adjusted = concurrency_adjusted_times(
+                times,
+                concurrency=float(search_cfg.concurrency),
+                alpha=float(search_cfg.alpha_conc),
+            )
+            spec_speed = max(1.0, float(search_cfg.spec_speedup))
+            tpot_spec = float(conc_adjusted.tpot_eff_ms) / spec_speed
+            throughput = (
+                float(search_cfg.concurrency) * 1000.0 / tpot_spec if tpot_spec > 0 else 0.0
+            )
+            rows.append(
+                {
+                    "input_tokens": int(input_len),
+                    "output_tokens": int(output_len),
+                    "kv_len": kv_len,
+                    "ttft_ms": float(conc_adjusted.ttft_eff_ms),
+                    "tpot_ms": tpot_spec,
+                    "throughput_tps": throughput,
+                    "prefill_parallel": parallel_cfg.stage_signature("prefill"),
+                    "decode_parallel": parallel_cfg.stage_signature("decode"),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 @dataclass(frozen=True)
@@ -157,6 +474,58 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         alpha_conc = c17.slider("并发平滑系数 α", 1.0, 3.0, 1.7, 0.1)
         spec_speedup = c18.slider("Speculative 解码加速", 1.0, 3.0, 1.3, 0.1)
 
+    with st.expander("Prefill / Decode 并行配置", expanded=True):
+        cpa, cpb, cpc = st.columns(3)
+        prefill_tp = cpa.number_input(
+            "Prefill TP",
+            1,
+            8192,
+            int(session_state.get("pd_prefill_tp", 8)),
+            1,
+            key="pd_prefill_tp",
+        )
+        prefill_dp = cpb.number_input(
+            "Prefill DP",
+            1,
+            8192,
+            int(session_state.get("pd_prefill_dp", 8)),
+            1,
+            key="pd_prefill_dp",
+        )
+        prefill_ep = cpc.number_input(
+            "Prefill EP",
+            1,
+            8192,
+            int(session_state.get("pd_prefill_ep", max(1, H))),
+            1,
+            key="pd_prefill_ep",
+        )
+        cpd, cpe, cpf = st.columns(3)
+        decode_tp = cpd.number_input(
+            "Decode TP",
+            1,
+            8192,
+            int(session_state.get("pd_decode_tp", 4)),
+            1,
+            key="pd_decode_tp",
+        )
+        decode_dp = cpe.number_input(
+            "Decode DP",
+            1,
+            8192,
+            int(session_state.get("pd_decode_dp", 16)),
+            1,
+            key="pd_decode_dp",
+        )
+        decode_ep = cpf.number_input(
+            "Decode EP",
+            1,
+            8192,
+            int(session_state.get("pd_decode_ep", max(1, H))),
+            1,
+            key="pd_decode_ep",
+        )
+
     do_search = st.button(
         "开始搜索",
         type="primary",
@@ -180,6 +549,16 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         spec_speedup=float(spec_speedup),
         causal_mask=bool(causal_mask),
         attn_impl=str(attn_impl),
+        hbm_eff=float(hbm_eff),
+    )
+
+    parallel_cfg = _ParallelConfig(
+        prefill_tp=int(prefill_tp),
+        prefill_dp=int(prefill_dp),
+        prefill_ep=int(prefill_ep),
+        decode_tp=int(decode_tp),
+        decode_dp=int(decode_dp),
+        decode_ep=int(decode_ep),
     )
 
     refresh_token_key = "refresh_token_pd_disagg"
@@ -230,6 +609,10 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         top_k=None,
     )
     comp_df = profile.component_dataframe()
+    module_totals = profile.module_totals()
+    adj_prefill_flops, adj_decode_flops = _prefill_decode_adjusted_flops(
+        profile, module_totals, parallel_cfg
+    )
 
     st.subheader("方案对比表")
     st.dataframe(df, use_container_width=True)
@@ -247,20 +630,21 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
     tp_eff = int(best_row.get("TP", 1))
 
-    memory = kv_cache_memory_traffic(
+    memory = _pd_memory_traffic(
         profile,
         input_tokens=int(search_cfg.avg_input),
         kv_len_decode=int(search_cfg.seq_len_kv),
         kv_cache_hit=float(search_cfg.kv_cache_hit),
-        tp=int(tp_eff),
+        tp_prefill=int(parallel_cfg.prefill_tp or tp_eff),
+        tp_decode=int(parallel_cfg.decode_tp or tp_eff),
     )
 
     eff_compute = effective_compute_tflops(float(tflops), float(mfu))
-    hbm_eff_adj = search_cfg.chunked_prefill.adjust_hbm_efficiency(float(hbm_eff))
+    hbm_eff_adj = search_cfg.chunked_prefill.adjust_hbm_efficiency(float(search_cfg.hbm_eff))
 
     times = prefill_decode_time_breakdown(
-        flops_prefill=float(profile.prefill_totals.get("total", 0.0)),
-        flops_decode=float(profile.decode_totals.get("total", 0.0)),
+        flops_prefill=float(adj_prefill_flops),
+        flops_decode=float(adj_decode_flops),
         effective_tflops=float(eff_compute),
         memory=memory,
         hbm_bw_GBs=float(hbm_bw),
@@ -290,6 +674,9 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     c19, c20 = st.columns(2)
     c19.metric("Effective TFLOPs", f"{eff_compute:.1f}")
     c20.metric("Concurrency-adjusted TTFT", f"{conc_times.ttft_ms:.1f} ms")
+    st.caption(
+        f"Prefill 并行: {parallel_cfg.stage_signature('prefill')} · Decode 并行: {parallel_cfg.stage_signature('decode')}"
+    )
 
     st.subheader("TTFT vs. Batch per GPU")
     fig_ttft = plot_metric_vs_batch(df, metric="ttft_ms")
@@ -298,6 +685,10 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     st.subheader("TPOT vs. Batch per GPU")
     fig_tpot = plot_metric_vs_batch(df, metric="tpot_ms")
     st.plotly_chart(fig_tpot, use_container_width=True)
+
+    st.subheader("Concurrency vs Mean TTFT / TPOT")
+    conc_fig = _plot_concurrency_vs_parallel(df)
+    st.plotly_chart(conc_fig, use_container_width=True)
 
     st.subheader("Prefill/Decode Breakdown")
     breakdown_df = pd.DataFrame(
@@ -322,6 +713,49 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     st.markdown(
         f"TTFT: {conc_times.ttft_ms:.2f} ms · TPOT: {conc_times.tpot_ms:.3f} ms/token · Throughput: {conc_times.throughput_tps:.2f} tok/s"
     )
+
+    with st.expander("Seq-length Sweep (固定并行)", expanded=False):
+        cc1, cc2 = st.columns(2)
+        seq_inputs_txt = cc1.text_input(
+            "输入长度列表 (tokens)",
+            value=session_state.get("pd_seq_inputs", "512,1024,2048"),
+            key="pd_seq_inputs",
+        )
+        seq_outputs_txt = cc2.text_input(
+            "输出长度列表 (tokens)",
+            value=session_state.get("pd_seq_outputs", "128,256"),
+            key="pd_seq_outputs",
+        )
+        run_seq_sweep = st.button(
+            "运行序列长度扫描",
+            key="pd_run_seq_sweep",
+            use_container_width=True,
+        )
+        sweep_key = "pd_seq_sweep_df"
+        if run_seq_sweep:
+            seq_inputs = _parse_seq_list(seq_inputs_txt)
+            seq_outputs = _parse_seq_list(seq_outputs_txt)
+            if not seq_inputs or not seq_outputs:
+                st.warning("请输入合法的输入/输出长度列表 (逗号分隔的正整数)。")
+            else:
+                sweep_df = _run_seq_sweep(
+                    model,
+                    chip=search_cfg.chip,
+                    search_cfg=search_cfg,
+                    parallel_cfg=parallel_cfg,
+                    input_lengths=seq_inputs,
+                    output_lengths=seq_outputs,
+                )
+                session_state[sweep_key] = sweep_df
+        sweep_df = session_state.get(sweep_key)
+        if sweep_df is not None and not sweep_df.empty:
+            st.markdown("**Seq-length 扫描结果表** (按 input/output 组合的 mean TTFT/TPOT)")
+            st.dataframe(sweep_df, use_container_width=True)
+            mean_table = sweep_df.groupby("input_tokens", as_index=False)[["ttft_ms", "tpot_ms"]].mean()
+            st.markdown("**输入长度维度的均值**")
+            st.dataframe(mean_table, use_container_width=True)
+            sweep_fig = _plot_seq_sweep(sweep_df)
+            st.plotly_chart(sweep_fig, use_container_width=True)
 
 
 def main() -> None:
