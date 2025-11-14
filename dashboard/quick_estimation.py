@@ -23,6 +23,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     st = state.st
     session_state = state.session_state
     model = state.model
+    is_moe = bool(getattr(model, "is_moe_enabled", lambda: False)())
 
     st.markdown("### Quick runtime estimate — local hardware only")
     with st.container():
@@ -79,21 +80,70 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         format_func=lambda x: f"{int(x * 100)}%",
     )
 
-    cc1, cc2, cc3, cc4 = st.columns(4)
-    tp_run = cc1.number_input(
-        "TP",
-        1,
-        4096,
-        int(session_state.get("inspect_tp", 8)),
-        1,
+    cc1, cc2 = st.columns(2)
+    separate_pd = bool(
+        cc1.checkbox(
+            "Prefill / Decode use different TP·DP·EP",
+            value=False,
+            help="勾选后可为 Prefill 与 Decode 设置独立的并行度。",
+        )
     )
-    dp_run = cc2.number_input(
-        "DP",
-        1,
-        4096,
-        int(session_state.get("inspect_dp", 8)),
-        1,
+    link_ep_to_tpdp = bool(
+        cc2.checkbox(
+            "Auto-set EP = TP × DP when MoE disabled",
+            value=True,
+            help="若未启用 MoE，默认按 TP×DP 估算 EP 规模。",
+        )
     )
+
+    def _parallel_inputs(prefix: str, defaults: dict[str, int | None]) -> tuple[int, int, int]:
+        col_tp, col_dp, col_ep = st.columns(3)
+        tp_default = defaults.get("tp")
+        if tp_default is None:
+            tp_default = int(session_state.get("inspect_tp", 8))
+        tp_val = col_tp.number_input(
+            f"{prefix} TP",
+            1,
+            4096,
+            max(1, int(tp_default)),
+            1,
+        )
+        dp_default = defaults.get("dp")
+        if dp_default is None:
+            dp_default = int(session_state.get("inspect_dp", 8))
+        dp_val = col_dp.number_input(
+            f"{prefix} DP",
+            1,
+            4096,
+            max(1, int(dp_default)),
+            1,
+        )
+        ep_default = defaults.get("ep")
+        if ep_default is None:
+            ep_default = int(session_state.get("inspect_ep", int(tp_default) * int(dp_default)))
+        if link_ep_to_tpdp and not is_moe:
+            ep_default = int(tp_val) * int(dp_val)
+        ep_val = col_ep.number_input(
+            f"{prefix} EP",
+            1,
+            4096,
+            max(1, ep_default),
+            1,
+        )
+        return int(tp_val), int(dp_val), int(ep_val)
+
+    if separate_pd:
+        st.markdown("**Prefill parallelism**")
+        tp_prefill, dp_prefill, ep_prefill = _parallel_inputs("Prefill", {"tp": None, "dp": None, "ep": None})
+        st.markdown("**Decode parallelism**")
+        tp_decode, dp_decode, ep_decode = _parallel_inputs("Decode", {"tp": None, "dp": None, "ep": None})
+    else:
+        tp_shared, dp_shared, ep_shared = _parallel_inputs("Shared", {"tp": None, "dp": None, "ep": None})
+        tp_prefill = tp_decode = int(tp_shared)
+        dp_prefill = dp_decode = int(dp_shared)
+        ep_prefill = ep_decode = int(ep_shared)
+
+    cc3, cc4 = st.columns(2)
     seq_len_run = cc3.number_input(
         "Sequence length (prefill)",
         1,
@@ -134,11 +184,15 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
     layers = int(getattr(model, "num_hidden_layers", 0) or 0)
     hidden_size = int(getattr(model, "hidden_size", 0) or 0)
-    tp = int(tp_run)
-    dp = int(dp_run)
-    total_devices = tp * dp
+    tp_prefill = max(1, int(tp_prefill))
+    dp_prefill = max(1, int(dp_prefill))
+    ep_prefill = max(1, int(ep_prefill))
+    tp_decode = max(1, int(tp_decode))
+    dp_decode = max(1, int(dp_decode))
+    ep_decode = max(1, int(ep_decode))
+    total_devices_prefill = tp_prefill * dp_prefill * ep_prefill
+    total_devices_decode = tp_decode * dp_decode * ep_decode
     batch = max(1, int(batch_per_gpu))
-    is_moe = bool(getattr(model, "is_moe_enabled", lambda: False)())
     experts_per_tok = int(getattr(getattr(model, "cfg", {}), "get", lambda k, d=None: d)("num_experts_per_tok", 0) or 0)
     weight_dtype_b = int(session_state.get("weight_bytes", 2))
     kv_dtype_b = int(session_state.get("kv_bytes", 2))
@@ -163,15 +217,15 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
     flops_prefill_per_layer = float(sum(row.get("FLOPs_per_layer", 0.0) for row in rows_prefill))
     flops_decode_per_layer = float(sum(row.get("FLOPs_per_layer", 0.0) for row in rows_decode))
-    flops_prefill_total = flops_prefill_per_layer * layers
-    flops_decode_total = flops_decode_per_layer * layers
+    flops_prefill_total = flops_prefill_per_layer * layers / max(1, tp_prefill)
+    flops_decode_total = flops_decode_per_layer * layers / max(1, tp_decode)
 
     weight_totals = model.weights_totals(weight_dtype_bytes=weight_dtype_b)
     weights_total_bytes = int(weight_totals.get("bytes_total", 0))
 
     per_tok_kv_layer_bytes = actions.per_token_kv_bytes_per_layer_per_gpu(
         model,
-        tp=tp,
+        tp=tp_prefill,
         dtype_bytes=kv_dtype_b,
     )
     kv_layers = int(getattr(model, "num_hidden_layers", 0) or layers)
@@ -179,49 +233,59 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     tokens_prefill_per_device = batch * int(seq_len_run)
     hbm_bytes_prefill_weights = weights_total_bytes
     hbm_bytes_prefill_kv_write = int(per_tok_kv_layer_bytes) * kv_layers * tokens_prefill_per_device
-    hbm_bytes_prefill_total = hbm_bytes_prefill_weights + hbm_bytes_prefill_kv_write
+    hbm_bytes_prefill_result = int(tokens_prefill_per_device * hidden_size * kv_dtype_b)
+    hbm_bytes_prefill_total = hbm_bytes_prefill_weights + hbm_bytes_prefill_kv_write + hbm_bytes_prefill_result
 
-    hbm_bytes_per_token = actions.per_token_decode_hbm_bytes_per_layer_per_gpu(
+    per_token_decode_kv = actions.per_token_decode_hbm_bytes_per_layer_per_gpu(
         model,
-        tp=tp,
+        tp=tp_decode,
         kv_len=kv_len_for_decode,
         dtype_bytes=kv_dtype_b,
     ) * kv_layers
 
+    hbm_bytes_per_token = per_token_decode_kv
     if include_weight_read_in_decode_hbm_local:
         hbm_bytes_per_token += weights_total_bytes
+    hbm_bytes_decode_result = int(hidden_size * kv_dtype_b)
+    hbm_bytes_per_token += hbm_bytes_decode_result
 
     tp_bytes_prefill = (
-        int(2 * (max(1, tp) - 1) / max(1, tp) * (batch * int(seq_len_run)) * hidden_size * weight_dtype_b) * 2 * layers
-        if tp > 1
+        int(2 * (max(1, tp_prefill) - 1) / max(1, tp_prefill) * (batch * int(seq_len_run)) * hidden_size * weight_dtype_b)
+        * 2
+        * layers
+        if tp_prefill > 1
         else 0
     )
     ep_bytes_prefill = (
-        int(2 * (batch * int(seq_len_run)) * hidden_size * experts_per_tok * (1 - 1 / max(1, total_devices)) * weight_dtype_b)
+        int(
+            2
+            * (batch * int(seq_len_run))
+            * hidden_size
+            * experts_per_tok
+            * (1 - 1 / max(1, total_devices_prefill))
+            * weight_dtype_b
+        )
         * layers
-        if (is_moe and experts_per_tok > 0 and total_devices > 1)
+        if (is_moe and experts_per_tok > 0 and total_devices_prefill > 1)
         else 0
     )
     tp_bytes_decode = (
-        int(2 * (max(1, tp) - 1) / max(1, tp) * hidden_size * weight_dtype_b) * 2 * layers
-        if tp > 1
+        int(2 * (max(1, tp_decode) - 1) / max(1, tp_decode) * hidden_size * weight_dtype_b) * 2 * layers
+        if tp_decode > 1
         else 0
     )
     ep_bytes_decode = (
-        int(2 * hidden_size * experts_per_tok * (1 - 1 / max(1, total_devices)) * weight_dtype_b) * layers
-        if (is_moe and experts_per_tok > 0 and total_devices > 1)
+        int(
+            2
+            * hidden_size
+            * experts_per_tok
+            * (1 - 1 / max(1, total_devices_decode))
+            * weight_dtype_b
+        )
+        * layers
+        if (is_moe and experts_per_tok > 0 and total_devices_decode > 1)
         else 0
     )
-
-    per_token_decode_hbm = actions.per_token_decode_hbm_bytes_per_layer_per_gpu(
-        model,
-        tp=tp,
-        kv_len=kv_len_for_decode,
-        dtype_bytes=kv_dtype_b,
-    ) * layers
-
-    if include_weight_read_in_decode_hbm_local:
-        per_token_decode_hbm += weights_total_bytes
 
     def human_flops(value: float) -> str:
         if value is None:
@@ -238,21 +302,39 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     estimate_rows = [
         {
             "Phase": "Prefill",
+            "Unit": "Per pass / device",
+            "TP": tp_prefill,
+            "DP": dp_prefill,
+            "EP": ep_prefill,
+            "Devices": total_devices_prefill,
             "B_per_gpu": batch,
-            "Concurrency": batch * dp * int(grad_accum),
+            "Concurrency": batch * dp_prefill * int(grad_accum),
             "TP_bytes_net": tp_bytes_prefill,
             "EP_bytes_net": ep_bytes_prefill,
             "FLOPs_per_layer": flops_prefill_per_layer,
             "FLOPs_total": flops_prefill_total,
+            "HBM_weight_bytes": hbm_bytes_prefill_weights,
+            "HBM_kv_bytes": hbm_bytes_prefill_kv_write,
+            "HBM_result_bytes": hbm_bytes_prefill_result,
+            "HBM_total_bytes": hbm_bytes_prefill_total,
         },
         {
             "Phase": "Decode",
+            "Unit": "Per token / device",
+            "TP": tp_decode,
+            "DP": dp_decode,
+            "EP": ep_decode,
+            "Devices": total_devices_decode,
             "B_per_gpu": 1,
-            "Concurrency": dp * int(grad_accum),
+            "Concurrency": dp_decode * int(grad_accum),
             "TP_bytes_net": tp_bytes_decode,
             "EP_bytes_net": ep_bytes_decode,
             "FLOPs_per_layer": flops_decode_per_layer,
             "FLOPs_total": flops_decode_total,
+            "HBM_weight_bytes": weights_total_bytes if include_weight_read_in_decode_hbm_local else 0,
+            "HBM_kv_bytes": per_token_decode_kv,
+            "HBM_result_bytes": hbm_bytes_decode_result,
+            "HBM_total_bytes": hbm_bytes_per_token,
         },
     ]
 
@@ -263,31 +345,51 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     df_display["FLOPs_per_layer (per_device)"] = df_display["FLOPs_per_layer"].apply(human_flops)
     df_display["FLOPs_total_per_device"] = df_display["FLOPs_total"].apply(human_flops)
 
-    cluster_devices = max(1, tp * dp)
-    df_display["TP_bytes_cluster"] = df_est["TP_bytes_net"].apply(lambda x: actions.human_bytes(int(x * cluster_devices)))
-    df_display["EP_bytes_cluster"] = df_est["EP_bytes_net"].apply(lambda x: actions.human_bytes(int(x * cluster_devices)))
-    df_display["FLOPs_total_cluster"] = df_est["FLOPs_total"].apply(lambda x: human_flops(x * cluster_devices))
+    df_display["Weight_bytes_per_device"] = df_display["HBM_weight_bytes"].apply(lambda x: actions.human_bytes(int(x)))
+    df_display["KV_bytes_per_device"] = df_display["HBM_kv_bytes"].apply(lambda x: actions.human_bytes(int(x)))
+    df_display["Result_bytes_per_device"] = df_display["HBM_result_bytes"].apply(lambda x: actions.human_bytes(int(x)))
+    df_display["HBM_total_per_device"] = df_display["HBM_total_bytes"].apply(lambda x: actions.human_bytes(int(x)))
 
-    hbm_list_device = ["-", actions.human_bytes(int(per_token_decode_hbm))]
-    hbm_list_cluster = ["-", actions.human_bytes(int(per_token_decode_hbm * cluster_devices))]
-    df_display["HBM_per_token_per_device"] = hbm_list_device[: len(df_display)]
-    df_display["HBM_per_token_cluster"] = hbm_list_cluster[: len(df_display)]
+    df_display["TP_bytes_per_device"] = df_display["TP_bytes_net"].apply(lambda x: actions.human_bytes(int(x)))
+    df_display["EP_bytes_per_device (All2All)"] = df_display["EP_bytes_net"].apply(lambda x: actions.human_bytes(int(x)))
+
+    df_display["TP_bytes_cluster"] = df_est.apply(
+        lambda row: actions.human_bytes(int(row["TP_bytes_net"] * max(1, row["Devices"]))), axis=1
+    )
+    df_display["EP_bytes_cluster"] = df_est.apply(
+        lambda row: actions.human_bytes(int(row["EP_bytes_net"] * max(1, row["Devices"]))), axis=1
+    )
+    df_display["HBM_total_cluster"] = df_est.apply(
+        lambda row: actions.human_bytes(int(row["HBM_total_bytes"] * max(1, row["Devices"]))), axis=1
+    )
+    df_display["FLOPs_total_cluster"] = df_est.apply(
+        lambda row: human_flops(row["FLOPs_total"] * max(1, row["Devices"])) if row["Devices"] else human_flops(0),
+        axis=1,
+    )
 
     st.dataframe(
         df_display[
             [
                 "Phase",
+                "Unit",
+                "TP",
+                "DP",
+                "EP",
+                "Devices",
                 "B_per_gpu",
                 "Concurrency",
                 "FLOPs_per_layer (per_device)",
                 "FLOPs_total_per_device",
                 "FLOPs_total_cluster",
+                "Weight_bytes_per_device",
+                "KV_bytes_per_device",
+                "Result_bytes_per_device",
+                "HBM_total_per_device",
+                "HBM_total_cluster",
                 "TP_bytes_per_device",
                 "TP_bytes_cluster",
-                "EP_bytes_per_device",
+                "EP_bytes_per_device (All2All)",
                 "EP_bytes_cluster",
-                "HBM_per_token_per_device",
-                "HBM_per_token_cluster",
             ]
         ],
         use_container_width=True,
@@ -306,26 +408,37 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
     t_comp_p = t_from_flops_ms(flops_prefill_total, tensor_core_peak_local, mfu_local)
     t_comp_d = t_from_flops_ms(flops_decode_total, tensor_core_peak_local, mfu_local)
-    t_net_p = t_from_bytes_ms(bytes_net_prefill, net_bw_local, 0.0)
-    t_net_d = t_from_bytes_ms(bytes_net_decode, net_bw_local, 0.0)
-    t_hbm_p = actions.bytes_to_time_ms(int(hbm_bytes_prefill_total), float(hbm_bw_local))
-    t_hbm_d = actions.bytes_to_time_ms(int(per_token_decode_hbm), float(hbm_bw_local))
+    t_tp_prefill = t_from_bytes_ms(tp_bytes_prefill, net_bw_local)
+    t_ep_prefill = t_from_bytes_ms(ep_bytes_prefill, net_bw_local)
+    t_tp_decode = t_from_bytes_ms(tp_bytes_decode, net_bw_local)
+    t_ep_decode = t_from_bytes_ms(ep_bytes_decode, net_bw_local)
+    t_weight_prefill = actions.bytes_to_time_ms(int(hbm_bytes_prefill_weights), float(hbm_bw_local))
+    t_kv_prefill = actions.bytes_to_time_ms(int(hbm_bytes_prefill_kv_write), float(hbm_bw_local))
+    t_result_prefill = actions.bytes_to_time_ms(int(hbm_bytes_prefill_result), float(hbm_bw_local))
+    t_weight_decode = actions.bytes_to_time_ms(
+        int(weights_total_bytes if include_weight_read_in_decode_hbm_local else 0), float(hbm_bw_local)
+    )
+    t_kv_decode = actions.bytes_to_time_ms(int(per_token_decode_kv), float(hbm_bw_local))
+    t_result_decode = actions.bytes_to_time_ms(int(hbm_bytes_decode_result), float(hbm_bw_local))
 
     def plot_timeline(title: str, comps_dict: dict[str, float], overlaps: list[float]):
         import plotly.graph_objects as go
 
-        labels = list(comps_dict.keys())
-        times = [float(comps_dict[k]) for k in labels]
+        filtered = {k: float(v) for k, v in comps_dict.items() if float(v) > 0}
+        labels = list(filtered.keys())
+        times = [float(filtered[k]) for k in labels]
         fig = go.Figure()
         cumulative = 0.0
         colors = {
             "Compute": "#64B5F6",
-            "Network": "#81C784",
-            "HBM": "#FFB74D",
-            "HBM (weights+KV)": "#FF8A65",
+            "TP collectives": "#81C784",
+            "EP all2all": "#388E3C",
+            "Weight load": "#FFB74D",
+            "KV cache": "#FF8A65",
+            "Result write": "#9575CD",
         }
         for key in labels:
-            value = float(comps_dict[key])
+            value = float(filtered[key])
             fig.add_trace(
                 go.Bar(
                     x=[value],
@@ -373,7 +486,14 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     st.plotly_chart(
         plot_timeline(
             "Prefill timeline (per device)",
-            {"Compute": t_comp_p, "Network": t_net_p, "HBM (weights+KV)": t_hbm_p},
+            {
+                "Compute": t_comp_p,
+                "TP collectives": t_tp_prefill,
+                "EP all2all": t_ep_prefill,
+                "Weight load": t_weight_prefill,
+                "KV cache": t_kv_prefill,
+                "Result write": t_result_prefill,
+            },
             timeline_overlaps,
         ),
         use_container_width=True,
@@ -381,7 +501,14 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     st.plotly_chart(
         plot_timeline(
             "Decode timeline per token (per device)",
-            {"Compute": t_comp_d, "Network": t_net_d, "HBM (weights+KV)": t_hbm_d},
+            {
+                "Compute": t_comp_d,
+                "TP collectives": t_tp_decode,
+                "EP all2all": t_ep_decode,
+                "Weight load": t_weight_decode,
+                "KV cache": t_kv_decode,
+                "Result write": t_result_decode,
+            },
             timeline_overlaps,
         ),
         use_container_width=True,
