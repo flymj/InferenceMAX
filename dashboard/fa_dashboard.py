@@ -155,17 +155,39 @@ def _segment_ranges(length: int, tile: int):
     return ranges
 
 
-def lower_tri_pairs(nq: int, nk: int) -> int:
-    """Return number of valid Q-K pairs for a lower-triangular (causal) mask."""
+def _causal_window_limits(window_left, window_right, nk):
+    if window_left is None:
+        window_left = nk
+    window_left = max(0, int(window_left))
+    window_right = max(0, int(window_right or 0))
+    return window_left, window_right
+
+
+def causal_valid_pairs(nq: int, nk: int, window_left=None, window_right=0) -> int:
+    """Return valid Q-K pairs for a causal mask with optional sliding window."""
 
     nq = max(0, int(nq))
     nk = max(0, int(nk))
     if nq == 0 or nk == 0:
         return 0
-    if nq <= nk:
-        return nq * (nq + 1) // 2
-    # First nk rows form a triangle, remainder are fully-populated rows.
-    return nk * (nk + 1) // 2 + (nq - nk) * nk
+
+    window_left, window_right = _causal_window_limits(window_left, window_right, nk)
+    prefix = max(0, nk - nq)
+    total = 0
+    last_key = nk - 1
+    for row in range(nq):
+        q_global = prefix + row
+        left = max(0, q_global - window_left)
+        right = min(last_key, q_global + window_right)
+        if right >= left:
+            total += right - left + 1
+    return total
+
+
+def lower_tri_pairs(nq: int, nk: int, window_left=None, window_right=0) -> int:
+    """Backward-compatible wrapper that counts valid pairs for causal masks."""
+
+    return causal_valid_pairs(nq, nk, window_left=window_left, window_right=window_right)
 
 
 MASK_NONE = "none"
@@ -176,7 +198,7 @@ _MASK_LABELS = {
 }
 
 
-def mask_usage_ratio(nq: int, nk: int, mask_type: str) -> float:
+def mask_usage_ratio(nq: int, nk: int, mask_type: str, window_left=None, window_right=0) -> float:
     """Return ratio of useful compute vs. dense compute under the mask."""
 
     total = max(0, int(nq)) * max(0, int(nk))
@@ -184,7 +206,7 @@ def mask_usage_ratio(nq: int, nk: int, mask_type: str) -> float:
         return 0.0
     if mask_type != MASK_CAUSAL_LT:
         return 1.0
-    valid = lower_tri_pairs(nq, nk)
+    valid = lower_tri_pairs(nq, nk, window_left=window_left, window_right=window_right)
     return min(1.0, valid / total) if valid > 0 else 0.0
 
 
@@ -195,6 +217,8 @@ def flops_attention_masked(
     d_v: int,
     mask_type: str,
     skip_masked_gemm: bool,
+    window_left=None,
+    window_right=0,
 ):
     """Return FLOPs accounting for masking strategy."""
 
@@ -226,7 +250,7 @@ def flops_attention_masked(
         }
 
     if mask_type == MASK_CAUSAL_LT:
-        valid_pairs = lower_tri_pairs(L_q, L_k)
+        valid_pairs = lower_tri_pairs(L_q, L_k, window_left=window_left, window_right=window_right)
         density = valid_pairs / total_pairs if total_pairs > 0 else 0.0
     else:
         valid_pairs = total_pairs
@@ -263,7 +287,16 @@ def flops_attention_masked(
     }
 
 
-def causal_tile_density_lower_triangle(i: int, j: int, M: int, N: int, L_q=None, L_k=None) -> float:
+def causal_tile_density_lower_triangle(
+    i: int,
+    j: int,
+    M: int,
+    N: int,
+    L_q=None,
+    L_k=None,
+    window_left=None,
+    window_right=0,
+) -> float:
     """Return fractional density of a tile under a causal lower-tri mask."""
 
     if M <= 0 or N <= 0:
@@ -275,31 +308,32 @@ def causal_tile_density_lower_triangle(i: int, j: int, M: int, N: int, L_q=None,
 
     q_min = i * M
     k_min = j * N
-    q_max = (i + 1) * M - 1
-    k_max = (j + 1) * N - 1
+    q_max = (i + 1) * M
+    k_max = (j + 1) * N
     if L_q is not None:
-        q_max = min(q_max, max(0, int(L_q)) - 1)
+        q_max = min(q_max, max(0, int(L_q)))
     if L_k is not None:
-        k_max = min(k_max, max(0, int(L_k)) - 1)
+        k_max = min(k_max, max(0, int(L_k)))
 
-    q_rows = q_max - q_min + 1
-    k_cols = k_max - k_min + 1
+    q_rows = q_max - q_min
+    k_cols = k_max - k_min
     if q_rows <= 0 or k_cols <= 0:
         return 0.0
 
-    # Tile fully above diagonal
-    if q_max < k_min:
-        return 0.0
-
-    # Tile fully below diagonal
-    if k_max <= q_min:
-        return 1.0
-
+    nk_val = max(1, int(L_k)) if L_k is not None else k_max
+    window_left, window_right = _causal_window_limits(window_left, window_right, nk_val)
+    prefix = max(0, nk_val - (int(L_q) if L_q is not None else q_max))
+    last_key = nk_val - 1
     valid = 0
-    for q in range(q_min, q_max + 1):
-        right = min(q, k_max)
-        if right >= k_min:
-            valid += right - k_min + 1
+    for q in range(q_min, q_max):
+        q_global = prefix + q
+        left = max(0, q_global - window_left)
+        right = min(last_key, q_global + window_right)
+        overlap_start = max(k_min, left)
+        overlap_end = min(k_max - 1, right)
+        if overlap_end >= overlap_start:
+            valid += overlap_end - overlap_start + 1
+
     tile_area = q_rows * k_cols
     if tile_area <= 0:
         return 0.0
@@ -317,6 +351,8 @@ def flops_tile_qk_pv_causal(
     skip_masked_gemm: bool,
     L_q: int = None,
     L_k: int = None,
+    window_left=None,
+    window_right=0,
 ):
     """Return per-tile FLOPs (hw/effective) under the given mask."""
 
@@ -337,7 +373,16 @@ def flops_tile_qk_pv_causal(
 
     density = 1.0
     if mask_type == MASK_CAUSAL_LT:
-        density = causal_tile_density_lower_triangle(i, j, M, N, L_q=L_q, L_k=L_k)
+        density = causal_tile_density_lower_triangle(
+            i,
+            j,
+            M,
+            N,
+            L_q=L_q,
+            L_k=L_k,
+            window_left=window_left,
+            window_right=window_right,
+        )
 
     q_min = i * M
     k_min = j * N
@@ -389,6 +434,8 @@ def estimate_mask_tile_execution_ratio(
     tile_N: int,
     mask_type: str,
     skip_masked_gemm: bool,
+    window_left=None,
+    window_right=0,
 ) -> float:
     """Return ratio of compute executed vs. dense compute for tiled masking."""
 
@@ -416,6 +463,8 @@ def estimate_mask_tile_execution_ratio(
                 skip_masked_gemm,
                 L_q=nq,
                 L_k=nk,
+                window_left=window_left,
+                window_right=window_right,
             )
             tile_area = tile_stats["tile_area"]
             if tile_area <= 0:
@@ -577,6 +626,8 @@ with col_p2:
             "custom_mask": ("custom_mask", int),
             "mask_type": ("mask_type", str),
             "skip_masked_gemm": ("skip_masked_gemm", int),
+            "window_size_left": ("window_left", int),
+            "window_size_right": ("window_right", int),
         }
         for k, (sk, caster) in mapping.items():
             if k in kv:
@@ -594,6 +645,8 @@ for k, v in {
     "d": 128, "dv": 128, "dropout": 0.0, "custom_mask": 0,
     "mask_type": MASK_NONE,
     "skip_masked_gemm": False,
+    "window_left": None,
+    "window_right": 0,
 }.items():
     st.session_state.setdefault(k, v)
 
@@ -629,14 +682,52 @@ st.session_state["mask_type"] = mask_type
 st.session_state["skip_masked_gemm"] = skip_masked_gemm
 custom_mask_enabled = mask_type != MASK_NONE
 st.session_state["custom_mask"] = int(custom_mask_enabled)
+if custom_mask_enabled:
+    default_win_left = st.session_state.get("window_left")
+    if default_win_left is None:
+        default_win_left = max(0, nk - 1)
+    default_win_right = st.session_state.get("window_right", 0)
+    win_col1, win_col2 = st.columns(2)
+    window_left = win_col1.number_input(
+        "Window size (left)",
+        min_value=0,
+        value=int(default_win_left),
+        help="How many past keys each query can attend to (tokens).",
+    )
+    window_right = win_col2.number_input(
+        "Window size (right)",
+        min_value=0,
+        value=int(default_win_right),
+        help="How many future keys each query can attend to (tokens).",
+    )
+    st.session_state["window_left"] = int(window_left)
+    st.session_state["window_right"] = int(window_right)
+else:
+    window_left = None
+    window_right = 0
+    st.session_state["window_left"] = None
+    st.session_state["window_right"] = 0
 
 # ----------------------- Core Model -----------------------
 bytes_per_el = 1 if dtype == "fp8" else 2
 
 total_pairs = max(0, nq * nk)
-mask_ratio = mask_usage_ratio(nq, nk, mask_type)
-mask_valid_pairs = lower_tri_pairs(nq, nk) if custom_mask_enabled else total_pairs
-mask_flops = flops_attention_masked(nq, nk, d, dv, mask_type, skip_masked_gemm)
+mask_ratio = mask_usage_ratio(nq, nk, mask_type, window_left=window_left, window_right=window_right)
+mask_valid_pairs = (
+    lower_tri_pairs(nq, nk, window_left=window_left, window_right=window_right)
+    if custom_mask_enabled
+    else total_pairs
+)
+mask_flops = flops_attention_masked(
+    nq,
+    nk,
+    d,
+    dv,
+    mask_type,
+    skip_masked_gemm,
+    window_left=window_left,
+    window_right=window_right,
+)
 mask_hw_ratio = mask_flops["hw_density"]
 
 def _scale_by_mask(value: float) -> float:
@@ -887,7 +978,14 @@ with col_gpu3:
 
 tile_b = DTYPE_BYTES.get(tile_dtype, 2)
 tile_mask_exec_ratio = estimate_mask_tile_execution_ratio(
-    nq, nk, tile_M, tile_N, mask_type, skip_masked_gemm
+    nq,
+    nk,
+    tile_M,
+    tile_N,
+    mask_type,
+    skip_masked_gemm,
+    window_left=window_left,
+    window_right=window_right,
 )
 mask_waste_factor = (
     (tile_mask_exec_ratio / mask_ratio)
@@ -986,7 +1084,14 @@ if custom_mask_enabled:
                 for j in range(k_tiles):
                     row.append(
                         causal_tile_density_lower_triangle(
-                            i, j, tile_M, tile_N, L_q=nq, L_k=nk
+                            i,
+                            j,
+                            tile_M,
+                            tile_N,
+                            L_q=nq,
+                            L_k=nk,
+                            window_left=window_left,
+                            window_right=window_right,
                         )
                         if mask_type == MASK_CAUSAL_LT
                         else 1.0
