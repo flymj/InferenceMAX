@@ -41,8 +41,16 @@ class LlamaModel(BaseModel):
         ]
         return rows
 
-    def flops_component_rows(self, mode: str, batch: int, seq_len: int, kv_len: int,
-                             include_scores: bool = True, top_k: int | None = None):
+    def flops_component_rows(
+        self,
+        mode: str,
+        batch: int,
+        seq_len: int,
+        kv_len: int,
+        include_scores: bool = True,
+        top_k: int | None = None,
+        ep_group: int | None = None,
+    ):
         D = self.hidden_size
         H, Hkv, hd = self.mha_dims()
         T = batch if mode == "decode" else batch * seq_len
@@ -74,4 +82,3 @@ class LlamaModel(BaseModel):
                          "Formula":"2·(tp-1)/tp · (tokens·D·dtype) × #collectives",
                          "Bytes_per_layer_per_device": tp_bytes})
         return rows
-

@@ -177,8 +177,16 @@ class QwenModel(BaseModel):
         return rows
 
     # ============================ FLOPs 统计 ============================
-    def flops_component_rows(self, mode: str, batch: int, seq_len: int, kv_len: int,
-                             include_scores: bool = True, top_k: int | None = None):
+    def flops_component_rows(
+        self,
+        mode: str,
+        batch: int,
+        seq_len: int,
+        kv_len: int,
+        include_scores: bool = True,
+        top_k: int | None = None,
+        ep_group: int | None = None,
+    ):
         D = self.hidden_size
         T = batch if mode == "decode" else batch * seq_len
         Klen = kv_len if mode == "decode" else seq_len
@@ -245,10 +253,14 @@ class QwenModel(BaseModel):
         rows.append({"Module":"MLP (Dense)","Submodule":"Gated","Formula":"2 · 3 · D · d_ff · T",
                      "FLOPs_per_layer": 2*3*D*self.intermediate_size*T})
         tk = int(top_k if top_k is not None else self.cfg.get("num_experts_per_tok", 0))
+        ep_eff = max(1, int(ep_group)) if ep_group else 1
         if self.is_moe_enabled() and self.moe_intermediate_size > 0 and tk > 0:
+            moe_flops = 2 * 3 * D * self.moe_intermediate_size * T * tk
+            if ep_eff > 1:
+                moe_flops /= float(ep_eff)
             rows.append({"Module":"MoE","Submodule":"Experts (executed)",
                          "Formula":"2 · 3 · D · d_ff_m · T · top_k",
-                         "FLOPs_per_layer": 2*3*D*self.moe_intermediate_size*T*tk})
+                         "FLOPs_per_layer": moe_flops})
         return rows
 
     # ============================ 通信统计 ============================
@@ -273,4 +285,3 @@ class QwenModel(BaseModel):
                          "Formula":"2 · tokens · D · top_k · (1 - 1/ep) · dtype",
                          "Bytes_per_layer_per_device": ep_bytes})
         return rows
-

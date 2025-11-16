@@ -193,23 +193,67 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         512,
         1,
     )
+    decode_tokens_total = max(1, int(out_len_run))
 
-    bb1, bb2 = st.columns(2)
-    batch_per_gpu = bb1.number_input(
-        "Per-GPU batch (B)",
-        1,
-        1_000_000,
-        int(session_state.get("meas_bref", 1)),
-        1,
-    )
-    grad_accum = bb2.number_input(
-        "Grad-accum steps",
-        1,
-        10000,
-        int(session_state.get("grad_accum", 1)),
-        1,
-        help="推理用 1；训练可>1（影响并发）",
-    )
+    def _avg_decode_kv_tokens(prefill_tokens: int, decode_tokens: int, kv_limit: int) -> float:
+        kv_limit = max(1, int(kv_limit))
+        prefill_tokens = max(0, int(prefill_tokens))
+        decode_tokens = max(1, int(decode_tokens))
+        prefill_effective = min(prefill_tokens, kv_limit)
+        tokens_until_cap = max(0, kv_limit - prefill_effective + 1)
+        tokens_increasing = min(decode_tokens, tokens_until_cap)
+        sum_increasing = 0.0
+        if tokens_increasing > 0:
+            last = min(kv_limit, prefill_effective + tokens_increasing - 1)
+            sum_increasing = (prefill_effective + last) * float(tokens_increasing) / 2.0
+        tokens_remaining = max(0, decode_tokens - tokens_increasing)
+        sum_remaining = float(tokens_remaining * kv_limit)
+        total = sum_increasing + sum_remaining
+        return float(prefill_effective) if total <= 0 else total / float(decode_tokens)
+
+    if separate_pd:
+        bb1, bb2, bb3 = st.columns(3)
+        batch_prefill_per_gpu = bb1.number_input(
+            "Prefill per-GPU batch (B)",
+            1,
+            1_000_000,
+            int(session_state.get("meas_bref", 1)),
+            1,
+        )
+        batch_decode_per_gpu = bb2.number_input(
+            "Decode per-GPU chained batch (B)",
+            1,
+            1_000_000,
+            int(session_state.get("decode_batch", 1)),
+            1,
+            help="vLLM chained batch：一次 Decode iteration 合并多个 token，摊薄 HBM 权重读取。",
+        )
+        grad_accum = bb3.number_input(
+            "Grad-accum steps",
+            1,
+            10000,
+            int(session_state.get("grad_accum", 1)),
+            1,
+            help="推理用 1；训练可>1（影响并发）",
+        )
+    else:
+        bb1, bb2 = st.columns(2)
+        shared_batch_per_gpu = bb1.number_input(
+            "Per-GPU batch (B)",
+            1,
+            1_000_000,
+            int(session_state.get("meas_bref", 1)),
+            1,
+        )
+        batch_prefill_per_gpu = batch_decode_per_gpu = shared_batch_per_gpu
+        grad_accum = bb2.number_input(
+            "Grad-accum steps",
+            1,
+            10000,
+            int(session_state.get("grad_accum", 1)),
+            1,
+            help="推理用 1；训练可>1（影响并发）",
+        )
 
     run_now_local = st.button("Run estimate (Local HW)", type="primary")
 
@@ -247,33 +291,40 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         if is_moe
         else tp_decode * dp_decode * ep_decode
     )
-    batch = max(1, int(batch_per_gpu))
+    batch_prefill = max(1, int(batch_prefill_per_gpu))
+    batch_decode = max(1, int(batch_decode_per_gpu))
     experts_per_tok = int(getattr(getattr(model, "cfg", {}), "get", lambda k, d=None: d)("num_experts_per_tok", 0) or 0)
     weight_dtype_b = int(session_state.get("weight_bytes", 2))
     kv_dtype_b = int(session_state.get("kv_bytes", 2))
     kv_len_for_decode = int(session_state.get("kv_len_in", 4096))
+    avg_decode_kv_tokens = _avg_decode_kv_tokens(int(seq_len_run), decode_tokens_total, kv_len_for_decode)
+    avg_decode_kv_tokens_int = max(1, int(round(avg_decode_kv_tokens)))
 
     rows_prefill = model.flops_component_rows(
         mode="prefill",
-        batch=batch,
+        batch=batch_prefill,
         seq_len=int(seq_len_run),
         kv_len=int(seq_len_run),
         include_scores=bool(session_state.get("inc_scores", True)),
         top_k=None,
+        ep_group=int(ep_group_prefill) if is_moe else None,
     )
     rows_decode = model.flops_component_rows(
         mode="decode",
-        batch=1,
+        batch=batch_decode,
         seq_len=1,
         kv_len=kv_len_for_decode,
         include_scores=bool(session_state.get("inc_scores", True)),
         top_k=None,
+        ep_group=int(ep_group_decode) if is_moe else None,
     )
 
     flops_prefill_per_layer = float(sum(row.get("FLOPs_per_layer", 0.0) for row in rows_prefill))
-    flops_decode_per_layer = float(sum(row.get("FLOPs_per_layer", 0.0) for row in rows_decode))
+    flops_decode_per_layer_iteration = float(sum(row.get("FLOPs_per_layer", 0.0) for row in rows_decode))
     flops_prefill_total = flops_prefill_per_layer * layers / max(1, tp_prefill)
-    flops_decode_total = flops_decode_per_layer * layers / max(1, tp_decode)
+    flops_decode_total_iteration = flops_decode_per_layer_iteration * layers / max(1, tp_decode)
+    flops_decode_per_layer_per_token = flops_decode_per_layer_iteration / max(1, batch_decode)
+    flops_decode_total_per_token = flops_decode_total_iteration / max(1, batch_decode)
 
     weights_prefill_bytes = int(
         weights_bytes_per_gpu(
@@ -299,27 +350,45 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     )
     kv_layers = int(getattr(model, "num_hidden_layers", 0) or layers)
 
-    tokens_prefill_per_device = batch * int(seq_len_run)
+    tokens_prefill_per_device = batch_prefill * int(seq_len_run)
     hbm_bytes_prefill_weights = int(weights_prefill_bytes)
     hbm_bytes_prefill_kv_write = int(per_tok_kv_layer_bytes) * kv_layers * tokens_prefill_per_device
     hbm_bytes_prefill_result = int(tokens_prefill_per_device * hidden_size * kv_dtype_b)
     hbm_bytes_prefill_total = hbm_bytes_prefill_weights + hbm_bytes_prefill_kv_write + hbm_bytes_prefill_result
 
-    per_token_decode_kv = actions.per_token_decode_hbm_bytes_per_layer_per_gpu(
+    per_token_decode_kv_bytes = actions.per_token_decode_hbm_bytes_per_layer_per_gpu(
         model,
         tp=tp_decode,
-        kv_len=kv_len_for_decode,
+        kv_len=avg_decode_kv_tokens_int,
         dtype_bytes=kv_dtype_b,
     ) * kv_layers
 
-    hbm_bytes_per_token = per_token_decode_kv
-    if include_weight_read_in_decode_hbm_local:
-        hbm_bytes_per_token += int(weights_decode_bytes)
-    hbm_bytes_decode_result = int(hidden_size * kv_dtype_b)
-    hbm_bytes_per_token += hbm_bytes_decode_result
+    decode_tokens_per_device = max(1, batch_decode)
+    hbm_bytes_decode_result_per_token = int(hidden_size * kv_dtype_b)
+    hbm_bytes_decode_result_iteration = hbm_bytes_decode_result_per_token * decode_tokens_per_device
+
+    weights_decode_bytes_iteration = int(weights_decode_bytes) if include_weight_read_in_decode_hbm_local else 0
+    weights_decode_bytes_per_token = (
+        float(weights_decode_bytes_iteration) / float(decode_tokens_per_device) if weights_decode_bytes_iteration else 0.0
+    )
+    kv_decode_bytes_per_token = int(per_token_decode_kv_bytes)
+    kv_decode_bytes_iteration = kv_decode_bytes_per_token * decode_tokens_per_device
+    hbm_bytes_per_token = int(
+        round(weights_decode_bytes_per_token + kv_decode_bytes_per_token + hbm_bytes_decode_result_per_token)
+    )
+    hbm_bytes_decode_iteration = (
+        int(weights_decode_bytes_iteration) + int(kv_decode_bytes_iteration) + int(hbm_bytes_decode_result_iteration)
+    )
 
     tp_bytes_prefill = (
-        int(2 * (max(1, tp_prefill) - 1) / max(1, tp_prefill) * (batch * int(seq_len_run)) * hidden_size * weight_dtype_b)
+        int(
+            2
+            * (max(1, tp_prefill) - 1)
+            / max(1, tp_prefill)
+            * (batch_prefill * int(seq_len_run))
+            * hidden_size
+            * weight_dtype_b
+        )
         * 2
         * layers
         if tp_prefill > 1
@@ -327,7 +396,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     )
     ep_bytes_prefill = (
         expert_parallel_a2a_bytes(
-            tokens_per_device=batch * int(seq_len_run),
+            tokens_per_device=batch_prefill * int(seq_len_run),
             hidden_size=hidden_size,
             dtype_bytes=weight_dtype_b,
             top_k=experts_per_tok,
@@ -338,14 +407,26 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         if experts_per_tok > 0
         else 0
     )
-    tp_bytes_decode = (
-        int(2 * (max(1, tp_decode) - 1) / max(1, tp_decode) * hidden_size * weight_dtype_b) * 2 * layers
+    tp_bytes_decode_iteration = (
+        int(
+            2
+            * (max(1, tp_decode) - 1)
+            / max(1, tp_decode)
+            * decode_tokens_per_device
+            * hidden_size
+            * weight_dtype_b
+        )
+        * 2
+        * layers
         if tp_decode > 1
         else 0
     )
-    ep_bytes_decode = (
+    tp_bytes_decode_per_token = (
+        float(tp_bytes_decode_iteration) / float(decode_tokens_per_device) if tp_bytes_decode_iteration else 0.0
+    )
+    ep_bytes_decode_iteration = (
         expert_parallel_a2a_bytes(
-            tokens_per_device=1,
+            tokens_per_device=decode_tokens_per_device,
             hidden_size=hidden_size,
             dtype_bytes=weight_dtype_b,
             top_k=experts_per_tok,
@@ -355,6 +436,9 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         )
         if experts_per_tok > 0
         else 0
+    )
+    ep_bytes_decode_per_token = (
+        float(ep_bytes_decode_iteration) / float(decode_tokens_per_device) if ep_bytes_decode_iteration else 0.0
     )
 
     def human_flops(value: float) -> str:
@@ -369,6 +453,10 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             return f"{value / 1e6:.3f} MFLOPs"
         return f"{value:.0f} FLOPs"
 
+    decode_unit = (
+        "Per token / device" if batch_decode == 1 else f"Per token / device (B iter = {batch_decode})"
+    )
+
     estimate_rows = [
         {
             "Phase": "Prefill",
@@ -377,8 +465,8 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             "DP": dp_prefill,
             "EP": ep_group_prefill,
             "Devices": total_devices_prefill,
-            "B_per_gpu": batch,
-            "Concurrency": batch * dp_prefill * int(grad_accum),
+            "B_per_gpu": batch_prefill,
+            "Concurrency": batch_prefill * dp_prefill * int(grad_accum),
             "TP_bytes_net": tp_bytes_prefill,
             "EP_bytes_net": ep_bytes_prefill,
             "FLOPs_per_layer": flops_prefill_per_layer,
@@ -390,22 +478,22 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         },
         {
             "Phase": "Decode",
-            "Unit": "Per token / device",
+            "Unit": decode_unit,
             "TP": tp_decode,
             "DP": dp_decode,
             "EP": ep_group_decode,
             "Devices": total_devices_decode,
-            "B_per_gpu": 1,
-            "Concurrency": dp_decode * int(grad_accum),
-            "TP_bytes_net": tp_bytes_decode,
-            "EP_bytes_net": ep_bytes_decode,
-            "FLOPs_per_layer": flops_decode_per_layer,
-            "FLOPs_total": flops_decode_total,
-            "HBM_weight_bytes": int(weights_decode_bytes) if include_weight_read_in_decode_hbm_local else 0,
-            "HBM_kv_bytes": per_token_decode_kv,
-            "HBM_result_bytes": hbm_bytes_decode_result,
+            "B_per_gpu": batch_decode,
+            "Concurrency": batch_decode * dp_decode * int(grad_accum),
+            "TP_bytes_net": int(round(tp_bytes_decode_per_token)),
+            "EP_bytes_net": int(round(ep_bytes_decode_per_token)),
+            "FLOPs_per_layer": flops_decode_per_layer_per_token,
+            "FLOPs_total": flops_decode_total_per_token,
+            "HBM_weight_bytes": int(round(weights_decode_bytes_per_token)),
+            "HBM_kv_bytes": kv_decode_bytes_per_token,
+            "HBM_result_bytes": hbm_bytes_decode_result_per_token,
             "HBM_total_bytes": hbm_bytes_per_token,
-        },
+        }
     ]
 
     df_est = pd.DataFrame(estimate_rows)
@@ -462,7 +550,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
                 "EP_bytes_cluster",
             ]
         ],
-        use_container_width=True,
+        width="stretch",
     )
 
     def t_from_flops_ms(flops: float, peak_tflops: float, mfu: float) -> float:
@@ -474,22 +562,22 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         return t + float(latency_ms)
 
     bytes_net_prefill = tp_bytes_prefill + ep_bytes_prefill
-    bytes_net_decode = tp_bytes_decode + ep_bytes_decode
+    bytes_net_decode = tp_bytes_decode_iteration + ep_bytes_decode_iteration
 
     t_comp_p = t_from_flops_ms(flops_prefill_total, tensor_core_peak_local, mfu_local)
-    t_comp_d = t_from_flops_ms(flops_decode_total, tensor_core_peak_local, mfu_local)
+    t_comp_d = t_from_flops_ms(flops_decode_total_iteration, tensor_core_peak_local, mfu_local)
     t_tp_prefill = t_from_bytes_ms(tp_bytes_prefill, net_bw_local)
     t_ep_prefill = t_from_bytes_ms(ep_bytes_prefill, net_bw_local)
-    t_tp_decode = t_from_bytes_ms(tp_bytes_decode, net_bw_local)
-    t_ep_decode = t_from_bytes_ms(ep_bytes_decode, net_bw_local)
+    t_tp_decode = t_from_bytes_ms(tp_bytes_decode_iteration, net_bw_local)
+    t_ep_decode = t_from_bytes_ms(ep_bytes_decode_iteration, net_bw_local)
     t_weight_prefill = actions.bytes_to_time_ms(int(hbm_bytes_prefill_weights), float(hbm_bw_local))
     t_kv_prefill = actions.bytes_to_time_ms(int(hbm_bytes_prefill_kv_write), float(hbm_bw_local))
     t_result_prefill = actions.bytes_to_time_ms(int(hbm_bytes_prefill_result), float(hbm_bw_local))
     t_weight_decode = actions.bytes_to_time_ms(
-        int(weights_decode_bytes if include_weight_read_in_decode_hbm_local else 0), float(hbm_bw_local)
+        int(weights_decode_bytes_iteration), float(hbm_bw_local)
     )
-    t_kv_decode = actions.bytes_to_time_ms(int(per_token_decode_kv), float(hbm_bw_local))
-    t_result_decode = actions.bytes_to_time_ms(int(hbm_bytes_decode_result), float(hbm_bw_local))
+    t_kv_decode = actions.bytes_to_time_ms(int(kv_decode_bytes_iteration), float(hbm_bw_local))
+    t_result_decode = actions.bytes_to_time_ms(int(hbm_bytes_decode_result_iteration), float(hbm_bw_local))
 
     def plot_timeline(title: str, comps_dict: dict[str, float], overlaps: list[float]):
         import plotly.graph_objects as go
@@ -566,11 +654,16 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             },
             timeline_overlaps,
         ),
-        use_container_width=True,
+        width="stretch",
+    )
+    decode_timeline_title = (
+        "Decode timeline per token (per device)"
+        if batch_decode == 1
+        else f"Decode timeline per iteration (per device, B={batch_decode})"
     )
     st.plotly_chart(
         plot_timeline(
-            "Decode timeline per token (per device)",
+            decode_timeline_title,
             {
                 "Compute": t_comp_d,
                 "TP collectives": t_tp_decode,
@@ -581,7 +674,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             },
             timeline_overlaps,
         ),
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -609,4 +702,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
