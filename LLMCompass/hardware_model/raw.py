@@ -26,6 +26,7 @@ class RawComputeModule:
         self.core_count = 1
         self.overhead = None
         self.l2_size = int(self.l2_size_bytes)
+        self.clock_freq = self.clock_freq_hz
 
 
 @dataclass
@@ -80,4 +81,5 @@ def create_raw_device(
         l2_groups=None,
     )
     device.name = name or "raw"
+    device.origin = "raw"
     return device

@@ -52,6 +52,31 @@ def fmt_sec(s: float) -> str:
     return f"{s:.3f} s"
 
 
+def fmt_tbps(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if value == float("inf"):
+        return "∞"
+    return f"{value:.2f} TB/s"
+
+
+def fmt_ghz(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.2f} GHz"
+
+
+CUSTOM_HW_DEFAULTS: Dict[str, Any] = {
+    "name": "CustomRaw",
+    "peak_tflops": 400.0,
+    "vector_tflops": 80.0,
+    "bandwidth_tbps": 3.0,
+    "clock_freq_ghz": 1.8,
+    "l2_size_mb": 64.0,
+    "memory_capacity_gb": 96.0,
+}
+
+
 @dataclass
 class FACaseConfig:
     label: str
@@ -66,7 +91,16 @@ class FACaseConfig:
     seq_len_kv: int
     causal: bool
     dtype: str
+    hardware_mode: str = "preset"
+    hardware_custom: Dict[str, Any] = field(
+        default_factory=lambda: dict(CUSTOM_HW_DEFAULTS)
+    )
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    def hardware_label(self) -> str:
+        if self.hardware_mode == "custom":
+            return self.hardware_custom.get("name", "Custom raw")
+        return self.hardware_model
 
 
 DEFAULT_CASES: List[FACaseConfig] = [
@@ -111,11 +145,23 @@ def _impl_options() -> Tuple[List[str], Dict[str, str], Dict[str, str]]:
 
 
 @st.cache_data(show_spinner=False)
-def _hardware_options() -> Tuple[List[str], Dict[str, str]]:
-    entries = list_available_hardware_models(detailed=True)
-    labels = [f"{e['label']}" for e in entries]
-    label_to_name = {labels[i]: entries[i]["name"] for i in range(len(entries))}
-    return labels, label_to_name
+def _hardware_library() -> List[Dict[str, Any]]:
+    return list_available_hardware_models(detailed=True)
+
+
+@st.cache_data(show_spinner=False)
+def _hardware_options() -> Tuple[List[str], Dict[str, str], List[Dict[str, Any]]]:
+    entries = _hardware_library()
+    labels: List[str] = []
+    label_to_name: Dict[str, str] = {}
+    for entry in entries:
+        label = entry["label"]
+        peak = entry.get("peak_tflops")
+        if peak:
+            label = f"{label} ({peak:.0f} TFLOPs)"
+        labels.append(label)
+        label_to_name[label] = entry["name"]
+    return labels, label_to_name, entries
 
 
 def _option_index(options: List[str], mapping: Dict[str, str], target: str) -> int:
@@ -127,7 +173,7 @@ def _option_index(options: List[str], mapping: Dict[str, str], target: str) -> i
 
 def _render_case_form(index: int, defaults: FACaseConfig) -> FACaseConfig:
     impl_labels, label_to_impl, impl_desc = _impl_options()
-    hw_labels, label_to_hw = _hardware_options()
+    hw_labels, label_to_hw, _ = _hardware_options()
     with st.expander(
         f"Configuration {index + 1}: {defaults.label}", expanded=index == 0
     ):
@@ -143,12 +189,76 @@ def _render_case_form(index: int, defaults: FACaseConfig) -> FACaseConfig:
             key=f"impl_{index}",
         )
         st.caption(impl_desc.get(impl_label, ""))
-        hw_label = st.selectbox(
-            "Hardware model",
-            options=hw_labels,
-            index=_option_index(hw_labels, label_to_hw, defaults.hardware_model),
-            key=f"hw_{index}",
+        hardware_mode_choice = st.radio(
+            "Hardware selection",
+            options=["Preset library", "Custom raw hardware"],
+            index=0 if defaults.hardware_mode == "preset" else 1,
+            key=f"hw_mode_{index}",
         )
+        hardware_mode = "preset" if hardware_mode_choice == "Preset library" else "custom"
+        hardware_custom = dict(defaults.hardware_custom)
+        if hardware_mode == "preset":
+            hw_label = st.selectbox(
+                "Hardware model",
+                options=hw_labels,
+                index=_option_index(hw_labels, label_to_hw, defaults.hardware_model),
+                key=f"hw_{index}",
+            )
+            hardware_model = label_to_hw[hw_label]
+        else:
+            st.caption("Provide simple architectural knobs for the raw hardware model.")
+            custom_defaults = {**CUSTOM_HW_DEFAULTS, **hardware_custom}
+            custom_name = st.text_input(
+                "Custom hardware label",
+                value=custom_defaults.get("name", f"Custom {index + 1}"),
+                key=f"custom_hw_name_{index}",
+            )
+            peak_tflops = st.number_input(
+                "Peak tensor TFLOPs",
+                min_value=1.0,
+                value=float(custom_defaults["peak_tflops"]),
+                key=f"custom_hw_peak_{index}",
+            )
+            vector_tflops = st.number_input(
+                "Vector TFLOPs",
+                min_value=1.0,
+                value=float(custom_defaults.get("vector_tflops", peak_tflops / 4)),
+                key=f"custom_hw_vector_{index}",
+            )
+            bandwidth_tbps = st.number_input(
+                "HBM / IO bandwidth (TB/s)",
+                min_value=0.1,
+                value=float(custom_defaults["bandwidth_tbps"]),
+                key=f"custom_hw_bw_{index}",
+            )
+            clock_freq_ghz = st.number_input(
+                "Clock frequency (GHz)",
+                min_value=0.1,
+                value=float(custom_defaults["clock_freq_ghz"]),
+                key=f"custom_hw_clock_{index}",
+            )
+            l2_size_mb = st.number_input(
+                "L2 / shared buffer size (MB)",
+                min_value=4.0,
+                value=float(custom_defaults["l2_size_mb"]),
+                key=f"custom_hw_l2_{index}",
+            )
+            memory_capacity_gb = st.number_input(
+                "Memory capacity (GB)",
+                min_value=1.0,
+                value=float(custom_defaults["memory_capacity_gb"]),
+                key=f"custom_hw_mem_{index}",
+            )
+            hardware_model = custom_name
+            hardware_custom = {
+                "name": custom_name,
+                "peak_tflops": peak_tflops,
+                "vector_tflops": vector_tflops,
+                "bandwidth_tbps": bandwidth_tbps,
+                "clock_freq_ghz": clock_freq_ghz,
+                "l2_size_mb": l2_size_mb,
+                "memory_capacity_gb": memory_capacity_gb,
+            }
         dtype = st.selectbox(
             "Data type",
             options=["fp16", "bf16", "fp8"],
@@ -207,7 +317,7 @@ def _render_case_form(index: int, defaults: FACaseConfig) -> FACaseConfig:
     return FACaseConfig(
         label=label,
         impl=label_to_impl[impl_label],
-        hardware_model=label_to_hw[hw_label],
+        hardware_model=hardware_model,
         batch_size=int(batch),
         num_heads=int(num_heads),
         num_kv_heads=int(num_kv_heads),
@@ -217,6 +327,8 @@ def _render_case_form(index: int, defaults: FACaseConfig) -> FACaseConfig:
         seq_len_kv=int(seq_len_kv),
         causal=causal,
         dtype=dtype,
+        hardware_mode=hardware_mode,
+        hardware_custom=hardware_custom,
     )
 
 
@@ -229,9 +341,44 @@ for idx in range(config_count):
     configs.append(_render_case_form(idx, defaults))
 
 
+hardware_library = _hardware_library()
+with st.expander("Hardware presets & custom builder guide", expanded=False):
+    st.markdown(
+        "**How do I choose LLMCompass hardware?** Select one of the preset devices in"
+        " the table below or switch any configuration to *Custom raw hardware* to input"
+        " your own TFLOPs, bandwidth, and memory knobs (可自定义架构参数)."
+    )
+    if hardware_library:
+        hw_rows = []
+        for entry in hardware_library:
+            peak = entry.get("peak_tflops")
+            vector = entry.get("vector_tflops")
+            l2_size = entry.get("l2_size_mb")
+            global_buffer = entry.get("global_buffer_mb")
+            hw_rows.append(
+                {
+                    "Name": entry.get("name"),
+                    "Clock": fmt_ghz(entry.get("clock_ghz")),
+                    "Peak TFLOPs": f"{peak:.1f}" if peak else "-",
+                    "Vector TFLOPs": f"{vector:.1f}" if vector else "-",
+                    "HBM BW": fmt_tbps(entry.get("memory_bandwidth_tbps")),
+                    "IO BW": fmt_tbps(entry.get("io_bandwidth_tbps")),
+                    "L2 (MB)": f"{l2_size:.1f}" if l2_size else "-",
+                    "Global buffer (MB)": f"{global_buffer:.1f}" if global_buffer else "-",
+                }
+            )
+        st.dataframe(pd.DataFrame(hw_rows), use_container_width=True)
+    else:
+        st.info("No registered hardware models were found.")
+
+
 results: List[Tuple[FACaseConfig, OpCostResult]] = []
 for cfg in configs:
     try:
+        hardware_override = cfg.hardware_custom if cfg.hardware_mode == "custom" else None
+        hardware_model = (
+            cfg.hardware_model if cfg.hardware_mode == "preset" else cfg.hardware_custom.get("name")
+        )
         cost = flash_attention_cost(
             impl=cfg.impl,
             batch_size=cfg.batch_size,
@@ -243,7 +390,8 @@ for cfg in configs:
             seq_len_kv=cfg.seq_len_kv,
             causal=cfg.causal,
             dtype=cfg.dtype,
-            hardware_model=cfg.hardware_model,
+            hardware_model=hardware_model,
+            hardware_override=hardware_override,
             extra=cfg.extra,
         )
         results.append((cfg, cost))
@@ -254,10 +402,16 @@ for cfg in configs:
 if results:
     table_rows = []
     for cfg, res in results:
+        hw_summary = res.extra.get("hardware_summary", {})
+        peak_tflops = hw_summary.get("peak_tflops")
         row = {
             "Label": cfg.label,
             "Implementation": res.extra.get("impl_label", res.impl),
-            "Hardware": res.hardware_model,
+            "Hardware": hw_summary.get("name", cfg.hardware_label()),
+            "Clock": fmt_ghz(hw_summary.get("clock_ghz")),
+            "Peak TFLOPs": f"{peak_tflops:.1f}" if peak_tflops else "-",
+            "HBM BW": fmt_tbps(hw_summary.get("memory_bandwidth_tbps")),
+            "IO BW": fmt_tbps(hw_summary.get("io_bandwidth_tbps")),
             "Latency": fmt_sec(res.extra["latency_s"]),
             "Cycles": fmt_num(res.cycles),
             "TFLOPs": f"{res.tflops:.2f}",
@@ -294,10 +448,21 @@ if results:
     st.subheader("Detailed metrics")
     for cfg, res in results:
         with st.expander(f"{cfg.label} • {res.extra.get('impl_label', res.impl)}"):
+            hw_summary = res.extra.get("hardware_summary", {})
             st.write(
                 f"Latency: {fmt_sec(res.extra['latency_s'])} • Cycles: {fmt_num(res.cycles)} • "
                 f"TFLOPs: {res.tflops:.2f}"
             )
+            if hw_summary:
+                peak = hw_summary.get("peak_tflops")
+                peak_str = f"{peak:.1f}" if peak else "-"
+                st.write(
+                    "Hardware: "
+                    f"{hw_summary.get('name', cfg.hardware_label())} • "
+                    f"Clock {fmt_ghz(hw_summary.get('clock_ghz'))} • "
+                    f"Peak TFLOPs {peak_str} • "
+                    f"HBM BW {fmt_tbps(hw_summary.get('memory_bandwidth_tbps'))}"
+                )
             st.write(
                 f"HBM reads {fmt_bytes(res.extra['hbm_read_bytes'])}, writes {fmt_bytes(res.extra['hbm_write_bytes'])}."
             )

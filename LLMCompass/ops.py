@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from hardware_model.registry import get_hardware_model, list_hardware_models
+from hardware_model.device import Device
+from hardware_model.raw import create_raw_device
+from hardware_model.registry import (
+    get_hardware_model,
+    list_hardware_models,
+    summarize_device,
+)
 from software_model.flash_attention import FlashAttention3, FlashAttention3Mapping
 from software_model.utils import Tensor, data_type_dict, DataType
 
@@ -101,17 +107,16 @@ def list_available_fa_impls(detailed: bool = False) -> List[Any]:
 
 
 def list_available_hardware_models(detailed: bool = False) -> List[Any]:
-    names = list_hardware_models()
-    if detailed:
-        return [
-            {
-                "name": name,
-                "label": name,
-                "description": "LLMCompass hardware model",
-            }
-            for name in names
-        ]
-    return names
+    entries = list_hardware_models(detailed=detailed)
+    if not detailed:
+        return entries
+    detailed_entries = []
+    for summary in entries:
+        summary = dict(summary)
+        summary.setdefault("label", summary["name"])
+        summary.setdefault("description", "LLMCompass hardware model")
+        detailed_entries.append(summary)
+    return detailed_entries
 
 
 def _resolve_dtype(name: str) -> DataType:
@@ -144,6 +149,32 @@ def _build_flash_attention_operator(
     )
 
 
+def _resolve_hardware(
+    hardware_model: Optional[str],
+    hardware_override: Optional[Dict[str, Any]],
+) -> Tuple[str, Device]:
+    if hardware_override:
+        config = {
+            "name": hardware_override.get("name", hardware_model or "custom_raw"),
+            "peak_tflops": float(hardware_override["peak_tflops"]),
+            "vector_tflops": float(
+                hardware_override.get("vector_tflops", hardware_override["peak_tflops"] / 4)
+            ),
+            "bandwidth_tbps": float(hardware_override["bandwidth_tbps"]),
+            "clock_freq_ghz": float(hardware_override["clock_freq_ghz"]),
+            "l2_size_mb": float(hardware_override.get("l2_size_mb", 32.0)),
+            "memory_capacity_gb": float(
+                hardware_override.get("memory_capacity_gb", 80.0)
+            ),
+        }
+        return config["name"], create_raw_device(**config)
+    if not hardware_model:
+        raise ValueError(
+            "flash_attention_cost requires either hardware_model or hardware_override"
+        )
+    return hardware_model, get_hardware_model(hardware_model)
+
+
 def flash_attention_cost(
     *,
     impl: str,
@@ -156,10 +187,16 @@ def flash_attention_cost(
     seq_len_kv: int,
     causal: bool,
     dtype: str,
-    hardware_model: str,
+    hardware_model: Optional[str] = None,
+    hardware_override: Optional[Dict[str, Any]] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> OpCostResult:
-    """Return hardware-aware cost predictions for FlashAttention."""
+    """Return hardware-aware cost predictions for FlashAttention.
+
+    Callers may pass either the name of a registered hardware model or a
+    ``hardware_override`` dictionary that describes a raw device in terms of
+    TFLOPs, bandwidth, and memory capacity.
+    """
 
     dtype_obj = _resolve_dtype(dtype)
     mask_type = (extra or {}).get("mask_type")
@@ -175,7 +212,7 @@ def flash_attention_cost(
     k = Tensor([batch_size, num_kv_heads, head_dim_qk, seq_len_kv], data_type=dtype_obj)
     v = Tensor([batch_size, num_kv_heads, seq_len_kv, head_dim_v], data_type=dtype_obj)
     operator(q, k, v)
-    device = get_hardware_model(hardware_model)
+    hardware_label, device = _resolve_hardware(hardware_model, hardware_override)
     latency_s = operator.roofline_model(device)
     clock = device.compute_module.clock_freq
     cycles = latency_s * clock
@@ -204,12 +241,13 @@ def flash_attention_cost(
         "peak_memory_elements": getattr(operator, "peak_memory_usage", None),
         "tile_count": len(operator.tile_log),
         "impl_label": _FLASH_ATTENTION_IMPLS[impl].label,
+        "hardware_summary": summarize_device(device),
     }
     return OpCostResult(
         op_name="FlashAttention",
         op_type="flash_attention",
         impl=impl,
-        hardware_model=hardware_model,
+        hardware_model=hardware_label,
         cycles=cycles,
         flops=flops,
         tflops=tflops,
