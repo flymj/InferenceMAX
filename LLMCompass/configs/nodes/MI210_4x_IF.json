@@ -1,0 +1,18 @@
+{
+    "name": "AMD MI210 4x Infinity Fabric",
+    "device_template": "../devices/AMD_MI210.json",
+    "device_count": 4,
+    "interconnect": {
+        "link": {
+            "name": "InfinityFabric",
+            "bandwidth_per_direction_byte": 25e9,
+            "bandwidth_both_directions_byte": 50e9,
+            "latency_second": 8.92e-6,
+            "flit_size_byte": 16,
+            "header_size_byte": 16,
+            "max_payload_size_byte": 256
+        },
+        "link_count_per_device": 8,
+        "topology": "FC"
+    }
+}

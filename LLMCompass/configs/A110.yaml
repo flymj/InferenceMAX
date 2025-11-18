@@ -1,0 +1,320 @@
+device:
+  name: A110
+  main_memory:
+    type: hbm2e
+    bandwidth_gbps: 3350
+    capacity_gb: 80
+
+  l3_buffer:
+    size_kb: 49152  # 48 MB global shared buffer
+    bandwidth_gbps: 5200
+
+  l2_groups:
+    - group_id: 0
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [0, 1, 2, 3]
+    - group_id: 1
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [4, 5, 6, 7]
+    - group_id: 2
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [8, 9, 10, 11]
+    - group_id: 3
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [12, 13, 14, 15]
+    - group_id: 4
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [16, 17, 18, 19]
+    - group_id: 5
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [20, 21, 22, 23]
+    - group_id: 6
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [24, 25, 26, 27]
+    - group_id: 7
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [28, 29, 30, 31]
+    - group_id: 8
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [32, 33, 34, 35]
+    - group_id: 9
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [36, 37, 38, 39]
+    - group_id: 10
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [40, 41, 42, 43]
+    - group_id: 11
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [44, 45, 46, 47]
+    - group_id: 12
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [48, 49, 50, 51]
+    - group_id: 13
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [52, 53, 54, 55]
+    - group_id: 14
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [56, 57, 58, 59]
+    - group_id: 15
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [60, 61, 62, 63]
+    - group_id: 16
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [64, 65, 66, 67]
+    - group_id: 17
+      l2_buffer:
+        size_kb: 2048
+        bandwidth_gbps: 2500
+      core_ids: [68, 69, 70, 71]
+
+  cores:
+    - core_id: 0
+      local_buffer:
+        size_kb: 384
+    - core_id: 1
+      local_buffer:
+        size_kb: 384
+    - core_id: 2
+      local_buffer:
+        size_kb: 384
+    - core_id: 3
+      local_buffer:
+        size_kb: 384
+    - core_id: 4
+      local_buffer:
+        size_kb: 384
+    - core_id: 5
+      local_buffer:
+        size_kb: 384
+    - core_id: 6
+      local_buffer:
+        size_kb: 384
+    - core_id: 7
+      local_buffer:
+        size_kb: 384
+    - core_id: 8
+      local_buffer:
+        size_kb: 384
+    - core_id: 9
+      local_buffer:
+        size_kb: 384
+    - core_id: 10
+      local_buffer:
+        size_kb: 384
+    - core_id: 11
+      local_buffer:
+        size_kb: 384
+    - core_id: 12
+      local_buffer:
+        size_kb: 384
+    - core_id: 13
+      local_buffer:
+        size_kb: 384
+    - core_id: 14
+      local_buffer:
+        size_kb: 384
+    - core_id: 15
+      local_buffer:
+        size_kb: 384
+    - core_id: 16
+      local_buffer:
+        size_kb: 384
+    - core_id: 17
+      local_buffer:
+        size_kb: 384
+    - core_id: 18
+      local_buffer:
+        size_kb: 384
+    - core_id: 19
+      local_buffer:
+        size_kb: 384
+    - core_id: 20
+      local_buffer:
+        size_kb: 384
+    - core_id: 21
+      local_buffer:
+        size_kb: 384
+    - core_id: 22
+      local_buffer:
+        size_kb: 384
+    - core_id: 23
+      local_buffer:
+        size_kb: 384
+    - core_id: 24
+      local_buffer:
+        size_kb: 384
+    - core_id: 25
+      local_buffer:
+        size_kb: 384
+    - core_id: 26
+      local_buffer:
+        size_kb: 384
+    - core_id: 27
+      local_buffer:
+        size_kb: 384
+    - core_id: 28
+      local_buffer:
+        size_kb: 384
+    - core_id: 29
+      local_buffer:
+        size_kb: 384
+    - core_id: 30
+      local_buffer:
+        size_kb: 384
+    - core_id: 31
+      local_buffer:
+        size_kb: 384
+    - core_id: 32
+      local_buffer:
+        size_kb: 384
+    - core_id: 33
+      local_buffer:
+        size_kb: 384
+    - core_id: 34
+      local_buffer:
+        size_kb: 384
+    - core_id: 35
+      local_buffer:
+        size_kb: 384
+    - core_id: 36
+      local_buffer:
+        size_kb: 384
+    - core_id: 37
+      local_buffer:
+        size_kb: 384
+    - core_id: 38
+      local_buffer:
+        size_kb: 384
+    - core_id: 39
+      local_buffer:
+        size_kb: 384
+    - core_id: 40
+      local_buffer:
+        size_kb: 384
+    - core_id: 41
+      local_buffer:
+        size_kb: 384
+    - core_id: 42
+      local_buffer:
+        size_kb: 384
+    - core_id: 43
+      local_buffer:
+        size_kb: 384
+    - core_id: 44
+      local_buffer:
+        size_kb: 384
+    - core_id: 45
+      local_buffer:
+        size_kb: 384
+    - core_id: 46
+      local_buffer:
+        size_kb: 384
+    - core_id: 47
+      local_buffer:
+        size_kb: 384
+    - core_id: 48
+      local_buffer:
+        size_kb: 384
+    - core_id: 49
+      local_buffer:
+        size_kb: 384
+    - core_id: 50
+      local_buffer:
+        size_kb: 384
+    - core_id: 51
+      local_buffer:
+        size_kb: 384
+    - core_id: 52
+      local_buffer:
+        size_kb: 384
+    - core_id: 53
+      local_buffer:
+        size_kb: 384
+    - core_id: 54
+      local_buffer:
+        size_kb: 384
+    - core_id: 55
+      local_buffer:
+        size_kb: 384
+    - core_id: 56
+      local_buffer:
+        size_kb: 384
+    - core_id: 57
+      local_buffer:
+        size_kb: 384
+    - core_id: 58
+      local_buffer:
+        size_kb: 384
+    - core_id: 59
+      local_buffer:
+        size_kb: 384
+    - core_id: 60
+      local_buffer:
+        size_kb: 384
+    - core_id: 61
+      local_buffer:
+        size_kb: 384
+    - core_id: 62
+      local_buffer:
+        size_kb: 384
+    - core_id: 63
+      local_buffer:
+        size_kb: 384
+    - core_id: 64
+      local_buffer:
+        size_kb: 384
+    - core_id: 65
+      local_buffer:
+        size_kb: 384
+    - core_id: 66
+      local_buffer:
+        size_kb: 384
+    - core_id: 67
+      local_buffer:
+        size_kb: 384
+    - core_id: 68
+      local_buffer:
+        size_kb: 384
+    - core_id: 69
+      local_buffer:
+        size_kb: 384
+    - core_id: 70
+      local_buffer:
+        size_kb: 384
+    - core_id: 71
+      local_buffer:
+        size_kb: 384
