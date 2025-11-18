@@ -1,6 +1,7 @@
 """FlashAttention-3 operator modeling with tile-level accounting."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -13,6 +14,7 @@ from software_model.utils import DataType, Tensor
 class _FlashAttentionShape:
     batch: int
     heads: int
+    kv_heads: int
     query_len: int
     dim_qk: int
     kv_len: int
@@ -27,6 +29,7 @@ class _FlashAttentionShape:
 class _TileStats:
     batch: int
     heads: int
+    kv_heads: int
     q_tokens: int
     k_tokens: int
     hbm_read_bytes: int
@@ -87,6 +90,7 @@ class FlashAttention3(Operator):
         self.shape = _FlashAttentionShape(
             batch=q.shape[0],
             heads=q.shape[1],
+            kv_heads=k.shape[1],
             query_len=q.shape[2],
             dim_qk=q.shape[3],
             kv_len=k.shape[3],
@@ -141,7 +145,10 @@ class FlashAttention3(Operator):
         assert len(k.shape) == 4 and len(v.shape) == 4
         assert q.data_type == k.data_type == v.data_type == self.data_type
         assert q.shape[0] == k.shape[0] == v.shape[0]
-        assert q.shape[1] == k.shape[1] == v.shape[1]
+        assert v.shape[1] == k.shape[1], "K/V must expose the same head count"
+        assert (
+            q.shape[1] >= k.shape[1]
+        ), "Query heads must be greater than or equal to KV heads"
         assert q.shape[3] == k.shape[2], "K must expose Dqk along axis 2"
         assert v.shape[2] == k.shape[3], "K/V sequence length mismatch"
 
@@ -171,6 +178,22 @@ class FlashAttention3(Operator):
         last_token = min(self.shape.kv_len, q_start + q_block)
         return max(1, (first_token + last_token) // 2)
 
+    def _kv_group_size(self) -> int:
+        assert self.shape is not None
+        if self.shape.kv_heads <= 0:
+            return 1
+        return max(1, math.ceil(self.shape.heads / self.shape.kv_heads))
+
+    def _kv_heads_for_tile(self, head_start: int, head_count: int) -> int:
+        assert self.shape is not None
+        if head_count <= 0:
+            return 0
+        group_size = self._kv_group_size()
+        first_group = head_start // group_size
+        last_group = (head_start + head_count - 1) // group_size
+        last_group = min(last_group, self.shape.kv_heads - 1)
+        return max(1, last_group - first_group + 1)
+
     def _simulate_tiles(self) -> Tuple[int, int, int, int, int, int, int, List[_TileStats], int]:
         assert self.shape is not None and self.mapping is not None
         shape = self.shape
@@ -188,6 +211,7 @@ class FlashAttention3(Operator):
             b_tile = min(mapping.batch_tile, shape.batch - b)
             for h in range(0, shape.heads, mapping.head_tile):
                 h_tile = min(mapping.head_tile, shape.heads - h)
+                kv_head_tile = self._kv_heads_for_tile(h, h_tile)
                 for q in range(0, shape.query_len, mapping.query_tile):
                     q_tile = min(mapping.query_tile, shape.query_len - q)
                     effective_k = self._effective_k_for_block(q, q_tile)
@@ -203,8 +227,8 @@ class FlashAttention3(Operator):
                             mapping.key_tile, effective_k - kv_consumed
                         )
                         kv_consumed += kv_block
-                        k_elems = b_tile * h_tile * kv_block * shape.dim_qk
-                        v_elems = b_tile * h_tile * kv_block * shape.dim_v
+                        k_elems = b_tile * kv_head_tile * kv_block * shape.dim_qk
+                        v_elems = b_tile * kv_head_tile * kv_block * shape.dim_v
                         k_bytes = k_elems * bytes_per_elem
                         v_bytes = v_elems * bytes_per_elem
                         tile_bytes = q_bytes + k_bytes + v_bytes
@@ -216,6 +240,7 @@ class FlashAttention3(Operator):
                             _TileStats(
                                 batch=b_tile,
                                 heads=h_tile,
+                                kv_heads=kv_head_tile,
                                 q_tokens=q_tile,
                                 k_tokens=kv_block,
                                 hbm_read_bytes=k_bytes + v_bytes,
