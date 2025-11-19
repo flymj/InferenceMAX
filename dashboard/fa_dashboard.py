@@ -7,6 +7,14 @@ import streamlit as st
 import plotly.express as px
 import pandas as pd
 
+from dashboard.operators import (
+    FlashAttentionHardware,
+    FlashAttentionOperator,
+    MASK_CAUSAL_LT,
+    MASK_LABELS,
+    MASK_NONE,
+)
+
 st.set_page_config(page_title="FlashAttention UT Roofline", layout="wide")
 st.title("FlashAttention UT • Roofline Estimator (Streamlit + Plotly)")
 st.caption(
@@ -153,114 +161,6 @@ def _segment_ranges(length: int, tile: int):
         ranges.append((start, end))
         start = end
     return ranges
-
-
-def lower_tri_pairs(nq: int, nk: int) -> int:
-    """Return number of valid Q-K pairs for a lower-triangular (causal) mask."""
-
-    nq = max(0, int(nq))
-    nk = max(0, int(nk))
-    if nq == 0 or nk == 0:
-        return 0
-    if nq <= nk:
-        return nq * (nq + 1) // 2
-    # First nk rows form a triangle, remainder are fully-populated rows.
-    return nk * (nk + 1) // 2 + (nq - nk) * nk
-
-
-MASK_NONE = "none"
-MASK_CAUSAL_LT = "causal_lower_triangle"
-_MASK_LABELS = {
-    MASK_NONE: "None (dense)",
-    MASK_CAUSAL_LT: "Causal lower-triangle",
-}
-
-
-def mask_usage_ratio(nq: int, nk: int, mask_type: str) -> float:
-    """Return ratio of useful compute vs. dense compute under the mask."""
-
-    total = max(0, int(nq)) * max(0, int(nk))
-    if total == 0:
-        return 0.0
-    if mask_type != MASK_CAUSAL_LT:
-        return 1.0
-    valid = lower_tri_pairs(nq, nk)
-    return min(1.0, valid / total) if valid > 0 else 0.0
-
-
-def flops_attention_masked(
-    L_q: int,
-    L_k: int,
-    d: int,
-    d_v: int,
-    mask_type: str,
-    skip_masked_gemm: bool,
-):
-    """Return FLOPs accounting for masking strategy."""
-
-    L_q = max(0, int(L_q))
-    L_k = max(0, int(L_k))
-    d = max(0, int(d))
-    d_v = max(0, int(d_v))
-
-    total_pairs = L_q * L_k
-    fl_qk_full = 2 * L_q * L_k * d
-    fl_pv_full = 2 * L_q * L_k * d_v
-    fl_full = fl_qk_full + fl_pv_full
-
-    if total_pairs == 0 or d == 0 or d_v == 0:
-        return {
-            "flops_qk_full": 0.0,
-            "flops_pv_full": 0.0,
-            "flops_full": 0.0,
-            "flops_qk_effective": 0.0,
-            "flops_pv_effective": 0.0,
-            "flops_effective": 0.0,
-            "flops_qk_hw": 0.0,
-            "flops_pv_hw": 0.0,
-            "flops_hw": 0.0,
-            "density": 0.0,
-            "hw_density": 0.0,
-            "valid_pairs": 0,
-            "total_pairs": total_pairs,
-        }
-
-    if mask_type == MASK_CAUSAL_LT:
-        valid_pairs = lower_tri_pairs(L_q, L_k)
-        density = valid_pairs / total_pairs if total_pairs > 0 else 0.0
-    else:
-        valid_pairs = total_pairs
-        density = 1.0
-
-    fl_qk_effective = fl_qk_full * density
-    fl_pv_effective = fl_pv_full * density
-    fl_effective = fl_qk_effective + fl_pv_effective
-
-    if skip_masked_gemm:
-        fl_qk_hw = fl_qk_effective
-        fl_pv_hw = fl_pv_effective
-        hw_density = density
-    else:
-        fl_qk_hw = fl_qk_full
-        fl_pv_hw = fl_pv_full
-        hw_density = 1.0
-    fl_hw = fl_qk_hw + fl_pv_hw
-
-    return {
-        "flops_qk_full": fl_qk_full,
-        "flops_pv_full": fl_pv_full,
-        "flops_full": fl_full,
-        "flops_qk_effective": fl_qk_effective,
-        "flops_pv_effective": fl_pv_effective,
-        "flops_effective": fl_effective,
-        "flops_qk_hw": fl_qk_hw,
-        "flops_pv_hw": fl_pv_hw,
-        "flops_hw": fl_hw,
-        "density": density,
-        "hw_density": hw_density,
-        "valid_pairs": valid_pairs,
-        "total_pairs": total_pairs,
-    }
 
 
 def causal_tile_density_lower_triangle(i: int, j: int, M: int, N: int, L_q=None, L_k=None) -> float:
@@ -536,23 +436,10 @@ with st.sidebar:
     freq_ghz = st.number_input("Frequency (GHz)", min_value=0.0, value=1.98, step=0.01)
 
 # ----------------------- Presets & Import -----------------------
-col_p1, col_p2 = st.columns([1,2])
+col_p1, col_p2 = st.columns([1, 2])
 with col_p1:
-    st.subheader("Workload Presets")
-    if st.button("Case A: 32K×32K, d=128, H=32 (bf16)"):
-        st.session_state.update({
-            "batch": 1, "nq": 32768, "nk": 32768, "heads": 32, "kv_heads": 32,
-            "d": 128, "dv": 128, "dropout": 0.0, "custom_mask": 0,
-            "mask_type": MASK_NONE,
-            "skip_masked_gemm": False,
-        })
-    if st.button("Case B: 1K×1K, d=64, H=16, drop=0.1 (bf16)"):
-        st.session_state.update({
-            "batch": 4, "nq": 1024, "nk": 1024, "heads": 16, "kv_heads": 16,
-            "d": 64, "dv": 64, "dropout": 0.1, "custom_mask": 1,
-            "mask_type": MASK_CAUSAL_LT,
-            "skip_masked_gemm": True,
-        })
+    st.subheader("Workload Notes")
+    st.write("Configure workloads via the fields below or import a UT config string.")
 
 with col_p2:
     st.subheader("Import UT Config String")
@@ -610,7 +497,7 @@ with c3:
 with c4:
     nq = st.number_input("Seq Q (Nq)", min_value=1, value=int(st.session_state["nq"]))
     nk = st.number_input("Seq K (Nk)", min_value=1, value=int(st.session_state["nk"]))
-mask_type_options = list(_MASK_LABELS.keys())
+mask_type_options = list(MASK_LABELS.keys())
 default_mask_type = st.session_state.get("mask_type", MASK_NONE)
 if default_mask_type not in mask_type_options:
     default_mask_type = MASK_CAUSAL_LT if int(st.session_state.get("custom_mask", 0)) else MASK_NONE
@@ -618,7 +505,7 @@ mask_type = st.selectbox(
     "Mask Type",
     options=mask_type_options,
     index=mask_type_options.index(default_mask_type),
-    format_func=lambda x: _MASK_LABELS.get(x, x),
+    format_func=lambda x: MASK_LABELS.get(x, x),
 )
 skip_masked_gemm = st.checkbox(
     "Skip masked tiles in GEMM",
@@ -631,46 +518,56 @@ custom_mask_enabled = mask_type != MASK_NONE
 st.session_state["custom_mask"] = int(custom_mask_enabled)
 
 # ----------------------- Core Model -----------------------
-bytes_per_el = 1 if dtype == "fp8" else 2
+workload_metadata = {
+    "dtype": dtype,
+    "batch": batch,
+    "heads": heads,
+    "kv_heads": kv_heads,
+    "d": d,
+    "dv": dv,
+    "dropout": dropout,
+    "nq": nq,
+    "nk": nk,
+    "mask_type": mask_type,
+    "skip_masked_gemm": skip_masked_gemm,
+}
+hardware = FlashAttentionHardware(
+    tc_tflops=tc_tflops,
+    fp32_tflops=fp32_tflops,
+    sfu_tops=sfu_tops,
+    hbm_tbs=hbm_tbs,
+    freq_ghz=freq_ghz,
+)
+fa_operator = FlashAttentionOperator(workload_metadata, hardware)
+tflops_info = fa_operator.calculate_tflops()
+hbm_info = fa_operator.calculate_hbm_throughput()
+analysis_text = fa_operator.self_analysis()
 
-total_pairs = max(0, nq * nk)
-mask_ratio = mask_usage_ratio(nq, nk, mask_type)
-mask_valid_pairs = lower_tri_pairs(nq, nk) if custom_mask_enabled else total_pairs
-mask_flops = flops_attention_masked(nq, nk, d, dv, mask_type, skip_masked_gemm)
-mask_hw_ratio = mask_flops["hw_density"]
+st.subheader("Parsed Workload Parameters")
+if analysis_text:
+    st.markdown(analysis_text)
+st.json(workload_metadata)
 
-def _scale_by_mask(value: float) -> float:
-    return value * mask_ratio if mask_ratio > 0 else 0.0
+mask_ratio = tflops_info["mask_ratio"]
+mask_valid_pairs = tflops_info["mask_valid_pairs"]
+total_pairs = tflops_info["total_pairs"]
+mask_hw_ratio = tflops_info["mask_hw_ratio"]
 
-# FLOPs (Tensor Core dominated): QK^T and P*V
-tensor_flops = batch * heads * mask_flops["flops_hw"]
-tensor_flops_effective = batch * heads * mask_flops["flops_effective"]
+tensor_flops = tflops_info["tensor_flops"]
+tensor_flops_effective = tflops_info["tensor_flops_effective"]
+valu_ops = tflops_info["valu_ops"]
+sfu_ops = tflops_info["sfu_ops"]
+hbm_bytes = hbm_info["hbm_bytes"]
 
-# VALU ops (approx): max + sum (+ dropout scale) per score element
-per_elem = 2 + (1 if dropout > 0 else 0)
-valu_ops = _scale_by_mask(batch * heads * nq * nk * per_elem)
+tc_peak = hardware.tensor_peak
+valu_peak = hardware.valu_peak
+sfu_peak = hardware.sfu_peak
+hbm_peak = hardware.hbm_peak
 
-# SFU ops: exp() per score element
-sfu_ops = _scale_by_mask(batch * heads * nq * nk)
-
-# Best-case FA HBM traffic (read Q,K,V; write O). Ignore RNG bytes.
-q_bytes = batch * heads    * nq * d  * bytes_per_el
-k_bytes = batch * kv_heads * nk * d  * bytes_per_el
-v_bytes = batch * kv_heads * nk * dv * bytes_per_el
-o_bytes = batch * heads    * nq * dv * bytes_per_el
-hbm_bytes = q_bytes + k_bytes + v_bytes + o_bytes
-
-# Peaks (/s)
-tc_peak = tc_tflops * 1e12
-valu_peak = fp32_tflops * 1e12
-sfu_peak = sfu_tops * 1e12
-hbm_peak = hbm_tbs * 1e12
-
-# Times
-t_tensor = tensor_flops / max(tc_peak, 1e-9)
-t_valu   = valu_ops     / max(valu_peak, 1e-9)
-t_sfu    = sfu_ops      / max(sfu_peak, 1e-9)
-t_hbm    = hbm_bytes    / max(hbm_peak, 1e-9)
+t_tensor = tflops_info["t_tensor"]
+t_valu = tflops_info["t_valu"]
+t_sfu = tflops_info["t_sfu"]
+t_hbm = hbm_info["t_hbm"]
 
 # Critical path & utilizations
 t_crit = max(t_tensor, t_valu, t_sfu, t_hbm)
@@ -683,7 +580,7 @@ elif t_crit == t_valu:
 else:
     bound = "SFU (exp)"
 
-freq_hz = freq_ghz * 1e9
+freq_hz = hardware.freq_hz
 cycles_dict = {
     "Tensor": t_tensor * freq_hz,
     "VALU":   t_valu   * freq_hz,
@@ -741,7 +638,7 @@ with col_m5:
 
 if custom_mask_enabled:
     st.caption(
-        f"{_MASK_LABELS.get(mask_type, mask_type)} keeps {mask_ratio*100:.2f}% "
+        f"{MASK_LABELS.get(mask_type, mask_type)} keeps {mask_ratio*100:.2f}% "
         f"of score pairs ({mask_valid_pairs:,} / {total_pairs:,}). "
         f"Hardware GEMM density = {mask_hw_ratio*100:.2f}% "
         f"(skip masked GEMM: {'Yes' if skip_masked_gemm else 'No'})."
@@ -950,7 +847,7 @@ summary_rows = [
 if custom_mask_enabled:
     summary_rows.extend(
         [
-            ("Mask type", _MASK_LABELS.get(mask_type, mask_type)),
+            ("Mask type", MASK_LABELS.get(mask_type, mask_type)),
             ("Skip masked GEMM", "Yes" if skip_masked_gemm else "No"),
             ("Mask util (effective)", f"{mask_ratio*100:.2f}%"),
             ("Mask util (hardware)", f"{mask_hw_ratio*100:.2f}%"),
@@ -1079,20 +976,20 @@ with st.expander("Tile Sweep (optional)", expanded=False):
                     smem_c["smem_total"] <= smem_limit_bytes
                     and regs_c["regs_thread"] <= max_regs_per_thread
                 )
-                    rows.append(
-                        {
-                            "M": M_candidate,
-                            "N": N_candidate,
-                            "SMEM_KB": smem_c["smem_total"] / 1024.0,
-                            "Regs/thread": regs_c["regs_thread"],
-                            "AI": ai_c["AI"],
-                            "Roofline_TFLOPs": ai_c["attainable_TFLOPs"],
-                            "Mask_effective_%": mask_ratio * 100.0 if custom_mask_enabled else 100.0,
-                            "Mask_hw_%": mask_exec_ratio_c * 100.0,
-                            "Mask_overhead_x": mask_overhead_c,
-                            "Valid": valid,
-                        }
-                    )
+                rows.append(
+                    {
+                        "M": M_candidate,
+                        "N": N_candidate,
+                        "SMEM_KB": smem_c["smem_total"] / 1024.0,
+                        "Regs/thread": regs_c["regs_thread"],
+                        "AI": ai_c["AI"],
+                        "Roofline_TFLOPs": ai_c["attainable_TFLOPs"],
+                        "Mask_effective_%": mask_ratio * 100.0 if custom_mask_enabled else 100.0,
+                        "Mask_hw_%": mask_exec_ratio_c * 100.0,
+                        "Mask_overhead_x": mask_overhead_c,
+                        "Valid": valid,
+                    }
+                )
         sweep_df = pd.DataFrame(rows)
         if sweep_df.empty:
             st.info("No tiles evaluated (check ranges).")
