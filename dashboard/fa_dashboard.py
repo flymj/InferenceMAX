@@ -7,6 +7,16 @@ import streamlit as st
 import plotly.express as px
 import pandas as pd
 
+if __package__ is None or __package__ == "":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from dashboard._paths import ensure_repo_root_on_path
+
+ensure_repo_root_on_path()
+
 from dashboard.operators import (
     FlashAttentionHardware,
     FlashAttentionOperator,
