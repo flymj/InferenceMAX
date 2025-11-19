@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from hardware_descriptions import FlashAttentionHardware, HardwareDescription
@@ -13,6 +15,20 @@ from .flash_attention_operator import (
     MASK_NONE,
     mask_usage_ratio,
 )
+
+def _add_llmcompass_to_path() -> None:
+    """Ensure the local LLMCompass repo is importable as a package."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    llm_dir = repo_root / "LLMCompass"
+    if not llm_dir.is_dir():  # pragma: no cover - depends on checkout contents
+        return
+    llm_path = str(llm_dir)
+    if llm_path not in sys.path:
+        sys.path.append(llm_path)
+
+
+_add_llmcompass_to_path()
 
 try:  # pragma: no cover - optional dependency wiring
     from LLMCompass.software_model.flash_attention import FlashAttention3
