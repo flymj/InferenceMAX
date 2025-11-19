@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+from hardware_descriptions import FlashAttentionHardware
 
 MASK_NONE = "none"
 MASK_CAUSAL_LT = "causal_lower_triangle"
@@ -113,43 +114,11 @@ def flops_attention_masked(
     }
 
 
-@dataclass
-class FlashAttentionHardware:
-    """Hardware description for FlashAttention estimates."""
-
-    tc_tflops: float
-    fp32_tflops: float
-    sfu_tops: float
-    hbm_tbs: float
-    freq_ghz: float
-
-    @property
-    def tensor_peak(self) -> float:
-        return max(self.tc_tflops, 0.0) * 1e12
-
-    @property
-    def valu_peak(self) -> float:
-        return max(self.fp32_tflops, 0.0) * 1e12
-
-    @property
-    def sfu_peak(self) -> float:
-        return max(self.sfu_tops, 0.0) * 1e12
-
-    @property
-    def hbm_peak(self) -> float:
-        return max(self.hbm_tbs, 0.0) * 1e12
-
-    @property
-    def freq_hz(self) -> float:
-        return max(self.freq_ghz, 0.0) * 1e9
-
-
 class FlashAttentionOperator:
     """Encapsulates FlashAttention workload estimation."""
 
-    def __init__(self, metadata: Dict[str, Any], hardware: FlashAttentionHardware):
+    def __init__(self, metadata: Dict[str, Any]):
         self.metadata = metadata or {}
-        self.hardware = hardware
 
     @staticmethod
     def _fmt_large(value: float) -> str:
@@ -186,7 +155,7 @@ class FlashAttentionOperator:
             "skip_masked_gemm": bool(meta.get("skip_masked_gemm", False)),
         }
 
-    def calculate_tflops(self) -> Dict[str, float]:
+    def calculate_tflops(self, hardware: FlashAttentionHardware) -> Dict[str, float]:
         """Calculate FLOPs/ops counts and per-unit times."""
 
         workload = self._workload()
@@ -207,9 +176,9 @@ class FlashAttentionOperator:
         valu_ops = mask_ratio * workload["batch"] * workload["heads"] * workload["nq"] * workload["nk"] * per_elem
         sfu_ops = mask_ratio * workload["batch"] * workload["heads"] * workload["nq"] * workload["nk"]
 
-        t_tensor = tensor_flops / max(self.hardware.tensor_peak, 1e-9)
-        t_valu = valu_ops / max(self.hardware.valu_peak, 1e-9)
-        t_sfu = sfu_ops / max(self.hardware.sfu_peak, 1e-9)
+        t_tensor = tensor_flops / max(hardware.tensor_peak, 1e-9)
+        t_valu = valu_ops / max(hardware.valu_peak, 1e-9)
+        t_sfu = sfu_ops / max(hardware.sfu_peak, 1e-9)
 
         return {
             "tensor_flops": tensor_flops,
@@ -225,7 +194,7 @@ class FlashAttentionOperator:
             "total_pairs": mask_flops["total_pairs"],
         }
 
-    def calculate_hbm_throughput(self) -> Dict[str, float]:
+    def calculate_hbm_throughput(self, hardware: FlashAttentionHardware) -> Dict[str, float]:
         """Calculate HBM traffic and time."""
 
         workload = self._workload()
@@ -235,16 +204,16 @@ class FlashAttentionOperator:
         v_bytes = workload["batch"] * workload["kv_heads"] * workload["nk"] * workload["dv"] * bytes_per_el
         o_bytes = workload["batch"] * workload["heads"] * workload["nq"] * workload["dv"] * bytes_per_el
         hbm_bytes = q_bytes + k_bytes + v_bytes + o_bytes
-        t_hbm = hbm_bytes / max(self.hardware.hbm_peak, 1e-9)
+        t_hbm = hbm_bytes / max(hardware.hbm_peak, 1e-9)
         return {"hbm_bytes": hbm_bytes, "t_hbm": t_hbm}
 
-    def self_analysis(self) -> str:
+    def self_analysis(self, hardware: FlashAttentionHardware) -> str:
         """Return a qualitative analysis of the current workload."""
 
         workload = self._workload()
         dtype = str(self.metadata.get("dtype", "bf16") or "bf16")
-        tflops = self.calculate_tflops()
-        hbm = self.calculate_hbm_throughput()
+        tflops = self.calculate_tflops(hardware)
+        hbm = self.calculate_hbm_throughput(hardware)
 
         t_tensor = tflops["t_tensor"]
         t_valu = tflops["t_valu"]
