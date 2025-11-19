@@ -145,16 +145,18 @@ class LLMCompassFlashAttentionOperator(FlashAttentionOperator):
             * effective_k
             * per_elem
         )
-        sfu_ops = (
-            workload["batch"]
-            * workload["heads"]
-            * workload["nq"]
-            * effective_k
-        )
+        sfu_ops = float(operator._softmax_flops())  # type: ignore[attr-defined]
 
         tensor_peak = max(hardware.tensor_peak, 1e-9)
         valu_peak = max(hardware.valu_peak, 1e-9)
-        sfu_peak = max(hardware.sfu_peak, 1e-9)
+        sfu_peak = hardware.sfu_peak
+        if sfu_peak <= 0:
+            # LLMCompass devices do not currently expose a dedicated SFU peak.
+            # Their special functions run on the same vector units as VALU ops,
+            # so reuse the vector throughput when an explicit SFU peak is
+            # missing to avoid reporting infinite SFU times.
+            sfu_peak = hardware.valu_peak or hardware.tensor_peak
+        sfu_peak = max(sfu_peak or 0.0, 1e-9)
 
         return {
             "tensor_flops": tensor_flops,
