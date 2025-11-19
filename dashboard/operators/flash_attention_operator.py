@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from hardware_descriptions import FlashAttentionHardware
 
@@ -114,6 +114,56 @@ def flops_attention_masked(
     }
 
 
+def _default_tile_sizes(nq: int, nk: int) -> Tuple[int, int]:
+    """Return heuristic tile sizes mirroring FlashAttention3 defaults."""
+
+    q_tile = max(1, min(128, int(nq)))
+    k_tile = max(32, min(256, int(nk)))
+    return q_tile, k_tile
+
+
+def _effective_k_for_block(q_start: int, q_block: int, nk: int, mask_type: str) -> int:
+    """Approximate how many keys participate in a query tile."""
+
+    nk = max(1, int(nk))
+    if mask_type != MASK_CAUSAL_LT:
+        return nk
+    first_token = min(nk, max(0, int(q_start)) + 1)
+    last_token = min(nk, max(0, int(q_start)) + max(1, int(q_block)))
+    return max(1, (first_token + last_token) // 2)
+
+
+def _approximate_flashattention_bytes(workload: Mapping[str, int], bytes_per_element: int) -> Dict[str, int]:
+    """Emulate the LLMCompass tile loop to estimate Q/K/V/O traffic."""
+
+    batch = max(1, int(workload.get("batch", 1)))
+    heads = max(1, int(workload.get("heads", 1)))
+    kv_heads = max(1, int(workload.get("kv_heads", heads)))
+    nq = max(1, int(workload.get("nq", 1)))
+    nk = max(1, int(workload.get("nk", 1)))
+    dim_qk = max(1, int(workload.get("d", 1)))
+    dim_v = max(1, int(workload.get("dv", 1)))
+    mask_type = str(workload.get("mask_type", MASK_NONE))
+
+    q_bytes = batch * heads * nq * dim_qk * bytes_per_element
+    o_bytes = batch * heads * nq * dim_v * bytes_per_element
+
+    q_tile, k_tile = _default_tile_sizes(nq, nk)
+    k_bytes = 0
+    v_bytes = 0
+    for q_start in range(0, nq, q_tile):
+        q_block = min(q_tile, nq - q_start)
+        effective_k = _effective_k_for_block(q_start, q_block, nk, mask_type)
+        kv_consumed = 0
+        while kv_consumed < effective_k:
+            kv_block = min(k_tile, effective_k - kv_consumed)
+            kv_consumed += kv_block
+            k_bytes += batch * kv_heads * kv_block * dim_qk * bytes_per_element
+            v_bytes += batch * kv_heads * kv_block * dim_v * bytes_per_element
+
+    return {"q_bytes": q_bytes, "k_bytes": k_bytes, "v_bytes": v_bytes, "o_bytes": o_bytes}
+
+
 class FlashAttentionOperator:
     """Encapsulates FlashAttention workload estimation."""
 
@@ -198,12 +248,8 @@ class FlashAttentionOperator:
         """Calculate HBM traffic and time."""
 
         workload = self._workload()
-        bytes_per_el = self._bytes_per_element()
-        q_bytes = workload["batch"] * workload["heads"] * workload["nq"] * workload["d"] * bytes_per_el
-        k_bytes = workload["batch"] * workload["kv_heads"] * workload["nk"] * workload["d"] * bytes_per_el
-        v_bytes = workload["batch"] * workload["kv_heads"] * workload["nk"] * workload["dv"] * bytes_per_el
-        o_bytes = workload["batch"] * workload["heads"] * workload["nq"] * workload["dv"] * bytes_per_el
-        hbm_bytes = q_bytes + k_bytes + v_bytes + o_bytes
+        breakdown = _approximate_flashattention_bytes(workload, self._bytes_per_element())
+        hbm_bytes = breakdown["q_bytes"] + breakdown["k_bytes"] + breakdown["v_bytes"] + breakdown["o_bytes"]
         t_hbm = hbm_bytes / max(hardware.hbm_peak, 1e-9)
         return {"hbm_bytes": hbm_bytes, "t_hbm": t_hbm}
 
