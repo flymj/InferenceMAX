@@ -40,15 +40,14 @@ class GeLU(Operator):
             , pcb_module.global_buffer_bandwidth_per_cycle
             * pcb_module.compute_module.clock_freq)
         )
-        total_flop_count = M * (
-            10 + pcb_module.compute_module.core.vector_unit.flops_per_exp
-        )
-        compute_latency = (
-            total_flop_count
-            / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
-            / pcb_module.compute_module.core_count
-            / pcb_module.compute_module.clock_freq
-        )
+        vector_flops = M * 10
+        sfu_ops = M
+        flops_per_exp = pcb_module.compute_module.core.vector_unit.flops_per_exp
+        self.flop_count = vector_flops + sfu_ops * flops_per_exp
+        vector_latency = vector_flops / pcb_module.compute_module.total_vector_flops
+        total_sfu_ops = getattr(pcb_module.compute_module, "total_sfu_ops", 0.0)
+        sfu_latency = sfu_ops / max(total_sfu_ops, 1e-9)
+        compute_latency = max(vector_latency, sfu_latency)
         self.roofline_latency = max(compute_latency, io_latency)
         return self.roofline_latency
 
@@ -78,15 +77,12 @@ class GeLU(Operator):
             / pcb_module.global_buffer_bandwidth_per_cycle
             / pcb_module.compute_module.clock_freq
         )
-        total_flop_count = M * (
-            10 + pcb_module.compute_module.core.vector_unit.flops_per_exp
-        )
-        compute_latency = (
-            total_flop_count
-            / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
-            / pcb_module.compute_module.core_count
-            / pcb_module.compute_module.clock_freq
-        )
+        vector_flops = M * 10
+        sfu_ops = M
+        vector_latency = vector_flops / pcb_module.compute_module.total_vector_flops
+        total_sfu_ops = getattr(pcb_module.compute_module, "total_sfu_ops", 0.0)
+        sfu_latency = sfu_ops / max(total_sfu_ops, 1e-9)
+        compute_latency = max(vector_latency, sfu_latency)
 
         return max(compute_latency, io_latency)
 

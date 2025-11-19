@@ -76,6 +76,25 @@ def render_sidebar() -> Dict[str, object]:
         )
 
     chip = ChipSpec(tflops=tflops, mfu=mfu, hbm_bw_GBs=hbm_bw, net_bw_GBs=net_bw)
+
+    tensor_baseline = float(preset_metrics.get("fp16_tflops", tflops)) or float(tflops)
+    scale = float(tflops) / tensor_baseline if tensor_baseline else 1.0
+    valu_baseline = preset_metrics.get("fp32_tflops")
+    sfu_baseline = preset_metrics.get("sfu_tflops")
+
+    valu_tflops = float(valu_baseline) * scale if valu_baseline else None
+    sfu_tflops = float(sfu_baseline) * scale if sfu_baseline else None
+    if sfu_tflops is None and valu_tflops is not None:
+        sfu_tflops = valu_tflops / 4.0
+
+    hardware_capabilities = {
+        "tensor_tflops": float(tflops),
+        "valu_tflops": valu_tflops,
+        "sfu_tflops": sfu_tflops,
+        "hbm_bw_GBs": float(hbm_bw),
+        "net_bw_GBs": float(net_bw),
+    }
+
     config = {
         "chip_name": preset_name,
         "chip_spec": chip,
@@ -85,6 +104,8 @@ def render_sidebar() -> Dict[str, object]:
         "hbm_per_gpu_gb": hbm_capacity,
         "default_weight_dtype": dtype,
         "default_weight_bytes": _DTYPE_BYTES[dtype],
+        "hardware_capabilities": hardware_capabilities,
+        "preset_metrics": dict(preset_metrics),
     }
 
     st.session_state["hardware_config"] = config

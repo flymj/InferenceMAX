@@ -31,6 +31,9 @@ class VectorUnit:
         data_type=data_type_dict["fp16"],
     ):
         self.total_vector_flops_per_cycle = total_vector_flops_per_cycle
+        # LLMCompass assumes a dedicated SFU pipeline whose throughput is a
+        # quarter of the FP32 VALU capability.
+        self.sfu_ops_per_cycle = total_vector_flops_per_cycle / 4.0
         self.word_size = word_size  # Byte
         self.flops_per_exp = flops_per_exp  # flops per exp instruction
         self.vector_width = vector_width
@@ -179,6 +182,8 @@ class ComputeModule:
             core.vector_unit.total_vector_flops_per_cycle * core_count
         )
         self.total_vector_flops = self.total_vector_flops_per_cycle * clock_freq
+        self.total_sfu_ops_per_cycle = core.vector_unit.sfu_ops_per_cycle * core_count
+        self.total_sfu_ops = self.total_sfu_ops_per_cycle * clock_freq
         self.total_systolic_array_flops = (
             core_count
             * core.systolic_array_count

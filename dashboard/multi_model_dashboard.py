@@ -27,6 +27,7 @@ from dashboard.components.sidebar import render_sidebar
 from dashboard.features import ChunkedPrefill, KvCacheTraffic
 from dashboard.models import build_model
 from dashboard.common import load_model_json
+from hardware_descriptions import HardwareDescription
 try:  # pragma: no cover - allow running as a script
     from dashboard.services.llm_calcs import (
         ModelProfile,
@@ -90,6 +91,124 @@ DTYPE_BYTES = {
     "FP8": 1,
     "INT8": 1,
 }
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
+
+
+def _caps_from_description(description: object) -> Dict[str, Optional[float]]:
+    caps: Dict[str, Optional[float]] = {}
+    if isinstance(description, HardwareDescription):
+        caps["tensor_tflops"] = _safe_float(description.tc_tflops)
+        caps["valu_tflops"] = _safe_float(description.fp32_tflops)
+        caps["sfu_tflops"] = _safe_float(description.sfu_tflops)
+        memory = getattr(description, "memory", None)
+        if memory and getattr(memory, "hbm_bandwidth_bytes_per_s", None):
+            caps["hbm_bw_GBs"] = _safe_float(memory.hbm_bandwidth_bytes_per_s / 1e9)
+        interconnect = getattr(description, "interconnect", None)
+        if interconnect and getattr(interconnect, "bandwidth_bytes_per_s", None):
+            caps["net_bw_GBs"] = _safe_float(interconnect.bandwidth_bytes_per_s / 1e9)
+    elif isinstance(description, Mapping):
+        caps["tensor_tflops"] = _safe_float(description.get("tensor_tflops"))
+        caps["valu_tflops"] = _safe_float(description.get("fp32_tflops"))
+        caps["sfu_tflops"] = _safe_float(description.get("sfu_tflops"))
+        hbm_tbs = _safe_float(description.get("hbm_tbs"))
+        if hbm_tbs:
+            caps["hbm_bw_GBs"] = hbm_tbs * 1000.0
+        memory = description.get("memory")
+        if isinstance(memory, Mapping):
+            hbm_bw = _safe_float(memory.get("hbm_bandwidth_bytes_per_s"))
+            if hbm_bw:
+                caps["hbm_bw_GBs"] = hbm_bw / 1e9
+        interconnect = description.get("interconnect")
+        if isinstance(interconnect, Mapping):
+            net_bw = _safe_float(interconnect.get("bandwidth_bytes_per_s"))
+            if net_bw:
+                caps["net_bw_GBs"] = net_bw / 1e9
+    return {k: v for k, v in caps.items() if v is not None}
+
+
+def _derive_hardware_capabilities(hardware: Mapping[str, Any]) -> Dict[str, Optional[float]]:
+    derived: Dict[str, Optional[float]] = {}
+    descriptor = hardware.get("hardware_description")
+    if descriptor is not None:
+        derived.update(_caps_from_description(descriptor))
+    capabilities = hardware.get("hardware_capabilities") or {}
+    if isinstance(capabilities, Mapping):
+        for key, value in capabilities.items():
+            derived[key] = _safe_float(value)
+
+    chip = hardware.get("chip_spec")
+    if chip is not None:
+        derived.setdefault("tensor_tflops", _safe_float(getattr(chip, "tflops", None)))
+        derived.setdefault("hbm_bw_GBs", _safe_float(getattr(chip, "hbm_bw_GBs", None)))
+        derived.setdefault("net_bw_GBs", _safe_float(getattr(chip, "net_bw_GBs", None)))
+
+    metrics = hardware.get("preset_metrics")
+    tensor_current = derived.get("tensor_tflops")
+    tensor_baseline = _safe_float(metrics.get("fp16_tflops")) if isinstance(metrics, Mapping) else None
+    scale = None
+    if tensor_current and tensor_baseline and tensor_baseline > 0:
+        scale = tensor_current / tensor_baseline
+
+    valu_baseline = _safe_float(metrics.get("fp32_tflops")) if isinstance(metrics, Mapping) else None
+    sfu_baseline = _safe_float(metrics.get("sfu_tflops")) if isinstance(metrics, Mapping) else None
+
+    if derived.get("valu_tflops") is None:
+        if valu_baseline is not None:
+            derived["valu_tflops"] = valu_baseline * scale if scale else valu_baseline
+        elif tensor_current is not None:
+            derived["valu_tflops"] = tensor_current / 2.0
+
+    if derived.get("sfu_tflops") is None:
+        if sfu_baseline is not None:
+            derived["sfu_tflops"] = sfu_baseline * scale if scale else sfu_baseline
+        elif derived.get("valu_tflops") is not None:
+            derived["sfu_tflops"] = derived["valu_tflops"] / 4.0
+
+    return derived
+
+
+def _format_capability(value: Optional[float], unit: str) -> str:
+    if value is None:
+        return "-"
+    magnitude = abs(value)
+    if magnitude >= 1000:
+        formatted = f"{value:,.0f}"
+    elif magnitude >= 100:
+        formatted = f"{value:,.1f}"
+    elif magnitude >= 10:
+        formatted = f"{value:,.2f}"
+    else:
+        formatted = f"{value:.2f}"
+    unit_suffix = f" {unit}" if unit else ""
+    return f"{formatted}{unit_suffix}"
+
+
+def _render_hardware_capabilities_panel(hardware: Mapping[str, Any]) -> None:
+    caps = _derive_hardware_capabilities(hardware)
+    if not caps:
+        st.markdown("**Hardware Capabilities**")
+        st.caption("No capability data available for the selected hardware.")
+        return
+
+    rows = [
+        ("Tensor Core TFLOPs", caps.get("tensor_tflops"), "TFLOPs"),
+        ("VALU TFLOPs", caps.get("valu_tflops"), "TFLOPs"),
+        ("SFU TFLOPs", caps.get("sfu_tflops"), "TFLOPs"),
+        ("Interconnect Bandwidth", caps.get("net_bw_GBs"), "GB/s"),
+        ("HBM Bandwidth", caps.get("hbm_bw_GBs"), "GB/s"),
+    ]
+    data = [{"Capability": label, "Per GPU": _format_capability(value, unit)} for label, value, unit in rows]
+    st.markdown("**Hardware Capabilities**")
+    st.table(pd.DataFrame(data))
 
 
 def _get_model_state() -> List[Dict[str, object]]:
@@ -533,6 +652,10 @@ def _model_metrics(
     params_total = profile.weights_total_bytes / max(1, _dtype_bytes(weight_dtype, hardware["default_weight_bytes"]))
     params_b = params_total / 1e9
 
+    decode_bytes = float(memory.decode_total_bytes)
+    decode_ai = float(flops_decode) / max(decode_bytes, 1.0)
+    decode_bound = "Compute" if times.t_comp_decode_ms >= times.t_hbm_decode_ms else "HBM"
+
     record = {
         "Model": str(model.get("name", "Model")),
         "Params (B)": params_b,
@@ -546,6 +669,10 @@ def _model_metrics(
         "Total Steady HBM / GPU (GB)": steady_hbm_gb,
         "HBM Headroom (GB)": headroom_gb,
         "HBM Capacity (GB)": hardware["hbm_per_gpu_gb"],
+        "Peak TFLOPs": float(chip.tflops),
+        "Effective TFLOPs (MFU)": eff_tflops,
+        "Compute MFU": float(chip.mfu),
+        "HBM efficiency": float(hbm_eff),
         "Prefill FLOPs (T)": flops_prefill / 1e12,
         "Decode FLOPs/token (G)": decode_flops_per_token / 1e9,
         "TTFT (ms)": times.ttft_theory_ms,
@@ -563,6 +690,13 @@ def _model_metrics(
         "Total GPUs": float(extras["total_gpus"]),
         "Weight dtype": weight_dtype,
         "Activation dtype": activation_dtype,
+        "_decode_flops": flops_decode,
+        "_decode_bytes": decode_bytes,
+        "_decode_ai": decode_ai,
+        "_decode_compute_ms": times.t_comp_decode_ms,
+        "_decode_hbm_ms": times.t_hbm_decode_ms,
+        "_tpot_theory_ms": times.tpot_theory_ms,
+        "_decode_bound": decode_bound,
     }
 
     return record, curve
@@ -676,6 +810,7 @@ def _render_summary(
     records: List[Dict[str, Any]],
     curves: List[Tuple[str, pd.DataFrame]],
     workload: WorkloadSettings,
+    hardware: Mapping[str, Any],
 ) -> None:
     if not records:
         st.info("Add at least one model to see the comparison summary.")
@@ -690,6 +825,10 @@ def _render_summary(
         "Steady KV state / GPU (GB)",
         "Total Steady HBM / GPU (GB)",
         "HBM Headroom (GB)",
+        "Peak TFLOPs",
+        "Effective TFLOPs (MFU)",
+        "Compute MFU",
+        "HBM efficiency",
         "Seq/s per GPU @ baseline",
         "Tokens/s per GPU @ baseline",
         "Seq/s per GPU (theory)",
@@ -704,7 +843,11 @@ def _render_summary(
         "Activation dtype",
     ]
     available_cols = [c for c in cols if c in df.columns]
-    st.dataframe(df[available_cols], use_container_width=True)
+    table_col, hw_col = st.columns((3, 2))
+    with table_col:
+        st.dataframe(df[available_cols], use_container_width=True)
+    with hw_col:
+        _render_hardware_capabilities_panel(hardware)
 
     st.caption(
         "Baseline concurrency per GPU: "
@@ -774,6 +917,98 @@ def _render_summary(
     )
     st.plotly_chart(fig_hbm, use_container_width=True)
 
+    _render_roofline(records, workload, hardware)
+
+
+def _render_roofline(
+    records: List[Mapping[str, Any]],
+    workload: WorkloadSettings,
+    hardware: Mapping[str, Any],
+) -> None:
+    if not records:
+        return
+
+    chip = hardware.get("chip_spec")
+    if chip is None:
+        return
+
+    peak_tf = float(getattr(chip, "tflops", 0.0)) * float(getattr(chip, "mfu", 0.0))
+    if peak_tf <= 0:
+        return
+
+    hbm_eff = workload.chunked_prefill.adjust_hbm_efficiency(workload.base_hbm_efficiency)
+    eff_bw_slope = float(getattr(chip, "hbm_bw_GBs", 0.0)) * float(hbm_eff) / 1000.0
+    if eff_bw_slope <= 0:
+        return
+
+    ai_values = [float(rec.get("_decode_ai", 0.0)) for rec in records if rec.get("_decode_ai", 0.0) > 0]
+    if not ai_values:
+        return
+
+    x_min = min(ai_values)
+    x_max = max(ai_values)
+    if x_min <= 0 or x_max <= 0:
+        return
+    span_low = max(1e-6, x_min * 0.5)
+    span_high = max(span_low * 10.0, x_max * 2.0)
+    xs = np.logspace(math.log10(span_low), math.log10(span_high), 200)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=xs,
+            y=[peak_tf] * len(xs),
+            mode="lines",
+            name="Compute roof",
+            line=dict(dash="dash"),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=xs,
+            y=eff_bw_slope * xs,
+            mode="lines",
+            name="Communication roof",
+            line=dict(dash="dot"),
+        )
+    )
+
+    for record in records:
+        ai = float(record.get("_decode_ai", 0.0))
+        flops_decode = float(record.get("_decode_flops", 0.0))
+        tpot_ms = float(record.get("_tpot_theory_ms", 0.0))
+        if ai <= 0 or flops_decode <= 0 or tpot_ms <= 0:
+            continue
+        achieved_tf = (flops_decode / 1e12) / (tpot_ms / 1000.0)
+        bound = str(record.get("_decode_bound", ""))
+        t_comp = float(record.get("_decode_compute_ms", 0.0))
+        t_hbm = float(record.get("_decode_hbm_ms", 0.0))
+        fig.add_trace(
+            go.Scatter(
+                x=[ai],
+                y=[achieved_tf],
+                mode="markers",
+                name=record.get("Model", "Model"),
+                legendgroup="models",
+                marker=dict(size=10, symbol="circle"),
+                customdata=[[bound, t_comp, t_hbm]],
+                hovertemplate=(
+                    "AI=%{x:.2e} FLOPs/B<br>Throughput=%{y:.2f} TFLOPs/s"
+                    "<br>Bound=%{customdata[0]}"
+                    "<br>t_comp=%{customdata[1]:.2f} ms"
+                    "<br>t_hbm=%{customdata[2]:.2f} ms<extra>%{fullData.name}</extra>"
+                ),
+            )
+        )
+
+    fig.update_layout(
+        title="Computation vs Communication Roofline",
+        xaxis_title="Arithmetic intensity (decode FLOPs / byte)",
+        yaxis_title="Attainable TFLOPs/s",
+        xaxis_type="log",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
 
 def main() -> None:
     st.set_page_config(page_title="Model Comparison Dashboard", layout="wide")
@@ -815,7 +1050,7 @@ def main() -> None:
             records.append(record)
             if curve is not None:
                 curves.append((record["Model"], curve))
-    _render_summary(records, curves, workload)
+    _render_summary(records, curves, workload, hardware)
 
 
 if __name__ == "__main__":

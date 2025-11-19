@@ -57,6 +57,7 @@ class FlashAttention3(Operator):
     """Tile-level simulator for FlashAttention v3."""
 
     SOFTMAX_FLOP_FACTOR = 5
+    SOFTMAX_SFU_FACTOR = 1
 
     def __init__(
         self,
@@ -117,9 +118,12 @@ class FlashAttention3(Operator):
         assert self.shape is not None, "Call the operator before profiling."
         systolic_flops = pcb_module.compute_module.total_systolic_array_flops
         vector_flops = pcb_module.compute_module.total_vector_flops
+        sfu_throughput = max(getattr(pcb_module.compute_module, "total_sfu_ops", 0.0), 1e-9)
+        softmax_vector_latency = self._softmax_flops() / vector_flops
+        softmax_sfu_latency = self._softmax_sfu_ops() / sfu_throughput
         compute_latency = (
             (self._qk_flops + self._pv_flops) / systolic_flops
-            + self._softmax_flops() / vector_flops
+            + max(softmax_vector_latency, softmax_sfu_latency)
         )
         bandwidth = min(
             pcb_module.io_module.bandwidth,
@@ -283,11 +287,18 @@ class FlashAttention3(Operator):
 
     def _softmax_flops(self) -> int:
         assert self.shape is not None
+        return self._softmax_base_ops() * self.SOFTMAX_FLOP_FACTOR
+
+    def _softmax_sfu_ops(self) -> int:
+        assert self.shape is not None
+        return self._softmax_base_ops() * self.SOFTMAX_SFU_FACTOR
+
+    def _softmax_base_ops(self) -> int:
+        assert self.shape is not None
         return (
             self.shape.batch
             * self.shape.heads
             * self.shape.query_len
             * self._effective_k_for_block(0, self.shape.query_len)
-            * self.SOFTMAX_FLOP_FACTOR
         )
 

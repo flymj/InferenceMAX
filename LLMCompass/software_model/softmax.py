@@ -11,6 +11,11 @@ import numpy as np
 
 
 class Softmax(Operator):
+    VECTOR_FLOPS_PER_ELEMENT = 7
+    SFU_OPS_PER_ELEMENT = 3
+    REDUCTION_VECTOR_FLOPS_PER_ELEMENT = 2
+    REDUCTION_SFU_OPS_PER_ELEMENT = 1
+
     def __init__(self, data_type: DataType):
         super().__init__(0, 0, 0, 0, data_type)
         self.shape = None
@@ -59,16 +64,18 @@ class Softmax(Operator):
     
     def roofline_model(self, pcb_module: Device):
         self.io_count = self.M * self.N * self.data_type.word_size * 3
-        self.flop_count = self.M * self.N * (pcb_module.compute_module.core.vector_unit.flops_per_exp * 3 + 7)
-        self.roofline_latency = max(
-            self.io_count
-            / min(
-                pcb_module.io_module.bandwidth,
-                pcb_module.global_buffer_bandwidth_per_cycle
-                * pcb_module.compute_module.clock_freq,
-            ),
-            self.flop_count / pcb_module.compute_module.total_vector_flops,
+        vector_flops, sfu_ops = self._workload_counts(self.M, self.N)
+        flops_per_exp = pcb_module.compute_module.core.vector_unit.flops_per_exp
+        self.flop_count = vector_flops + sfu_ops * flops_per_exp
+        io_latency = self.io_count / min(
+            pcb_module.io_module.bandwidth,
+            pcb_module.global_buffer_bandwidth_per_cycle
+            * pcb_module.compute_module.clock_freq,
         )
+        vector_latency = vector_flops / pcb_module.compute_module.total_vector_flops
+        total_sfu_ops = getattr(pcb_module.compute_module, "total_sfu_ops", 0.0)
+        sfu_latency = sfu_ops / max(total_sfu_ops, 1e-9)
+        self.roofline_latency = max(io_latency, vector_latency, sfu_latency)
         return self.roofline_latency
 
     def compile_and_simulate(self, pcb_module: Device, compile_mode=None):
@@ -250,9 +257,6 @@ class Softmax(Operator):
         ):
             self.M = M
             self.N = N
-            self.flops_per_exp = (
-                pcb_module.compute_module.core.vector_unit.flops_per_exp
-            )
             self.read_cycle_count = self.simulate_l1_tile_io_cycle_count(
                 M, N, data_type, pcb_module
             )
@@ -263,10 +267,7 @@ class Softmax(Operator):
                 M, N, data_type, pcb_module
             )
             self.reduction_cycle_count = (
-                M
-                * N
-                * (self.flops_per_exp + 2)
-                / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
+                self._compute_reduction_cycles(M, N, pcb_module)
                 + M
                 * N
                 * data_type.word_size
@@ -296,11 +297,33 @@ class Softmax(Operator):
             pcb_module: Device,
         ):
             # online softmax
-            total_flop_count = M * N * (self.flops_per_exp * 3 + 7)
-            return ceil(
-                total_flop_count
-                / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
+            vector_flops, sfu_ops = Softmax._workload_counts(M, N)
+            vector_cycles = vector_flops / (
+                pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
             )
+            sfu_cycles = sfu_ops / max(
+                pcb_module.compute_module.core.vector_unit.sfu_ops_per_cycle, 1e-9
+            )
+            return ceil(max(vector_cycles, sfu_cycles))
+
+        def _compute_reduction_cycles(self, M: int, N: int, pcb_module: Device) -> float:
+            vector_flops = (
+                M * N * Softmax.REDUCTION_VECTOR_FLOPS_PER_ELEMENT
+            )
+            sfu_ops = M * N * Softmax.REDUCTION_SFU_OPS_PER_ELEMENT
+            vector_cycles = vector_flops / (
+                pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
+            )
+            sfu_cycles = sfu_ops / max(
+                pcb_module.compute_module.core.vector_unit.sfu_ops_per_cycle, 1e-9
+            )
+            return max(vector_cycles, sfu_cycles)
+
+    @staticmethod
+    def _workload_counts(M: int, N: int) -> Tuple[int, int]:
+        vector_flops = M * N * Softmax.VECTOR_FLOPS_PER_ELEMENT
+        sfu_ops = M * N * Softmax.SFU_OPS_PER_ELEMENT
+        return vector_flops, sfu_ops
 
     def run_on_gpu(self):
         assert self.shape is not None

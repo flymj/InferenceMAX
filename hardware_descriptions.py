@@ -69,6 +69,7 @@ class HardwareDescription:
 
     tc_tflops: Optional[float] = None
     fp32_tflops: Optional[float] = None
+    sfu_tflops: Optional[float] = None
     sfu_tops: Optional[float] = None
     hbm_tbs: Optional[float] = None
     freq_ghz: Optional[float] = None
@@ -102,13 +103,27 @@ class HardwareDescription:
 
     @property
     def sfu_peak(self) -> float:
+        if self.sfu_tflops is not None:
+            return max(self.sfu_tflops, 0.0) * 1e12
         if self.sfu_tops is not None:
             return max(self.sfu_tops, 0.0) * 1e12
+        if self.fp32_tflops is not None:
+            return max(self.fp32_tflops / 4.0, 0.0) * 1e12
         if self.compute and self.compute.sfu_ops_per_cycle and (
             self.compute.clock_hz or self.freq_hz
         ):
             clock = self.compute.clock_hz or self.freq_hz
             return max(self.compute.sfu_ops_per_cycle * clock, 0.0)
+        if (
+            self.compute
+            and self.compute.vector_flops_per_cycle
+            and (self.compute.clock_hz or self.freq_hz)
+        ):
+            clock = self.compute.clock_hz or self.freq_hz
+            return max((self.compute.vector_flops_per_cycle * clock) / 4.0, 0.0)
+        valu_peak = self.valu_peak
+        if valu_peak:
+            return valu_peak / 4.0
         return 0.0
 
     @property
@@ -136,6 +151,7 @@ class HardwareDescription:
             "name": self.name,
             "tensor_tflops": self.tc_tflops,
             "fp32_tflops": self.fp32_tflops,
+            "sfu_tflops": self.sfu_tflops,
             "sfu_tops": self.sfu_tops,
             "hbm_tbs": self.hbm_tbs,
             "freq_ghz": self.freq_ghz,
@@ -204,7 +220,9 @@ class HardwareDescription:
                 vector_flops_per_cycle=getattr(
                     vector_unit, "total_vector_flops_per_cycle", None
                 ),
-                sfu_ops_per_cycle=None,
+                sfu_ops_per_cycle=getattr(vector_unit, "sfu_ops_per_cycle", None)
+                if vector_unit
+                else None,
                 tensor_array_shape=tensor_shape,
                 tensor_array_count=getattr(core, "systolic_array_count", None),
                 vector_width=getattr(vector_unit, "vector_width", None),
@@ -256,10 +274,20 @@ class HardwareDescription:
             or 0.0
         )
 
+        fp32_tflops = (vector_flops / 1e12) if vector_flops is not None else None
+        sfu_ops = getattr(compute_module, "total_sfu_ops", None)
+        if sfu_ops is not None:
+            sfu_tflops = sfu_ops / 1e12
+        elif fp32_tflops is not None:
+            sfu_tflops = fp32_tflops / 4.0
+        else:
+            sfu_tflops = None
+
         return cls(
             name=name or getattr(device, "__class__", type(device)).__name__,
             tc_tflops=(tensor_flops / 1e12) if tensor_flops is not None else None,
-            fp32_tflops=(vector_flops / 1e12) if vector_flops is not None else None,
+            fp32_tflops=fp32_tflops,
+            sfu_tflops=sfu_tflops,
             sfu_tops=None,
             hbm_tbs=(hbm_bandwidth_value / 1e12) if hbm_bandwidth_value else None,
             freq_ghz=(clock / 1e9) if clock else None,
