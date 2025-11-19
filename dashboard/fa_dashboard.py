@@ -538,10 +538,10 @@ hardware = FlashAttentionHardware(
     hbm_tbs=hbm_tbs,
     freq_ghz=freq_ghz,
 )
-fa_operator = FlashAttentionOperator(workload_metadata, hardware)
-tflops_info = fa_operator.calculate_tflops()
-hbm_info = fa_operator.calculate_hbm_throughput()
-analysis_text = fa_operator.self_analysis()
+fa_operator = FlashAttentionOperator(workload_metadata)
+tflops_info = fa_operator.calculate_tflops(hardware)
+hbm_info = fa_operator.calculate_hbm_throughput(hardware)
+analysis_text = fa_operator.self_analysis(hardware)
 
 st.subheader("Parsed Workload Parameters")
 if analysis_text:
