@@ -10,9 +10,12 @@ import pandas as pd
 from dashboard.operators import (
     FlashAttentionHardware,
     FlashAttentionOperator,
+    LLMCompassFlashAttentionOperator,
     MASK_CAUSAL_LT,
     MASK_LABELS,
     MASK_NONE,
+    get_llmcompass_devices,
+    make_llmcompass_hardware,
 )
 
 st.set_page_config(page_title="FlashAttention UT Roofline", layout="wide")
@@ -531,22 +534,137 @@ workload_metadata = {
     "mask_type": mask_type,
     "skip_masked_gemm": skip_masked_gemm,
 }
-hardware = FlashAttentionHardware(
+manual_hardware = FlashAttentionHardware(
     tc_tflops=tc_tflops,
     fp32_tflops=fp32_tflops,
     sfu_tops=sfu_tops,
     hbm_tbs=hbm_tbs,
     freq_ghz=freq_ghz,
 )
-fa_operator = FlashAttentionOperator(workload_metadata)
-tflops_info = fa_operator.calculate_tflops(hardware)
-hbm_info = fa_operator.calculate_hbm_throughput(hardware)
+
+MANUAL_IMPL = "Manual roofline (input peaks)"
+LLM_PREFIX = "LLMCompass: "
+llm_devices = get_llmcompass_devices()
+impl_options = [MANUAL_IMPL] + [f"{LLM_PREFIX}{name}" for name in llm_devices.keys()]
+default_selection = [MANUAL_IMPL]
+selected_impls = st.multiselect(
+    "Select operator/hardware implementations to evaluate",
+    options=impl_options,
+    default=default_selection,
+)
+if not selected_impls:
+    selected_impls = default_selection
+primary_impl = st.selectbox("Primary implementation for deep dive", options=selected_impls, index=0)
+
+scenarios = []
+for impl in selected_impls:
+    if impl == MANUAL_IMPL:
+        scenario_hardware = manual_hardware
+        operator = FlashAttentionOperator(workload_metadata)
+        label = MANUAL_IMPL
+    elif impl.startswith(LLM_PREFIX):
+        device_name = impl.split(":", 1)[1].strip()
+        device = llm_devices.get(device_name)
+        if device is None:
+            st.warning(f"LLMCompass device '{device_name}' not available; skipping.")
+            continue
+        scenario_hardware = make_llmcompass_hardware(device_name, device=device)
+        operator = LLMCompassFlashAttentionOperator(workload_metadata)
+        label = f"LLMCompass • {device_name}"
+    else:
+        continue
+
+    tflops_info = operator.calculate_tflops(scenario_hardware)
+    hbm_info = operator.calculate_hbm_throughput(scenario_hardware)
+    times = {
+        "Tensor": tflops_info["t_tensor"],
+        "VALU": tflops_info["t_valu"],
+        "SFU": tflops_info["t_sfu"],
+        "HBM": hbm_info["t_hbm"],
+    }
+    t_crit = max(times.values())
+    if t_crit == times["HBM"]:
+        bound = "HBM Bandwidth"
+    elif t_crit == times["Tensor"]:
+        bound = "Tensor Core"
+    elif t_crit == times["VALU"]:
+        bound = "VALU (FP32)"
+    else:
+        bound = "SFU (exp)"
+    freq_hz = scenario_hardware.freq_hz
+    cycles_dict = {unit: times[unit] * freq_hz for unit in _units()}
+    util_dict = {
+        unit: (min(1.0, times[unit] / t_crit) if t_crit > 0 else 0.0)
+        for unit in _units()
+    }
+    scenarios.append(
+        {
+            "key": impl,
+            "label": label,
+            "hardware": scenario_hardware,
+            "operator": operator,
+            "tflops": tflops_info,
+            "hbm": hbm_info,
+            "times": times,
+            "cycles": cycles_dict,
+            "util": util_dict,
+            "t_crit": t_crit,
+            "bound": bound,
+            "freq_hz": freq_hz,
+        }
+    )
+
+if not scenarios:
+    st.error("No valid implementations evaluated. Please adjust selections.")
+    st.stop()
+
+primary = next((s for s in scenarios if s["key"] == primary_impl), scenarios[0])
+hardware = primary["hardware"]
+fa_operator = primary["operator"]
+tflops_info = primary["tflops"]
+hbm_info = primary["hbm"]
 analysis_text = fa_operator.self_analysis(hardware)
 
 st.subheader("Parsed Workload Parameters")
 if analysis_text:
     st.markdown(analysis_text)
 st.json(workload_metadata)
+
+if len(scenarios) > 1:
+    st.subheader("Operator & Hardware Comparison")
+    comp_rows = []
+    for scenario in scenarios:
+        comp_rows.append(
+            {
+                "Implementation": scenario["label"],
+                "Bound": scenario["bound"],
+                "Latency (ms)": scenario["t_crit"] * 1e3,
+                "Tensor Time (ms)": scenario["times"]["Tensor"] * 1e3,
+                "VALU Time (ms)": scenario["times"]["VALU"] * 1e3,
+                "SFU Time (ms)": scenario["times"]["SFU"] * 1e3,
+                "HBM Time (ms)": scenario["times"]["HBM"] * 1e3,
+                "Tensor FLOPs": scenario["tflops"]["tensor_flops"],
+                "HBM Bytes": scenario["hbm"]["hbm_bytes"],
+                "Mask HW %": scenario["tflops"]["mask_hw_ratio"] * 100.0,
+            }
+        )
+    display_rows = []
+    for row in comp_rows:
+        display_rows.append(
+            {
+                "Implementation": row["Implementation"],
+                "Bound": row["Bound"],
+                "Latency (ms)": f"{row['Latency (ms)']:.3f}",
+                "Tensor Time (ms)": f"{row['Tensor Time (ms)']:.3f}",
+                "VALU Time (ms)": f"{row['VALU Time (ms)']:.3f}",
+                "SFU Time (ms)": f"{row['SFU Time (ms)']:.3f}",
+                "HBM Time (ms)": f"{row['HBM Time (ms)']:.3f}",
+                "Tensor FLOPs": fmt_num(row["Tensor FLOPs"]),
+                "HBM Bytes": fmt_bytes(row["HBM Bytes"]),
+                "Mask HW %": f"{row['Mask HW %']:.1f}%",
+            }
+        )
+    st.dataframe(pd.DataFrame(display_rows).set_index("Implementation"), use_container_width=True)
 
 mask_ratio = tflops_info["mask_ratio"]
 mask_valid_pairs = tflops_info["mask_valid_pairs"]
@@ -564,35 +682,18 @@ valu_peak = hardware.valu_peak
 sfu_peak = hardware.sfu_peak
 hbm_peak = hardware.hbm_peak
 
-t_tensor = tflops_info["t_tensor"]
-t_valu = tflops_info["t_valu"]
-t_sfu = tflops_info["t_sfu"]
-t_hbm = hbm_info["t_hbm"]
+t_tensor = primary["times"]["Tensor"]
+t_valu = primary["times"]["VALU"]
+t_sfu = primary["times"]["SFU"]
+t_hbm = primary["times"]["HBM"]
 
 # Critical path & utilizations
-t_crit = max(t_tensor, t_valu, t_sfu, t_hbm)
-if t_crit == t_hbm:
-    bound = "HBM Bandwidth"
-elif t_crit == t_tensor:
-    bound = "Tensor Core"
-elif t_crit == t_valu:
-    bound = "VALU (FP32)"
-else:
-    bound = "SFU (exp)"
+t_crit = primary["t_crit"]
+bound = primary["bound"]
 
-freq_hz = hardware.freq_hz
-cycles_dict = {
-    "Tensor": t_tensor * freq_hz,
-    "VALU":   t_valu   * freq_hz,
-    "SFU":    t_sfu    * freq_hz,
-    "HBM":    t_hbm    * freq_hz,
-}
-util_theory = {
-    "Tensor": min(1.0, t_tensor / t_crit),
-    "VALU":   min(1.0, t_valu   / t_crit),
-    "SFU":    min(1.0, t_sfu    / t_crit),
-    "HBM":    min(1.0, t_hbm    / t_crit),
-}
+freq_hz = primary["freq_hz"]
+cycles_dict = primary["cycles"]
+util_theory = primary["util"]
 
 # ----------------------- Compare with Actual (Cycles + MFU) -----------------------
 col_a1, col_a2 = st.columns([1,2])
