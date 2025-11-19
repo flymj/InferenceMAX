@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 MASK_NONE = "none"
 MASK_CAUSAL_LT = "causal_lower_triangle"
@@ -150,6 +151,21 @@ class FlashAttentionOperator:
         self.metadata = metadata or {}
         self.hardware = hardware
 
+    @staticmethod
+    def _fmt_large(value: float) -> str:
+        """Return a compact human-readable number."""
+
+        if value is None or not math.isfinite(value):
+            return "-"
+        units = ["", "K", "M", "B", "T", "P"]
+        value = float(value)
+        if value == 0:
+            return "0"
+        idx = int(max(0, min(len(units) - 1, math.floor(math.log10(abs(value)) / 3))))
+        scaled = value / (1000 ** idx)
+        suffix = units[idx]
+        return f"{scaled:.2f}{suffix}"
+
     def _bytes_per_element(self) -> int:
         return 1 if str(self.metadata.get("dtype", "bf16")) == "fp8" else 2
 
@@ -221,3 +237,107 @@ class FlashAttentionOperator:
         hbm_bytes = q_bytes + k_bytes + v_bytes + o_bytes
         t_hbm = hbm_bytes / max(self.hardware.hbm_peak, 1e-9)
         return {"hbm_bytes": hbm_bytes, "t_hbm": t_hbm}
+
+    def self_analysis(self) -> str:
+        """Return a qualitative analysis of the current workload."""
+
+        workload = self._workload()
+        dtype = str(self.metadata.get("dtype", "bf16") or "bf16")
+        tflops = self.calculate_tflops()
+        hbm = self.calculate_hbm_throughput()
+
+        t_tensor = tflops["t_tensor"]
+        t_valu = tflops["t_valu"]
+        t_sfu = tflops["t_sfu"]
+        t_hbm = hbm["t_hbm"]
+        times = {
+            "Tensor": t_tensor,
+            "VALU": t_valu,
+            "SFU": t_sfu,
+            "HBM": t_hbm,
+        }
+        t_crit = max(times.values())
+        bound = max(times, key=times.get)
+
+        seq_pairs = workload["nq"] * workload["nk"]
+        total_heads = workload["batch"] * workload["heads"]
+        dtype_bytes = self._bytes_per_element()
+        mask_ratio = tflops["mask_ratio"]
+        mask_hw_ratio = tflops["mask_hw_ratio"]
+
+        lines: List[str] = ["**Workload insights:**"]
+        lines.append(
+            "- Critical path: **{bound}** — t_TC={tc:.2e}s, "
+            "t_VALU={tv:.2e}s, t_SFU={ts:.2e}s, t_HBM={th:.2e}s."
+            .format(
+                bound=bound,
+                tc=t_tensor,
+                tv=t_valu,
+                ts=t_sfu,
+                th=t_hbm,
+            )
+        )
+
+        if seq_pairs >= 64_000_000:
+            lines.append(
+                "- Sequence lengths create ~{pairs} score pairs (O(Nq·Nk)), "
+                "which dominates compute/memory pressure."
+                .format(pairs=self._fmt_large(seq_pairs))
+            )
+        elif seq_pairs >= 4_000_000:
+            lines.append(
+                "- Moderate-long sequences (~{pairs} pairs) still yield sizable quadratic cost."
+                .format(pairs=self._fmt_large(seq_pairs))
+            )
+
+        if total_heads >= 64:
+            lines.append(
+                "- Batch·Heads = {total} inflates FLOP counts proportionally; consider GQA or head pruning."
+                .format(total=total_heads)
+            )
+
+        if max(workload["d"], workload["dv"]) >= 192:
+            lines.append(
+                "- Large head dimensions (d={d}, dv={dv}) amplify tensor-core math and register footprint."
+                .format(d=workload["d"], dv=workload["dv"])
+            )
+        elif max(workload["d"], workload["dv"]) >= 128:
+            lines.append(
+                "- Head dims d={d}, dv={dv} sit in a high-utilization regime; smaller tiles may be needed."
+                .format(d=workload["d"], dv=workload["dv"])
+            )
+
+        if workload["kv_heads"] < workload["heads"]:
+            lines.append(
+                "- Using GQA (H={h}, Hk={hk}) saves K/V bytes, but QK math still scales with full heads."
+                .format(h=workload["heads"], hk=workload["kv_heads"])
+            )
+
+        if mask_ratio < 0.99:
+            lines.append(
+                "- Mask keeps only {ratio:.1%} of scores; {hw:.1%} still executed on hardware ({skip} skip masked GEMM)."
+                .format(
+                    ratio=mask_ratio,
+                    hw=mask_hw_ratio,
+                    skip="does" if workload["skip_masked_gemm"] else "does not",
+                )
+            )
+
+        if workload["dropout"] > 0:
+            lines.append(
+                "- Dropout={drop:.0%} adds VALU pressure (extra RNG/compare) relative to deterministic runs."
+                .format(drop=workload["dropout"])
+            )
+
+        if dtype_bytes >= 2:
+            lines.append(
+                "- {dtype} implies {bytes} B/element, so HBM traffic scales with all Q/K/V/O tensors."
+                .format(dtype=dtype, bytes=dtype_bytes)
+            )
+        else:
+            lines.append("- fp8 packing cuts HBM bytes/element in half versus bf16/fp16.")
+
+        if len(lines) == 1:
+            lines.append("- Parameters are within a light regime; adjust inputs to explore other stress points.")
+
+        return "\n".join(lines)

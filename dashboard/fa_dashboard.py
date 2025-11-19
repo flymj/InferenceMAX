@@ -436,23 +436,10 @@ with st.sidebar:
     freq_ghz = st.number_input("Frequency (GHz)", min_value=0.0, value=1.98, step=0.01)
 
 # ----------------------- Presets & Import -----------------------
-col_p1, col_p2 = st.columns([1,2])
+col_p1, col_p2 = st.columns([1, 2])
 with col_p1:
-    st.subheader("Workload Presets")
-    if st.button("Case A: 32K×32K, d=128, H=32 (bf16)"):
-        st.session_state.update({
-            "batch": 1, "nq": 32768, "nk": 32768, "heads": 32, "kv_heads": 32,
-            "d": 128, "dv": 128, "dropout": 0.0, "custom_mask": 0,
-            "mask_type": MASK_NONE,
-            "skip_masked_gemm": False,
-        })
-    if st.button("Case B: 1K×1K, d=64, H=16, drop=0.1 (bf16)"):
-        st.session_state.update({
-            "batch": 4, "nq": 1024, "nk": 1024, "heads": 16, "kv_heads": 16,
-            "d": 64, "dv": 64, "dropout": 0.1, "custom_mask": 1,
-            "mask_type": MASK_CAUSAL_LT,
-            "skip_masked_gemm": True,
-        })
+    st.subheader("Workload Notes")
+    st.write("Configure workloads via the fields below or import a UT config string.")
 
 with col_p2:
     st.subheader("Import UT Config String")
@@ -554,6 +541,12 @@ hardware = FlashAttentionHardware(
 fa_operator = FlashAttentionOperator(workload_metadata, hardware)
 tflops_info = fa_operator.calculate_tflops()
 hbm_info = fa_operator.calculate_hbm_throughput()
+analysis_text = fa_operator.self_analysis()
+
+st.subheader("Parsed Workload Parameters")
+if analysis_text:
+    st.markdown(analysis_text)
+st.json(workload_metadata)
 
 mask_ratio = tflops_info["mask_ratio"]
 mask_valid_pairs = tflops_info["mask_valid_pairs"]
@@ -983,20 +976,20 @@ with st.expander("Tile Sweep (optional)", expanded=False):
                     smem_c["smem_total"] <= smem_limit_bytes
                     and regs_c["regs_thread"] <= max_regs_per_thread
                 )
-                    rows.append(
-                        {
-                            "M": M_candidate,
-                            "N": N_candidate,
-                            "SMEM_KB": smem_c["smem_total"] / 1024.0,
-                            "Regs/thread": regs_c["regs_thread"],
-                            "AI": ai_c["AI"],
-                            "Roofline_TFLOPs": ai_c["attainable_TFLOPs"],
-                            "Mask_effective_%": mask_ratio * 100.0 if custom_mask_enabled else 100.0,
-                            "Mask_hw_%": mask_exec_ratio_c * 100.0,
-                            "Mask_overhead_x": mask_overhead_c,
-                            "Valid": valid,
-                        }
-                    )
+                rows.append(
+                    {
+                        "M": M_candidate,
+                        "N": N_candidate,
+                        "SMEM_KB": smem_c["smem_total"] / 1024.0,
+                        "Regs/thread": regs_c["regs_thread"],
+                        "AI": ai_c["AI"],
+                        "Roofline_TFLOPs": ai_c["attainable_TFLOPs"],
+                        "Mask_effective_%": mask_ratio * 100.0 if custom_mask_enabled else 100.0,
+                        "Mask_hw_%": mask_exec_ratio_c * 100.0,
+                        "Mask_overhead_x": mask_overhead_c,
+                        "Valid": valid,
+                    }
+                )
         sweep_df = pd.DataFrame(rows)
         if sweep_df.empty:
             st.info("No tiles evaluated (check ranges).")
