@@ -15,7 +15,13 @@ class ChipSpec:
     tflops: float
     mfu: float
     hbm_bw_GBs: float
-    net_bw_GBs: float
+    net_bw_reduce_GBs: float
+    net_bw_a2a_GBs: float
+
+    @property
+    def net_bw_GBs(self) -> float:
+        """Backwards compatibility: return max of reduce/a2a."""
+        return max(self.net_bw_reduce_GBs, self.net_bw_a2a_GBs)
 
     def with_mfu(self, mfu: float) -> "ChipSpec":
         """Return a copy with a different MFU."""
@@ -24,7 +30,8 @@ class ChipSpec:
             tflops=float(self.tflops),
             mfu=float(mfu),
             hbm_bw_GBs=float(self.hbm_bw_GBs),
-            net_bw_GBs=float(self.net_bw_GBs),
+            net_bw_reduce_GBs=float(self.net_bw_reduce_GBs),
+            net_bw_a2a_GBs=float(self.net_bw_a2a_GBs),
         )
 
     @property
@@ -41,10 +48,19 @@ class ChipSpec:
         return max(1e-9, float(self.hbm_bw_GBs) * 1e9)
 
     @property
-    def network_bandwidth_Bps(self) -> float:
-        """Return the effective network bandwidth in bytes per second."""
+    def network_bandwidth_reduce_Bps(self) -> float:
+        """Return the effective Reduce network bandwidth in bytes per second."""
+        return max(1e-9, float(self.net_bw_reduce_GBs) * 1e9)
 
-        return max(1e-9, float(self.net_bw_GBs) * 1e9)
+    @property
+    def network_bandwidth_a2a_Bps(self) -> float:
+        """Return the effective All2All network bandwidth in bytes per second."""
+        return max(1e-9, float(self.net_bw_a2a_GBs) * 1e9)
+
+    @property
+    def network_bandwidth_Bps(self) -> float:
+        """Return the effective network bandwidth in bytes per second (legacy)."""
+        return max(self.network_bandwidth_reduce_Bps, self.network_bandwidth_a2a_Bps)
 
 
 def combine_time(overlap: float, *times_ms: float) -> float:

@@ -83,7 +83,45 @@ class QwenModel(BaseModel):
         self.n_routed_experts = int(cfg.get("n_routed_experts", self.num_experts) or 0)
         self.num_experts_per_tok = int(cfg.get("num_experts_per_tok", cfg.get("top_k", 0)) or 0)
         self.moe_intermediate_size = int(cfg.get("moe_intermediate_size", 0) or 0)
+        self.shared_expert_intermediate_size = int(cfg.get("shared_expert_intermediate_size", 0) or 0)
+
+        # ---- Context & Precision ----
+        self.max_position_embeddings = int(cfg.get("max_position_embeddings", 0) or 0)
+        self.torch_dtype = cfg.get("torch_dtype", "float16")
+
+        # ---- Quantization ----
+        q_config = cfg.get("quantization_config", {})
+        self.quant_method = q_config.get("quant_method", None) if q_config else None
+        self.quant_fmt = q_config.get("fmt", None) if q_config else None
+
+        # ---- RoPE ----
+        rope_config = cfg.get("rope_scaling", {})
+        # Handle both dict (new) and string/null (old)
+        if isinstance(rope_config, dict):
+            self.rope_type = rope_config.get("type", None)
+            self.rope_factor = rope_config.get("factor", None)
+        else:
+            self.rope_type = str(rope_config) if rope_config else None
+            self.rope_factor = None
+
         return self
+
+    def summary(self) -> dict:
+        base = super().summary()
+        base.update({
+            "shared_expert_intermediate_size": self.shared_expert_intermediate_size,
+            "linear_num_key_heads": self.linear_num_key_heads,
+            "linear_key_head_dim": self.linear_key_head_dim,
+            "linear_num_value_heads": self.linear_num_value_heads,
+            "linear_value_head_dim": self.linear_value_head_dim,
+            "max_position_embeddings": self.max_position_embeddings,
+            "torch_dtype": self.torch_dtype,
+            "quant_method": self.quant_method,
+            "quant_fmt": self.quant_fmt,
+            "rope_type": self.rope_type,
+            "rope_factor": self.rope_factor,
+        })
+        return base
 
     # ============================ 工具函数 ============================
     def is_linear_attn_enabled(self) -> bool:
@@ -174,6 +212,14 @@ class QwenModel(BaseModel):
                          "Layer_count": L_moe})
             rows.append({"Module":"MoE","Submodule":"Router","Dimension":f"D·E={D}·{self.num_experts}",
                          "Formula":"D·E","Params_per_layer": D*self.num_experts,"Layer_count": L_moe})
+
+            # Shared Expert (Qwen MoE usually has 1 shared expert if size > 0)
+            if self.shared_expert_intermediate_size > 0:
+                # 3 * D * shared_intermediate
+                rows.append({"Module":"MoE","Submodule":"Shared Expert",
+                             "Dimension":f"1·(3·D·d_ff_s)=1·(3·{D}·{self.shared_expert_intermediate_size})",
+                             "Formula":"3·D·d_ff_s","Params_per_layer": 3*D*self.shared_expert_intermediate_size,
+                             "Layer_count": L_moe})
         return rows
 
     # ============================ FLOPs 统计 ============================
@@ -261,6 +307,13 @@ class QwenModel(BaseModel):
             rows.append({"Module":"MoE","Submodule":"Experts (executed)",
                          "Formula":"2 · 3 · D · d_ff_m · T · top_k",
                          "FLOPs_per_layer": moe_flops})
+            
+            # Shared Expert FLOPs
+            if self.shared_expert_intermediate_size > 0:
+                shared_flops = 2 * 3 * D * self.shared_expert_intermediate_size * T
+                rows.append({"Module":"MoE","Submodule":"Shared Expert",
+                             "Formula":"2 · 3 · D · d_ff_s · T",
+                             "FLOPs_per_layer": shared_flops})
         return rows
 
     # ============================ 通信统计 ============================

@@ -10,21 +10,31 @@ from dashboard.features.hardware import ChipSpec
 from dashboard.hardware import load_hardware_presets
 
 
-_DEFAULT_CHIP = ChipSpec(tflops=600.0, mfu=0.5, hbm_bw_GBs=2000.0, net_bw_GBs=400.0)
+_DEFAULT_CHIP = ChipSpec(tflops=600.0, mfu=0.5, hbm_bw_GBs=2000.0, net_bw_reduce_GBs=400.0, net_bw_a2a_GBs=400.0)
 
 
 def _chip_from_metrics(metrics: Dict[str, float]) -> ChipSpec:
     tflops = float(metrics.get("fp16_tflops", _DEFAULT_CHIP.tflops))
     mfu = float(metrics.get("tensor_mfu", _DEFAULT_CHIP.mfu))
     hbm_bw = float(metrics.get("hbm_bandwidth", _DEFAULT_CHIP.hbm_bw_GBs))
-    net_candidates = [
-        metrics.get("allreduce_bandwidth"),
-        metrics.get("alltoall_bandwidth"),
-        metrics.get("network_bandwidth"),
-    ]
-    net_values = [float(val) for val in net_candidates if isinstance(val, (int, float))]
-    net_bw = max(net_values) if net_values else float(_DEFAULT_CHIP.net_bw_GBs)
-    return ChipSpec(tflops=tflops, mfu=mfu, hbm_bw_GBs=hbm_bw, net_bw_GBs=net_bw)
+
+    # Prioritize specific network bandwidths, then general, then default
+    net_bw_reduce = metrics.get("allreduce_bandwidth")
+    net_bw_a2a = metrics.get("alltoall_bandwidth")
+    general_net_bw = metrics.get("network_bandwidth")
+
+    if net_bw_reduce is None:
+        net_bw_reduce = general_net_bw if general_net_bw is not None else _DEFAULT_CHIP.net_bw_reduce_GBs
+    if net_bw_a2a is None:
+        net_bw_a2a = general_net_bw if general_net_bw is not None else _DEFAULT_CHIP.net_bw_a2a_GBs
+
+    return ChipSpec(
+        tflops=tflops,
+        mfu=mfu,
+        hbm_bw_GBs=hbm_bw,
+        net_bw_reduce_GBs=float(net_bw_reduce),
+        net_bw_a2a_GBs=float(net_bw_a2a),
+    )
 
 
 _PRESET_METRICS = {name: preset.as_dict() for name, preset in load_hardware_presets().items()}
@@ -75,7 +85,7 @@ def render_sidebar() -> Dict[str, object]:
             "match your target deployment cluster."
         )
 
-    chip = ChipSpec(tflops=tflops, mfu=mfu, hbm_bw_GBs=hbm_bw, net_bw_GBs=net_bw)
+    chip = ChipSpec(tflops=tflops, mfu=mfu, hbm_bw_GBs=hbm_bw, net_bw_reduce_GBs=net_bw, net_bw_a2a_GBs=net_bw)
 
     tensor_baseline = float(preset_metrics.get("fp16_tflops", tflops)) or float(tflops)
     scale = float(tflops) / tensor_baseline if tensor_baseline else 1.0

@@ -15,23 +15,29 @@ from ..services.llm_calcs import (
     communication_breakdown,
     per_token_decode_hbm_bytes_per_layer_per_gpu,
     weights_bytes_per_gpu,
+    active_weights_bytes_per_gpu,
 )
 
 from .hardware import ChipSpec, combine_time, flops_to_time_ms, bytes_to_time_ms
 from .kv_cache import KvCacheBudget
 
 
-def factor_pairs_pow2(n: int) -> List[Tuple[int, int]]:
-    """Return all (tp, dp) such that tp * dp == n and both are powers of two."""
-
+def factor_pairs_general(n: int) -> List[Tuple[int, int]]:
+    """Return all (tp, dp) such that tp * dp == n.
+    
+    Unlike the previous version, this supports non-power-of-2 values (e.g. TP=3, N=48).
+    """
     pairs: List[Tuple[int, int]] = []
-    x = 1
-    while x <= int(n):
+    n = int(n)
+    # Find all factors
+    for x in range(1, int(n**0.5) + 1):
         if n % x == 0:
             y = n // x
-            if (x & (x - 1)) == 0 and (y & (y - 1)) == 0:
-                pairs.append((x, y))
-        x <<= 1
+            pairs.append((x, y))
+            if x != y:
+                pairs.append((y, x))
+    # Sort by TP
+    pairs.sort(key=lambda p: p[0])
     return pairs
 
 
@@ -76,7 +82,7 @@ def run_scaleup_search_fixedN(
     weight_cache: Dict[Tuple[int, int], int] = {}
     kv_budget = KvCacheBudget(model)
 
-    for tp, dp in factor_pairs_pow2(N):
+    for tp, dp in factor_pairs_general(N):
         ep_group_for_weights = max(1, min(E if is_moe else 1, N))
         key = (int(tp), int(ep_group_for_weights))
         if key not in weight_cache:
@@ -88,6 +94,12 @@ def run_scaleup_search_fixedN(
             )
         wbytes_gpu = weight_cache[key]
 
+        # Check if weights fit in HBM
+        hbm_bytes_total = float(hbm_capacity_GB) * (1024**3)
+        if wbytes_gpu > hbm_bytes_total:
+            # Weights alone exceed HBM capacity
+            continue
+
         kv_cap = kv_budget.tokens_per_gpu(
             tp=int(tp),
             kv_dtype_bytes=int(kv_dtype_bytes),
@@ -95,9 +107,20 @@ def run_scaleup_search_fixedN(
             reserve_ratio=float(hbm_reserve_ratio),
             weights_per_gpu_bytes=wbytes_gpu,
         )
+        
+        if kv_cap <= 0:
+            # No space for KV cache
+            continue
 
         B = 1
         while True:
+            # Check KV capacity constraint
+            # kv_cap is the max logical tokens this GPU can support (accounting for TP sharding)
+            # Total logical tokens needed = B * kv_len_decode (assuming kv_len_decode is total context per req)
+            # Wait, kv_len_decode is usually context length.
+            # If B requests, total tokens = B * kv_len_decode.
+            if (B * kv_len_decode) > kv_cap:
+                break # OOM
             flops_rows_p = model.flops_component_rows(
                 "prefill", B, seq_len, seq_len, include_scores, top_k_override
             )
@@ -118,7 +141,10 @@ def run_scaleup_search_fixedN(
             ep_bytes_p = comm.ep_prefill_bytes
 
             t_comp_p = flops_to_time_ms(flops_prefill, chip)
-            t_comm_p = bytes_to_time_ms(tp_bytes_p + ep_bytes_p, chip.net_bw_GBs)
+            # TP uses Reduce BW, EP uses All2All BW
+            t_comm_p_tp = bytes_to_time_ms(tp_bytes_p, chip.net_bw_reduce_GBs)
+            t_comm_p_ep = bytes_to_time_ms(ep_bytes_p, chip.net_bw_a2a_GBs)
+            t_comm_p = t_comm_p_tp + t_comm_p_ep
             ttft_ms = combine_time(overlap, t_comp_p, t_comm_p)
 
             flops_rows_d = model.flops_component_rows(
@@ -129,19 +155,42 @@ def run_scaleup_search_fixedN(
             tp_bytes_d = comm.tp_decode_bytes
             ep_bytes_d = comm.ep_decode_bytes
 
-            hbm_bytes_per_token = (
+            # Calculate Active Weights for HBM Bandwidth
+            active_wbytes = active_weights_bytes_per_gpu(
+                model,
+                tp=int(tp),
+                ep_group=int(ep_group_for_weights),
+                weight_dtype_bytes=int(dtype_bytes),
+                batch_size=B,
+            )
+
+            # HBM Traffic = KV Cache Access + Active Weights Read (per token/batch step)
+            # Note: For decode, we read weights ONCE per step (for the whole batch).
+            # hbm_bytes_per_token usually implies per-token-in-batch, but here we want total bytes per step?
+            # No, t_hbm_d is calculated as bytes_to_time_ms(total_bytes, bw).
+            # per_token_decode_hbm_bytes... returns bytes PER TOKEN.
+            # So total KV traffic = per_token * B.
+            # Total Weight traffic = active_wbytes (read once per step).
+            
+            kv_bytes_per_token = (
                 per_token_decode_hbm_bytes_per_layer_per_gpu(
                     model, tp=int(tp), kv_len=int(kv_len_decode), dtype_bytes=int(kv_dtype_bytes)
                 )
                 * L
             )
+            
+            total_hbm_bytes_step = (kv_bytes_per_token * B) + active_wbytes
 
             t_comp_d = flops_to_time_ms(flops_decode, chip)
-            t_comm_d = bytes_to_time_ms(tp_bytes_d + ep_bytes_d, chip.net_bw_GBs)
-            t_hbm_d = bytes_to_time_ms(hbm_bytes_per_token, chip.hbm_bw_GBs)
+            # TP uses Reduce BW, EP uses All2All BW
+            t_comm_d_tp = bytes_to_time_ms(tp_bytes_d, chip.net_bw_reduce_GBs)
+            t_comm_d_ep = bytes_to_time_ms(ep_bytes_d, chip.net_bw_a2a_GBs)
+            t_comm_d = t_comm_d_tp + t_comm_d_ep
+            t_hbm_d = bytes_to_time_ms(total_hbm_bytes_step, chip.hbm_bw_GBs)
             tpot_ms = combine_time(overlap, t_comp_d, t_comm_d, t_hbm_d)
 
             concurrent = B * int(dp) * grad_accum
+            # Prefill Sequence Throughput (Prompts/sec) - purely based on TTFT
             throughput_seq_s = (concurrent / (ttft_ms / 1000.0)) if ttft_ms > 0 else 0.0
             tpop_s = tpot_ms / 1000.0
             raw_sum = t_comp_d + t_comm_d + t_hbm_d
@@ -168,14 +217,27 @@ def run_scaleup_search_fixedN(
                     "Prefill_EP_bytes_per_dev": ep_bytes_p,
                     "Decode_TP_bytes_per_dev": tp_bytes_d,
                     "Decode_EP_bytes_per_dev": ep_bytes_d,
-                    "HBM_bytes_per_token_per_dev": hbm_bytes_per_token,
+                    "Decode_EP_bytes_per_dev": ep_bytes_d,
+                    "HBM_bytes_per_token_per_dev": total_hbm_bytes_step / max(1, B),
+                    "Weights_bytes_per_dev": wbytes_gpu,
                     "Weights_bytes_per_dev": wbytes_gpu,
                     "KV_capacity_tokens_per_dev": kv_cap,
                 }
             )
 
-            if (ttft_ms > sla_ttft_ms) or (tpot_ms > sla_tpot_ms):
+            # For PD separation, we might have valid Decode configs (TPOT ok) even if Prefill (TTFT) violates SLA,
+            # or valid Prefill configs (TTFT ok) even if TPOT violates SLA.
+            # So we only break if BOTH violate their SLAs.
+            # We also add a hard limit on B to prevent infinite loops if SLAs are very loose.
+            prefill_violated = (ttft_ms > sla_ttft_ms)
+            decode_violated = (tpot_ms > sla_tpot_ms)
+            
+            if prefill_violated and decode_violated:
                 break
+            
+            if B >= 1024: # Safety limit
+                break
+                
             B += 1
 
     return pd.DataFrame(rows)

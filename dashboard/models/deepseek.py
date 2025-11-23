@@ -19,6 +19,20 @@ class DeepseekModel(BaseModel):
         self.num_key_value_heads = int(cfg.get("num_key_value_heads", self.num_attention_heads) or 0)
         self.intermediate_size = int(cfg.get("intermediate_size", self.intermediate_size) or 0)
 
+        # Context & Precision
+        self.max_position_embeddings = int(cfg.get("max_position_embeddings", 0) or 0)
+        self.torch_dtype = cfg.get("torch_dtype", "float16")
+
+        # Quantization
+        q_config = cfg.get("quantization_config", {})
+        self.quant_method = q_config.get("quant_method", None) if q_config else None
+        self.quant_fmt = q_config.get("fmt", None) if q_config else None
+
+        # RoPE
+        rope_config = cfg.get("rope_scaling", {})
+        self.rope_type = rope_config.get("type", None) if rope_config else None
+        self.rope_factor = rope_config.get("factor", None) if rope_config else None
+
         # MLA
         self.q_lora_rank = int(cfg.get("q_lora_rank", 0) or 0)
         self.kv_lora_rank = int(cfg.get("kv_lora_rank", 0) or 0)
@@ -32,7 +46,31 @@ class DeepseekModel(BaseModel):
         self.n_routed_experts = int(cfg.get("n_routed_experts", self.num_experts) or 0)
         self.num_experts_per_tok = int(cfg.get("num_experts_per_tok", cfg.get("top_k", 0)) or 0)
         self.moe_intermediate_size = int(cfg.get("moe_intermediate_size", 0) or 0)
+        self.moe_layer_freq = int(cfg.get("moe_layer_freq", 1) or 1)
+        self.n_shared_experts = int(cfg.get("n_shared_experts", 0) or 0)
+        self.num_nextn_predict_layers = int(cfg.get("num_nextn_predict_layers", 0) or 0)
         return self
+
+    def layer_kind_counts(self) -> dict:
+        """DeepSeek 特有：支持 first_k_dense_replace 与 moe_layer_freq"""
+        L = int(self.num_hidden_layers or 0)
+        if not self.is_moe_enabled():
+            return {"attention_layers": L, "dense_layers": L, "moe_layers": 0}
+        
+        first_k = int(self.cfg.get("first_k_dense_replace", 0) or 0)
+        first_k = max(0, min(first_k, L))
+        
+        # 剩余层中，每 moe_layer_freq 层有一个 MoE 层，其余为 Dense
+        # 但 DeepSeek V3 论文似乎暗示除了 first_k 外全是 MoE？
+        # Config 里的 moe_layer_freq: 1 暗示是每一层。
+        # 如果 freq > 1，则 (L - first_k) 中只有 1/freq 是 MoE。
+        # 假设剩余层是交替的：
+        rem_layers = L - first_k
+        freq = self.moe_layer_freq
+        moe_count = rem_layers // freq
+        dense_count = first_k + (rem_layers - moe_count)
+        
+        return {"attention_layers": L, "dense_layers": dense_count, "moe_layers": moe_count}
 
     # ---------- Weights ----------
     def weight_component_rows(self) -> List[Dict]:
@@ -82,13 +120,26 @@ class DeepseekModel(BaseModel):
                      "Layer_count": L_dense})
 
         # MoE（仅在启用时加入）
+        # MoE（仅在启用时加入）
         if self.is_moe_enabled() and L_moe > 0:
+            # Routed Experts
             rows.append({"Module":"MoE","Submodule":"Routed Experts",
                          "Dimension":f"E·(3·D·d_ff_m)={self.n_routed_experts}·(3·{D}·{self.moe_intermediate_size})",
                          "Formula":"E·(3·D·d_ff_m)","Params_per_layer": moe_weight_params(D, self.moe_intermediate_size, self.n_routed_experts),
                          "Layer_count": L_moe})
             rows.append({"Module":"MoE","Submodule":"Router","Dimension":f"D·E={D}·{self.n_routed_experts}",
                          "Formula":"D·E","Params_per_layer": D*self.n_routed_experts,"Layer_count": L_moe})
+            
+            # Shared Experts (DeepSeek V3/R1 特有: 总是激活)
+            if self.n_shared_experts > 0:
+                # Shared Experts 结构通常也是 3 * D * moe_intermediate_size
+                # 或者是 3 * D * (n_shared * moe_intermediate_size)? 
+                # DeepSeek V3: Shared expert is just a fixed expert.
+                # Params = n_shared * (3 * D * moe_intermediate_size)
+                rows.append({"Module":"MoE","Submodule":"Shared Experts",
+                             "Dimension":f"N_s·(3·D·d_ff_m)={self.n_shared_experts}·(3·{D}·{self.moe_intermediate_size})",
+                             "Formula":"N_s·(3·D·d_ff_m)","Params_per_layer": self.n_shared_experts * 3 * D * self.moe_intermediate_size,
+                             "Layer_count": L_moe})
         return rows
 
     # ---------- FLOPs ----------
@@ -151,6 +202,11 @@ class DeepseekModel(BaseModel):
             if ep_eff > 1:
                 moe_flops /= float(ep_eff)
             rows.append({"Module":"MoE","Submodule":"Experts (executed)","Formula":"2 · 3 · D · d_ff_m · T · top_k","FLOPs_per_layer": moe_flops})
+            
+            # Shared Experts FLOPs (Always executed in MoE layers)
+            if self.n_shared_experts > 0:
+                shared_flops = 2 * 3 * D * self.moe_intermediate_size * T * self.n_shared_experts
+                rows.append({"Module":"MoE","Submodule":"Shared Experts","Formula":"2 · 3 · D · d_ff_m · T · n_shared","FLOPs_per_layer": shared_flops})
         return rows
 
     # ---------- 通信 ----------
@@ -188,5 +244,14 @@ class DeepseekModel(BaseModel):
             "qk_rope_head_dim": self.qk_rope_head_dim,
             "v_head_dim": self.v_head_dim,
             "first_k_dense_replace": int(self.cfg.get("first_k_dense_replace", 0) or 0),
+            "max_position_embeddings": self.max_position_embeddings,
+            "torch_dtype": self.torch_dtype,
+            "quant_method": self.quant_method,
+            "quant_fmt": self.quant_fmt,
+            "rope_type": self.rope_type,
+            "rope_factor": self.rope_factor,
+            "moe_layer_freq": self.moe_layer_freq,
+            "n_shared_experts": self.n_shared_experts,
+            "num_nextn_predict_layers": self.num_nextn_predict_layers,
         })
         return base

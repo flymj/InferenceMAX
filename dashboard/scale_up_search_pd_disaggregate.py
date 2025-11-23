@@ -453,9 +453,11 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
         mfu = c6.slider("有效 MFU", 0.05, 1.0, 0.4, 0.05)
         hbm_bw = c7.number_input("HBM 带宽 (GB/s)", 100.0, 6000.0, 3000.0, step=100.0)
 
-        c8, c9 = st.columns(2)
+        c8, c9, c9b = st.columns(3)
         hbm_eff = c8.slider("HBM 利用率 (有效)", 0.05, 1.0, 0.6, 0.05)
-        clk_GHz = c9.number_input("GPU 时钟频率 (GHz)", 0.5, 3.0, 1.8, 0.1)
+        net_bw_reduce = c9.number_input("Reduce 互联带宽 (GB/s)", 1.0, 1000.0, 100.0, step=10.0)
+        net_bw_a2a = c9b.number_input("All2All 互联带宽 (GB/s)", 1.0, 1000.0, 100.0, step=10.0)
+        # clk_GHz = c9.number_input("GPU 时钟频率 (GHz)", 0.5, 3.0, 1.8, 0.1) # Removed to make space
 
     with st.expander("Prefill / Decode 调度参数", expanded=True):
         c10, c11, c12 = st.columns(3)
@@ -534,7 +536,13 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     )
 
     search_cfg = _SearchConfig(
-        chip=ChipSpec(float(tflops), float(mfu), float(hbm_bw), float(hbm_bw * 0.3)),
+        chip=ChipSpec(
+            tflops=float(tflops),
+            mfu=float(mfu),
+            hbm_bw_GBs=float(hbm_bw),
+            net_bw_reduce_GBs=float(net_bw_reduce),
+            net_bw_a2a_GBs=float(net_bw_a2a)
+        ),
         sla_ttft_ms=float(sla_ttft_ms),
         sla_tpot_ms=float(sla_tpot_ms),
         avg_input=int(avg_input),
@@ -599,6 +607,14 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     df["avg_input"] = search_cfg.avg_input
     df["avg_output"] = search_cfg.avg_output
 
+    # Calculate Total Token Throughput (Input+Output) for ranking
+    # Formula: Decode_TPS * (Input+Output)/Output
+    df["throughput_total_tps"] = df.apply(
+        lambda r: (r["concurrent"] * 1000.0 / r["TPOT_ms"] * (r["avg_input"] + r["avg_output"]) / r["avg_output"]) 
+                  if r["TPOT_ms"] > 0 else 0.0, 
+        axis=1
+    )
+
     profile = ModelProfile(
         model,
         weight_dtype_bytes=search_cfg.dtype_bytes,
@@ -619,7 +635,9 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
     st.subheader("算力/带宽 利用率")
     best_idx = None
-    if "throughput_seq_per_s" in df.columns and not df["throughput_seq_per_s"].isna().all():
+    if "throughput_total_tps" in df.columns and not df["throughput_total_tps"].isna().all():
+        best_idx = df["throughput_total_tps"].astype(float).idxmax()
+    elif "throughput_seq_per_s" in df.columns and not df["throughput_seq_per_s"].isna().all():
         best_idx = df["throughput_seq_per_s"].astype(float).idxmax()
     elif "TTFT_ms" in df.columns:
         best_idx = df["TTFT_ms"].astype(float).idxmin()
@@ -659,9 +677,39 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
 
     spec_speedup = max(1.0, float(search_cfg.spec_speedup))
     tpot_spec_ms = float(conc_adjusted.tpot_eff_ms) / spec_speedup
-    throughput_tps = (
-        float(search_cfg.concurrency) * 1000.0 / tpot_spec_ms if tpot_spec_ms > 0 else 0.0
-    )
+    
+    # Throughput Calculation:
+    # User Request: "input+output Max throughput, token/s. 也就是在decode达到running-req最大时候的throughput"
+    # Total tokens per request = avg_input + avg_output
+    # Throughput = (Total Tokens * Concurrency) / (Total Time per Request)
+    # But user said "decode达到running-req最大时候", implying steady state decode throughput?
+    # "Max throughput" usually implies fully saturated system.
+    # If we assume steady state where all requests are decoding (continuous batching),
+    # then throughput is dominated by decode speed.
+    # However, "input+output" suggests we count prefill tokens too.
+    # Let's use the standard formula: Throughput = (Batch * (Input + Output)) / (End-to-End Latency)?
+    # Or simply: Throughput = (Concurrency) / TPOT * (Input + Output)? No.
+    # Standard generation throughput (tokens/s) = Batch / TPOT (for decode tokens).
+    # If we want "Total Throughput" including prefill tokens:
+    # If system is saturated, we process (Input + Output) tokens for each request.
+    # Rate = Concurrency / (TTFT + (Output-1)*TPOT).
+    # Tokens/s = Concurrency * (Input + Output) / (TTFT + (Output-1)*TPOT).
+    
+    # Re-reading user: "input+output的Max throughput... 开始的rampping up可以ignore"
+    # This implies steady state.
+    # In steady state continuous batching, we are processing `Concurrency` requests.
+    # In each step (TPOT), we generate `Concurrency` tokens (decode).
+    # PLUS we process some prefill tokens in the background (Chunked Prefill).
+    # If the system is balanced, the rate of retiring tokens = rate of incoming tokens.
+    # Total Throughput = Decode Throughput + Prefill Throughput.
+    # Decode Throughput = Concurrency * 1000 / TPOT.
+    # Prefill Throughput = Decode Throughput * (Input / Output).
+    # Total = Decode * (1 + Input/Output) = Decode * (Input+Output)/Output.
+    
+    # Let's use this interpretation:
+    decode_throughput = float(search_cfg.concurrency) * 1000.0 / tpot_spec_ms if tpot_spec_ms > 0 else 0.0
+    ratio = (float(search_cfg.avg_input) + float(search_cfg.avg_output)) / float(search_cfg.avg_output)
+    throughput_tps = decode_throughput * ratio
 
     conc_times = _ConcurrencySummary(
         ttft_ms=float(conc_adjusted.ttft_eff_ms),
@@ -679,11 +727,11 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     )
 
     st.subheader("TTFT vs. Batch per GPU")
-    fig_ttft = plot_metric_vs_batch(df, metric="ttft_ms")
+    fig_ttft = plot_metric_vs_batch(df, metric="TTFT_ms")
     st.plotly_chart(fig_ttft, use_container_width=True)
 
     st.subheader("TPOT vs. Batch per GPU")
-    fig_tpot = plot_metric_vs_batch(df, metric="tpot_ms")
+    fig_tpot = plot_metric_vs_batch(df, metric="TPOT_ms")
     st.plotly_chart(fig_tpot, use_container_width=True)
 
     st.subheader("Concurrency vs Mean TTFT / TPOT")
@@ -756,6 +804,273 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
             st.dataframe(mean_table, use_container_width=True)
             sweep_fig = _plot_seq_sweep(sweep_df)
             st.plotly_chart(sweep_fig, use_container_width=True)
+
+    st.subheader("Cluster Resource Allocation (PD Ratio Sweep)")
+    with st.expander("集群资源分配扫描", expanded=False):
+        st.markdown("扫描 Decode 节点数量占比，寻找最佳的 Prefill/Decode 资源配比。")
+        
+        c_sweep1, c_sweep2 = st.columns(2)
+        total_gpus_sweep = c_sweep1.number_input("集群总卡数 (Total GPUs)", 2, 1024, 64, 1, key="sweep_total_gpus")
+        run_pd_sweep = st.button("运行 PD 配比扫描", key="run_pd_sweep", use_container_width=True)
+        
+        pd_sweep_key = "pd_ratio_sweep_df"
+        
+        if run_pd_sweep:
+            sweep_rows = []
+            progress_bar = st.progress(0)
+            
+            # Loop decode GPUs from 1 to Total-1
+            # To save time, we can stride if Total is large, but let's do full sweep for now or stride 1
+            # If Total is huge, maybe stride. For now assume < 128 or user accepts wait.
+            # Actually, scale_up_search_fixedN is cached, so repeated calls with same N are fast.
+            
+            possible_decode_counts = range(1, int(total_gpus_sweep))
+            total_steps = len(possible_decode_counts)
+            
+            for i, n_decode in enumerate(possible_decode_counts):
+                n_prefill = int(total_gpus_sweep) - n_decode
+                progress_bar.progress((i + 1) / total_steps)
+                
+                # 1. Get Max Prefill Throughput (Seq/s) for n_prefill GPUs
+                # We use the same search_cfg but N=n_prefill
+                df_prefill = run_scaleup_search_fixedN(
+                    cfg=cfg,
+                    N=n_prefill,
+                    seq_len=search_cfg.avg_input,
+                    kv_len_decode=search_cfg.seq_len_kv,
+                    dtype_bytes=search_cfg.dtype_bytes,
+                    kv_dtype_bytes=search_cfg.dtype_bytes,
+                    top_k_override=None,
+                    chip=search_cfg.chip,
+                    overlap=0.0,
+                    sla_ttft_ms=search_cfg.sla_ttft_ms,
+                    sla_tpot_ms=search_cfg.sla_tpot_ms,
+                    hbm_capacity_GB=80.0,
+                    hbm_reserve_ratio=0.1,
+                    include_scores=True,
+                    grad_accum=1,
+                    refresh_token=0, # Use 0 to hit cache if possible
+                )
+                
+                max_prefill_seq_s = 0.0
+                best_prefill_tp = 0
+                best_prefill_dp = 0
+                
+                if not df_prefill.empty and "throughput_seq_per_s" in df_prefill.columns:
+                    # Filter by SLA (TTFT)
+                    valid_prefill = df_prefill[df_prefill["TTFT_ms"] <= search_cfg.sla_ttft_ms]
+                    if not valid_prefill.empty:
+                        idx_best = valid_prefill["throughput_seq_per_s"].idxmax()
+                        row_best = valid_prefill.loc[idx_best]
+                        max_prefill_seq_s = float(row_best["throughput_seq_per_s"])
+                        best_prefill_tp = int(row_best["TP"])
+                        best_prefill_dp = int(row_best["DP"])
+                
+                # 2. Get Max Decode Throughput (Total Token/s) for n_decode GPUs
+                df_decode = run_scaleup_search_fixedN(
+                    cfg=cfg,
+                    N=n_decode,
+                    seq_len=search_cfg.avg_input,
+                    kv_len_decode=search_cfg.seq_len_kv,
+                    dtype_bytes=search_cfg.dtype_bytes,
+                    kv_dtype_bytes=search_cfg.dtype_bytes,
+                    top_k_override=None,
+                    chip=search_cfg.chip,
+                    overlap=0.0,
+                    sla_ttft_ms=search_cfg.sla_ttft_ms,
+                    sla_tpot_ms=search_cfg.sla_tpot_ms,
+                    hbm_capacity_GB=80.0,
+                    hbm_reserve_ratio=0.1,
+                    include_scores=True,
+                    grad_accum=1,
+                    refresh_token=0,
+                )
+                
+                max_decode_rps = 0.0
+                best_decode_tp = 0
+                best_decode_dp = 0
+                
+                if not df_decode.empty:
+                     # Decode RPS = Concurrency * 1000 / TPOT / Output
+                     df_decode["rps"] = df_decode.apply(
+                        lambda r: (r["concurrent"] * 1000.0 / r["TPOT_ms"] / search_cfg.avg_output)
+                                  if r["TPOT_ms"] > 0 else 0.0,
+                        axis=1
+                     )
+                     valid_decode = df_decode[df_decode["TPOT_ms"] <= search_cfg.sla_tpot_ms]
+                     if not valid_decode.empty:
+                         idx_best = valid_decode["rps"].idxmax()
+                         row_best = valid_decode.loc[idx_best]
+                         max_decode_rps = float(row_best["rps"])
+                         best_decode_tp = int(row_best["TP"])
+                         best_decode_dp = int(row_best["DP"])
+
+                system_rps = min(max_prefill_seq_s, max_decode_rps)
+                system_total_tps = system_rps * (search_cfg.avg_input + search_cfg.avg_output)
+                
+                sweep_rows.append({
+                    "n_decode": n_decode,
+                    "n_prefill": n_prefill,
+                    "prefill_rps": max_prefill_seq_s,
+                    "prefill_cfg": f"TP{best_prefill_tp}DP{best_prefill_dp}",
+                    "decode_rps": max_decode_rps,
+                    "decode_cfg": f"TP{best_decode_tp}DP{best_decode_dp}",
+                    "system_rps": system_rps,
+                    "system_total_tps": system_total_tps
+                })
+            
+            session_state[pd_sweep_key] = pd.DataFrame(sweep_rows)
+            progress_bar.empty()
+            
+        sweep_df = session_state.get(pd_sweep_key)
+        if sweep_df is not None and not sweep_df.empty:
+            st.dataframe(
+                sweep_df, 
+                column_config={
+                    "prefill_rps": st.column_config.NumberColumn("Prefill Cap (RPS)", format="%.2f"),
+                    "decode_rps": st.column_config.NumberColumn("Decode Cap (RPS)", format="%.2f"),
+                    "system_rps": st.column_config.NumberColumn("System RPS", format="%.2f"),
+                    "system_total_tps": st.column_config.NumberColumn("System Tok/s", format="%.0f"),
+                },
+                use_container_width=True
+            )
+            
+            # Plot
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=sweep_df["n_decode"], y=sweep_df["prefill_rps"],
+                mode='lines', name='Prefill Capacity (RPS)',
+                hovertemplate="N_decode=%{x}<br>Prefill RPS=%{y:.2f}<br>Cfg=%{text}<extra></extra>",
+                text=sweep_df["prefill_cfg"]
+            ))
+            fig.add_trace(go.Scatter(
+                x=sweep_df["n_decode"], y=sweep_df["decode_rps"],
+                mode='lines', name='Decode Capacity (RPS)',
+                hovertemplate="N_decode=%{x}<br>Decode RPS=%{y:.2f}<br>Cfg=%{text}<extra></extra>",
+                text=sweep_df["decode_cfg"]
+            ))
+            fig.add_trace(go.Scatter(
+                x=sweep_df["n_decode"], y=sweep_df["system_rps"],
+                mode='lines+markers', name='System Throughput (RPS)',
+                line=dict(width=4, color='green'),
+                hovertemplate="N_decode=%{x}<br>System RPS=%{y:.2f}<extra></extra>"
+            ))
+            fig.update_layout(
+                title=f"System Throughput vs Decode GPUs (Total={total_gpus_sweep})",
+                xaxis_title="Number of Decode GPUs",
+                yaxis_title="Requests per Second (RPS)",
+                hovermode="closest"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            best_row = sweep_df.loc[sweep_df["system_rps"].idxmax()]
+            st.success(
+                f"最佳配比: Decode={int(best_row['n_decode'])}卡 ({best_row['decode_cfg']}), "
+                f"Prefill={int(best_row['n_prefill'])}卡 ({best_row['prefill_cfg']}). "
+                f"Max RPS={best_row['system_rps']:.2f}"
+            )
+
+    st.subheader("Cluster Scale-up Analysis")
+    with st.expander("集群规模扩展性分析", expanded=False):
+        st.markdown("分析不同集群规模下 (8卡 -> 128卡) 的单卡吞吐效率，观察 Scale-up 边际效应。")
+        
+        run_scaleup_sweep = st.button("运行 Scale-up 扫描", key="run_scaleup_sweep", use_container_width=True)
+        scaleup_key = "scaleup_analysis_df"
+        
+        if run_scaleup_sweep:
+            scaleup_rows = []
+            gpu_counts = [8, 16, 32, 64, 128]
+            progress_bar = st.progress(0)
+            
+            for i, total_gpus in enumerate(gpu_counts):
+                progress_bar.progress((i + 1) / len(gpu_counts))
+                
+                # For each total_gpus, we need to find the BEST PD split.
+                # We can reuse the logic from PD Ratio Sweep, but we need to be efficient.
+                # We can stride the search or just do full search since N is smallish.
+                
+                best_system_rps = 0.0
+                best_split = None
+                
+                # Sweep decode counts
+                possible_decode_counts = range(1, total_gpus)
+                # Optimization: stride if total_gpus is large?
+                step = 1
+                if total_gpus >= 64: step = 2
+                if total_gpus >= 128: step = 4
+                
+                for n_decode in range(1, total_gpus, step):
+                    n_prefill = total_gpus - n_decode
+                    
+                    # 1. Prefill Max
+                    df_prefill = run_scaleup_search_fixedN(
+                        cfg=cfg, N=n_prefill,
+                        seq_len=search_cfg.avg_input, kv_len_decode=search_cfg.seq_len_kv,
+                        dtype_bytes=search_cfg.dtype_bytes, kv_dtype_bytes=search_cfg.dtype_bytes,
+                        top_k_override=None, chip=search_cfg.chip, overlap=0.0,
+                        sla_ttft_ms=search_cfg.sla_ttft_ms, sla_tpot_ms=search_cfg.sla_tpot_ms,
+                        hbm_capacity_GB=80.0, hbm_reserve_ratio=0.1, include_scores=True, grad_accum=1, refresh_token=0
+                    )
+                    max_prefill_seq_s = 0.0
+                    if not df_prefill.empty and "throughput_seq_per_s" in df_prefill.columns:
+                        valid = df_prefill[df_prefill["TTFT_ms"] <= search_cfg.sla_ttft_ms]
+                        if not valid.empty: max_prefill_seq_s = valid["throughput_seq_per_s"].max()
+                        
+                    # 2. Decode Max
+                    df_decode = run_scaleup_search_fixedN(
+                        cfg=cfg, N=n_decode,
+                        seq_len=search_cfg.avg_input, kv_len_decode=search_cfg.seq_len_kv,
+                        dtype_bytes=search_cfg.dtype_bytes, kv_dtype_bytes=search_cfg.dtype_bytes,
+                        top_k_override=None, chip=search_cfg.chip, overlap=0.0,
+                        sla_ttft_ms=search_cfg.sla_ttft_ms, sla_tpot_ms=search_cfg.sla_tpot_ms,
+                        hbm_capacity_GB=80.0, hbm_reserve_ratio=0.1, include_scores=True, grad_accum=1, refresh_token=0
+                    )
+                    max_decode_rps = 0.0
+                    if not df_decode.empty:
+                        df_decode["rps"] = df_decode.apply(
+                            lambda r: (r["concurrent"] * 1000.0 / r["TPOT_ms"] / search_cfg.avg_output) if r["TPOT_ms"] > 0 else 0.0, axis=1
+                        )
+                        valid = df_decode[df_decode["TPOT_ms"] <= search_cfg.sla_tpot_ms]
+                        if not valid.empty: max_decode_rps = valid["rps"].max()
+                        
+                    system_rps = min(max_prefill_seq_s, max_decode_rps)
+                    if system_rps > best_system_rps:
+                        best_system_rps = system_rps
+                        best_split = (n_prefill, n_decode)
+                
+                if best_split:
+                    system_total_tps = best_system_rps * (search_cfg.avg_input + search_cfg.avg_output)
+                    per_gpu_tps = system_total_tps / total_gpus
+                    scaleup_rows.append({
+                        "Total GPUs": total_gpus,
+                        "Best Split (P/D)": f"{best_split[0]}/{best_split[1]}",
+                        "System RPS": best_system_rps,
+                        "System Total TPS": system_total_tps,
+                        "Per-GPU TPS": per_gpu_tps
+                    })
+            
+            session_state[scaleup_key] = pd.DataFrame(scaleup_rows)
+            progress_bar.empty()
+            
+        scaleup_df = session_state.get(scaleup_key)
+        if scaleup_df is not None and not scaleup_df.empty:
+            st.dataframe(scaleup_df, use_container_width=True)
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=scaleup_df["Total GPUs"], y=scaleup_df["Per-GPU TPS"],
+                mode='lines+markers', name='Per-GPU TPS',
+                line=dict(width=3, color='blue'),
+                hovertemplate="GPUs=%{x}<br>Per-GPU TPS=%{y:.1f}<br>Split=%{text}<extra></extra>",
+                text=scaleup_df["Best Split (P/D)"]
+            ))
+            fig.update_layout(
+                title="Per-GPU Throughput Scalability",
+                xaxis_title="Total GPUs",
+                yaxis_title="Per-GPU Total Tokens/s",
+                yaxis_range=[0, None]
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
 
 def main() -> None:

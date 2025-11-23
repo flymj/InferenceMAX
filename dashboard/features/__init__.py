@@ -11,7 +11,7 @@ from .chunked_prefill import ChunkedPrefill
 from .kv_cache import KvCacheBudget, KvCacheTraffic
 from .attention import AttentionFeature, AttentionFamily
 from .scale_up import (
-    factor_pairs_pow2,
+    factor_pairs_general,
     plot_metric_vs_batch,
     run_scaleup_search_fixedN,
 )
@@ -26,7 +26,7 @@ __all__ = [
     "bytes_to_time_ms",
     "combine_time",
     "estimate_efficiencies_from_measurement",
-    "factor_pairs_pow2",
+    "factor_pairs_general",
     "flops_to_time_ms",
     "plot_metric_vs_batch",
     "run_scaleup_search_fixedN",

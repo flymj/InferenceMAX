@@ -663,6 +663,85 @@ def weights_bytes_per_gpu(model: Any, tp: int, ep_group: int, weight_dtype_bytes
     return int(per_gpu)
 
 
+def active_weights_bytes_per_gpu(
+    model: Any,
+    tp: int,
+    ep_group: int,
+    weight_dtype_bytes: int,
+    batch_size: int = 1,
+) -> int:
+    """Estimate active weight bytes per GPU (accounting for MoE sparsity)."""
+    wt = model.weights_totals(weight_dtype_bytes=weight_dtype_bytes)
+    total_bytes = int(wt.get("bytes_total", 0))
+    rows = model.weight_component_rows()
+    D = int(getattr(model, "hidden_size", 0) or 0)
+
+    dense_bytes = moe_bytes = router_bytes = attn_bytes = 0
+    vocab_size = int(getattr(model, "vocab_size", 0) or 0)
+    cfg = getattr(model, "cfg", {}) or {}
+    tie_embeddings = bool(cfg.get("tie_word_embeddings", False))
+    emb_lm_bytes = (vocab_size * D + (0 if tie_embeddings else vocab_size * D)) * weight_dtype_bytes
+
+    # MoE specific
+    num_experts = int(getattr(model, "num_experts", 0) or getattr(model, "n_routed_experts", 0) or 0)
+    top_k = int(getattr(model, "num_experts_per_tok", 0) or getattr(model, "top_k", 0) or 0)
+    
+    # Calculate per-expert size if MoE
+    expert_size_bytes = 0
+    
+    for r in rows:
+        params = int(r.get("Params_per_layer", 0))
+        layers = int(r.get("Layer_count", 0))
+        bytes_total = params * layers * weight_dtype_bytes
+        mod = r.get("Module", "")
+        sub = r.get("Submodule", "")
+        if "MoE" in mod and "Router" not in sub:
+            moe_bytes += bytes_total
+            if num_experts > 0 and layers > 0:
+                 # Approximate size of one expert across all layers
+                 # Note: bytes_total is for ALL experts in ALL layers
+                 expert_size_bytes = bytes_total // num_experts
+        elif "Router" in sub:
+            router_bytes += bytes_total
+        elif "Attention" in mod:
+            attn_bytes += bytes_total
+        else:
+            dense_bytes += bytes_total
+
+    tp = max(1, int(tp))
+    ep_group = max(1, int(ep_group))
+    
+    # Base dense weights (always active)
+    active_per_gpu = 0
+    active_per_gpu += emb_lm_bytes // tp
+    active_per_gpu += attn_bytes // tp
+    active_per_gpu += dense_bytes // tp
+    active_per_gpu += router_bytes // tp
+    
+    # MoE Active Weights
+    if moe_bytes > 0 and num_experts > 0 and top_k > 0:
+        # Total experts stored on this GPU
+        experts_stored = num_experts // ep_group
+        stored_moe_bytes = moe_bytes // ep_group
+        
+        # Active experts per token = top_k
+        # Active experts for batch = min(experts_stored, top_k * batch_size)
+        # This assumes worst case that each token picks different experts until saturation
+        active_experts = min(experts_stored, top_k * int(batch_size))
+        
+        active_moe_bytes = active_experts * expert_size_bytes
+        # Clamp to stored bytes just in case
+        active_moe_bytes = min(active_moe_bytes, stored_moe_bytes)
+        
+        active_per_gpu += active_moe_bytes
+    else:
+        # Fallback for non-MoE or if parsing failed
+        active_per_gpu += (moe_bytes // ep_group) if moe_bytes > 0 else 0
+
+    active_per_gpu = min(active_per_gpu, total_bytes)
+    return int(active_per_gpu)
+
+
 def kv_capacity_tokens_per_gpu(
     model: Any,
     tp: int,

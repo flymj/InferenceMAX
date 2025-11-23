@@ -165,7 +165,7 @@ def render(state: DashboardState, actions: DashboardActions) -> None:
     )
 
     search_cfg = _SearchConfig(
-        chip=ChipSpec(float(tflops), float(mfu), float(hbm_bw), float(hbm_bw * 0.3)),
+        chip=ChipSpec(float(tflops), float(mfu), float(hbm_bw), float(hbm_bw * 0.3), float(hbm_bw * 0.3)),
         sla_ttft_ms=float(sla_ttft_ms),
         sla_tpot_ms=float(sla_tpot_ms),
         avg_input=int(avg_input),
