@@ -27,16 +27,26 @@ def lower_tri_pairs(nq: int, nk: int) -> int:
     return nk * (nk + 1) // 2 + (nq - nk) * nk
 
 
-def mask_usage_ratio(nq: int, nk: int, mask_type: str) -> float:
+def mask_usage_ratio(nq: int, nk: int, mask_type: str, window_size: int = None) -> float:
     """Return ratio of useful compute vs. dense compute under the mask."""
 
     total = max(0, int(nq)) * max(0, int(nk))
     if total == 0:
         return 0.0
-    if mask_type != MASK_CAUSAL_LT:
-        return 1.0
-    valid = lower_tri_pairs(nq, nk)
-    return min(1.0, valid / total) if valid > 0 else 0.0
+    
+    # Sliding window attention
+    if window_size is not None and window_size > 0:
+        effective_k = min(int(window_size), int(nk))
+        valid = int(nq) * effective_k
+        return min(1.0, valid / total) if valid > 0 else 0.0
+    
+    # Causal masking
+    if mask_type in [MASK_CAUSAL_LT, "causal"]:
+        valid = lower_tri_pairs(nq, nk)
+        return min(1.0, valid / total) if valid > 0 else 0.0
+    
+    # Full attention
+    return 1.0
 
 
 def flops_attention_masked(
@@ -46,6 +56,7 @@ def flops_attention_masked(
     d_v: int,
     mask_type: str,
     skip_masked_gemm: bool,
+    window_size: int = None,
 ) -> Dict[str, float]:
     """Return FLOPs accounting for masking strategy."""
 
@@ -76,9 +87,16 @@ def flops_attention_masked(
             "total_pairs": total_pairs,
         }
 
-    if mask_type == MASK_CAUSAL_LT:
+    # Sliding window attention
+    if window_size is not None and window_size > 0:
+        effective_k = min(int(window_size), L_k)
+        valid_pairs = L_q * effective_k
+        density = valid_pairs / total_pairs if total_pairs > 0 else 0.0
+    # Causal masking
+    elif mask_type in [MASK_CAUSAL_LT, "causal"]:
         valid_pairs = lower_tri_pairs(L_q, L_k)
         density = valid_pairs / total_pairs if total_pairs > 0 else 0.0
+    # Full attention
     else:
         valid_pairs = total_pairs
         density = 1.0
@@ -87,11 +105,20 @@ def flops_attention_masked(
     fl_pv_effective = fl_pv_full * density
     fl_effective = fl_qk_effective + fl_pv_effective
 
-    if skip_masked_gemm:
+    # Hardware FLOPs: window_size always limits compute (physical constraint)
+    # skip_masked_gemm only matters for mask-based optimizations
+    if window_size is not None and window_size > 0:
+        # Window attention: always use windowed FLOPs (physical limitation)
+        fl_qk_hw = fl_qk_effective
+        fl_pv_hw = fl_pv_effective
+        hw_density = density
+    elif skip_masked_gemm:
+        # Mask-based skipping enabled
         fl_qk_hw = fl_qk_effective
         fl_pv_hw = fl_pv_effective
         hw_density = density
     else:
+        # No optimization: compute full dense attention
         fl_qk_hw = fl_qk_full
         fl_pv_hw = fl_pv_full
         hw_density = 1.0
@@ -122,19 +149,27 @@ def _default_tile_sizes(nq: int, nk: int) -> Tuple[int, int]:
     return q_tile, k_tile
 
 
-def _effective_k_for_block(q_start: int, q_block: int, nk: int, mask_type: str) -> int:
+def _effective_k_for_block(q_start: int, q_block: int, nk: int, mask_type: str, window_size: int = None) -> int:
     """Approximate how many keys participate in a query tile."""
 
     nk = max(1, int(nk))
-    if mask_type != MASK_CAUSAL_LT:
-        return nk
-    first_token = min(nk, max(0, int(q_start)) + 1)
-    last_token = min(nk, max(0, int(q_start)) + max(1, int(q_block)))
-    return max(1, (first_token + last_token) // 2)
+    
+    # Sliding window attention
+    if window_size is not None and window_size > 0:
+        return min(int(window_size), nk)
+    
+    # Causal masking
+    if mask_type == MASK_CAUSAL_LT:
+        first_token = min(nk, max(0, int(q_start)) + 1)
+        last_token = min(nk, max(0, int(q_start)) + max(1, int(q_block)))
+        return max(1, (first_token + last_token) // 2)
+    
+    # Full attention
+    return nk
 
 
 def _approximate_flashattention_bytes(workload: Mapping[str, int], bytes_per_element: int) -> Dict[str, int]:
-    """Emulate the LLMCompass tile loop to estimate Q/K/V/O traffic."""
+    """Estimate Q/K/V/O HBM traffic assuming perfect L2 cache (FlashAttention design)."""
 
     batch = max(1, int(workload.get("batch", 1)))
     heads = max(1, int(workload.get("heads", 1)))
@@ -143,23 +178,13 @@ def _approximate_flashattention_bytes(workload: Mapping[str, int], bytes_per_ele
     nk = max(1, int(workload.get("nk", 1)))
     dim_qk = max(1, int(workload.get("d", 1)))
     dim_v = max(1, int(workload.get("dv", 1)))
-    mask_type = str(workload.get("mask_type", MASK_NONE))
 
+    # FlashAttention design ensures K/V tiles stay in L2/SMEM
+    # K/V are read from HBM once, then cached for all Q tiles
     q_bytes = batch * heads * nq * dim_qk * bytes_per_element
+    k_bytes = batch * kv_heads * nk * dim_qk * bytes_per_element
+    v_bytes = batch * kv_heads * nk * dim_v * bytes_per_element
     o_bytes = batch * heads * nq * dim_v * bytes_per_element
-
-    q_tile, k_tile = _default_tile_sizes(nq, nk)
-    k_bytes = 0
-    v_bytes = 0
-    for q_start in range(0, nq, q_tile):
-        q_block = min(q_tile, nq - q_start)
-        effective_k = _effective_k_for_block(q_start, q_block, nk, mask_type)
-        kv_consumed = 0
-        while kv_consumed < effective_k:
-            kv_block = min(k_tile, effective_k - kv_consumed)
-            kv_consumed += kv_block
-            k_bytes += batch * kv_heads * kv_block * dim_qk * bytes_per_element
-            v_bytes += batch * kv_heads * kv_block * dim_v * bytes_per_element
 
     return {"q_bytes": q_bytes, "k_bytes": k_bytes, "v_bytes": v_bytes, "o_bytes": o_bytes}
 
@@ -192,6 +217,9 @@ class FlashAttentionOperator:
         meta = self.metadata
         heads = int(meta.get("heads", 1) or 1)
         kv_heads = int(meta.get("kv_heads", heads) or heads)
+        # Extract window_size, convert -1 or None to None
+        window_size_raw = meta.get("window_size")
+        window_size = None if window_size_raw is None or int(window_size_raw) <= 0 else int(window_size_raw)
         return {
             "batch": max(1, int(meta.get("batch", 1) or 1)),
             "heads": heads,
@@ -199,59 +227,157 @@ class FlashAttentionOperator:
             "nq": max(1, int(meta.get("nq", 1) or 1)),
             "nk": max(1, int(meta.get("nk", 1) or 1)),
             "d": max(1, int(meta.get("d", 1) or 1)),
-            "dv": max(1, int(meta.get("dv", 1) or 1)),
+            "dv": max(1, int(meta.get("dv", 0) or meta.get("head_dim_v", 0) or meta.get("d", 0) or meta.get("head_dim", 0) or 1)),
             "dropout": max(0.0, float(meta.get("dropout", 0.0) or 0.0)),
             "mask_type": str(meta.get("mask_type", MASK_NONE) or MASK_NONE),
-            "skip_masked_gemm": bool(meta.get("skip_masked_gemm", False)),
+            "skip_masked_gemm": bool(meta.get("skip_masked_gemm", False)) or (str(meta.get("mask_type", MASK_NONE)) in [MASK_CAUSAL_LT, "causal"]),
+            "window_size": window_size,
+            "fixed_overhead_us": float(meta.get("fixed_overhead_us", 0.0) or 0.0),
+            "compute_efficiency": float(meta.get("compute_efficiency", 1.0) or 1.0),
         }
 
     def calculate_tflops(self, hardware: FlashAttentionHardware) -> Dict[str, float]:
         """Calculate FLOPs/ops counts and per-unit times."""
 
         workload = self._workload()
-        mask_ratio = mask_usage_ratio(workload["nq"], workload["nk"], workload["mask_type"])
+        mask_ratio = mask_usage_ratio(
+            workload["nq"], 
+            workload["nk"], 
+            workload["mask_type"],
+            workload["window_size"]
+        )
+        # Pad sequence lengths to 128 (FlashAttention block size)
+        # This models the "Block Quantization" effect
+        block_size = 128
+        padded_nq = math.ceil(workload["nq"] / block_size) * block_size
+        padded_nk = math.ceil(workload["nk"] / block_size) * block_size
+        
+        # Dense Fallback logic REMOVED per user request
+        # Use skip_masked_gemm as-is from workload
+        effective_skip_masked_gemm = workload["skip_masked_gemm"]
+            
+        # DEBUG PRINTS (Uncomment for debugging)
+        # print(f"DEBUG: nq={workload['nq']}, padded={padded_nq}, overhead={padding_overhead:.2f}, force_dense={force_dense}, skip={effective_skip_masked_gemm}, d={workload['d']}, dv={workload['dv']}")
+            
         mask_flops = flops_attention_masked(
-            workload["nq"],
-            workload["nk"],
+            padded_nq,
+            padded_nk,
             workload["d"],
             workload["dv"],
             workload["mask_type"],
-            workload["skip_masked_gemm"],
+            effective_skip_masked_gemm,
+            workload["window_size"],
         )
+        
+        # print(f"DEBUG: flops_hw={mask_flops['flops_hw']:.2e}, flops_full={mask_flops['flops_full']:.2e}")
 
         tensor_flops = workload["batch"] * workload["heads"] * mask_flops["flops_hw"]
         tensor_flops_effective = workload["batch"] * workload["heads"] * mask_flops["flops_effective"]
 
+        # Recalculate mask_ratio with padded dims?
+        # Yes, mask_usage_ratio should use padded dims to be consistent.
+        mask_ratio = mask_usage_ratio(
+            padded_nq, padded_nk, 
+            workload["mask_type"], 
+            workload["window_size"]
+        )
+        
         per_elem = 2 + (1 if workload["dropout"] > 0 else 0)
         valu_ops = mask_ratio * workload["batch"] * workload["heads"] * workload["nq"] * workload["nk"] * per_elem
         sfu_ops = mask_ratio * workload["batch"] * workload["heads"] * workload["nq"] * workload["nk"]
 
-        t_tensor = tensor_flops / max(hardware.tensor_peak, 1e-9)
-        t_valu = valu_ops / max(hardware.valu_peak, 1e-9)
-        t_sfu = sfu_ops / max(hardware.sfu_peak, 1e-9)
+
+        # Apply compute efficiency to peak performance
+        efficiency = workload["compute_efficiency"]
+        tensor_peak = max(hardware.tensor_peak * efficiency, 1e-9)
+        valu_peak = max(hardware.valu_peak * efficiency, 1e-9)
+        sfu_peak = max(hardware.sfu_peak * efficiency, 1e-9)
+
+        # Calculate Occupancy
+        num_sms = hardware.num_sms or 132  # Default to 132 if not set (H100)
+        total_tiles = workload["batch"] * workload["heads"]
+        occupancy = total_tiles / num_sms
 
         return {
             "tensor_flops": tensor_flops,
             "tensor_flops_effective": tensor_flops_effective,
-            "valu_ops": valu_ops,
-            "sfu_ops": sfu_ops,
-            "t_tensor": t_tensor,
-            "t_valu": t_valu,
-            "t_sfu": t_sfu,
+            "valu_ops": float(valu_ops),
+            "sfu_ops": float(sfu_ops),
+            "t_tensor": tensor_flops / tensor_peak,
+            "t_valu": float(valu_ops) / valu_peak,
+            "t_sfu": float(sfu_ops) / sfu_peak,
+            "t_overhead": workload["fixed_overhead_us"] * 1e-6,
             "mask_ratio": mask_ratio,
             "mask_hw_ratio": mask_flops["hw_density"],
             "mask_valid_pairs": mask_flops["valid_pairs"],
             "total_pairs": mask_flops["total_pairs"],
+            "occupancy": occupancy,
+            "total_tiles": total_tiles,
         }
 
     def calculate_hbm_throughput(self, hardware: FlashAttentionHardware) -> Dict[str, float]:
-        """Calculate HBM traffic and time."""
-
         workload = self._workload()
+        # Apply efficiency to HBM bandwidth as well
+        efficiency = workload["compute_efficiency"]
+        # hardware.hbm_tbs is in TB/s. hbm_peak property usually returns bytes/s or similar?
+        # Let's check hardware_descriptions.py to be sure about units.
+        # Assuming hbm_peak is in GB/s or TB/s scaled.
+        # Wait, line 304 says: t_hbm = hbm_bytes / max(hardware.hbm_peak, 1e-9)
+        # If hbm_bytes is in bytes, hbm_peak must be in bytes/s.
+        
+        # Let's assume hardware.hbm_peak is the property to use.
+        # We scale it by efficiency.
+        effective_hbm_peak = max(hardware.hbm_peak * efficiency, 1e-9)
+        
         breakdown = _approximate_flashattention_bytes(workload, self._bytes_per_element())
         hbm_bytes = breakdown["q_bytes"] + breakdown["k_bytes"] + breakdown["v_bytes"] + breakdown["o_bytes"]
-        t_hbm = hbm_bytes / max(hardware.hbm_peak, 1e-9)
+        t_hbm = hbm_bytes / effective_hbm_peak
         return {"hbm_bytes": hbm_bytes, "t_hbm": t_hbm}
+
+    def calculate_for_tile(
+        self,
+        hardware: FlashAttentionHardware,
+        tile_M: int,
+        tile_N: int,
+    ) -> Dict[str, float]:
+        """Calculate performance for a specific tile size.
+
+        For the manual operator, this uses the analytical roofline model.
+        """
+        workload = self._workload()
+        # Use the standalone estimation function for now, as the manual model
+        # doesn't have internal tiling logic.
+        # We need to import it or move it here. For now, we'll implement a simplified version
+        # or rely on the fact that the manual model is just a roofline check.
+        
+        # Re-implementing the core logic of estimate_ai_and_roofline here to avoid circular imports
+        # if we were to import from fa_dashboard.
+        
+        mask_ratio = mask_usage_ratio(
+            workload["nq"], 
+            workload["nk"], 
+            workload["mask_type"],
+            workload["window_size"]
+        )
+        tile_d = workload["d"]
+        tile_dv = workload["dv"]
+        tile_b = self._bytes_per_element()
+        
+        flops_tile = 2 * tile_M * tile_N * (tile_d + tile_dv) * mask_ratio
+        bytes_tile = (tile_M * tile_d + tile_N * tile_d + tile_N * tile_dv + tile_M * tile_dv) * tile_b
+        
+        ai = flops_tile / bytes_tile if bytes_tile > 0 else 0
+        peak_tflops = hardware.tensor_peak / 1e12
+        bandwidth_tbps = hardware.hbm_peak / 1e12
+        
+        attainable_tflops = min(peak_tflops, ai * bandwidth_tbps)
+        
+        return {
+            "AI": ai,
+            "FLOPs_per_tile": flops_tile,
+            "bytes_per_tile": bytes_tile,
+            "attainable_TFLOPs": attainable_tflops,
+        }
 
     def self_analysis(self, hardware: FlashAttentionHardware) -> str:
         """Return a qualitative analysis of the current workload."""

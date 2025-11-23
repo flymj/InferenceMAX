@@ -14,7 +14,7 @@ H100_SXM80_FP64_PEAK_FLOPS = 3.0e13
 H100_SXM80_SM_COUNT = 132
 H100_SXM80_CLOCK_HZ = 1.98e9  # SXM GPUs boost close to 1.98 GHz under load.
 H100_SXM80_VECTOR_FLOPS_PER_SM = (
-    H100_SXM80_FP16_PEAK_FLOPS / (H100_SXM80_CLOCK_HZ * H100_SXM80_SM_COUNT)
+    H100_SXM80_FP32_PEAK_FLOPS / (H100_SXM80_CLOCK_HZ * H100_SXM80_SM_COUNT)
 )
 A110_CLOCK_HZ = 1.5e9
 A110_CORE_COUNT = 72
@@ -85,7 +85,7 @@ systolic_array_dict = {
     "TPUv3_new": SystolicArray(128, 128, 1, 2, 4),
     # TODO: update array shape/counts if public Hopper tensor core tiling data
     # becomes available.
-    "H100_fp16": SystolicArray(16, 16, 1, 2, 2),
+    "H100_fp16": SystolicArray(16, 16, 2, 2, 2),
 }
 
 

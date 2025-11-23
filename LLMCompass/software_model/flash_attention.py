@@ -13,6 +13,7 @@ from software_model.utils import DataType, Tensor
 class _FlashAttentionShape:
     batch: int
     heads: int
+    kv_heads: int
     query_len: int
     dim_qk: int
     kv_len: int
@@ -88,6 +89,7 @@ class FlashAttention3(Operator):
         self.shape = _FlashAttentionShape(
             batch=q.shape[0],
             heads=q.shape[1],
+            kv_heads=k.shape[1],
             query_len=q.shape[2],
             dim_qk=q.shape[3],
             kv_len=k.shape[3],
@@ -145,7 +147,8 @@ class FlashAttention3(Operator):
         assert len(k.shape) == 4 and len(v.shape) == 4
         assert q.data_type == k.data_type == v.data_type == self.data_type
         assert q.shape[0] == k.shape[0] == v.shape[0]
-        assert q.shape[1] == k.shape[1] == v.shape[1]
+        assert q.shape[1] % k.shape[1] == 0, "Q heads must be multiple of K heads (GQA)"
+        assert k.shape[1] == v.shape[1], "K and V must have same number of heads"
         assert q.shape[3] == k.shape[2], "K must expose Dqk along axis 2"
         assert v.shape[2] == k.shape[3], "K/V sequence length mismatch"
 
@@ -188,6 +191,13 @@ class FlashAttention3(Operator):
         tile_records: List[_TileStats] = []
         total_flops = 0
 
+        # FlashAttention design: K/V are read from HBM once and cached in L2/SMEM
+        # They are NOT re-fetched from HBM for each Q tile
+        # Calculate total K/V bytes upfront
+        total_k_bytes = shape.batch * shape.kv_heads * shape.kv_len * shape.dim_qk * bytes_per_elem
+        total_v_bytes = shape.batch * shape.kv_heads * shape.kv_len * shape.dim_v * bytes_per_elem
+        hbm_read += total_k_bytes + total_v_bytes
+
         for b in range(0, shape.batch, mapping.batch_tile):
             b_tile = min(mapping.batch_tile, shape.batch - b)
             for h in range(0, shape.heads, mapping.head_tile):
@@ -213,7 +223,7 @@ class FlashAttention3(Operator):
                         v_bytes = v_elems * bytes_per_elem
                         tile_bytes = q_bytes + k_bytes + v_bytes
                         max_tile_bytes = max(max_tile_bytes, tile_bytes)
-                        hbm_read += k_bytes + v_bytes
+                        # K/V bytes for cache hierarchy tracking (not HBM)
                         gb_read += k_bytes + v_bytes
                         lb_read += k_bytes + v_bytes
                         tile_records.append(
@@ -222,7 +232,7 @@ class FlashAttention3(Operator):
                                 heads=h_tile,
                                 q_tokens=q_tile,
                                 k_tokens=kv_block,
-                                hbm_read_bytes=k_bytes + v_bytes,
+                                hbm_read_bytes=0,  # K/V not re-read from HBM per tile
                                 hbm_write_bytes=0,
                             )
                         )

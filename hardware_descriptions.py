@@ -73,6 +73,7 @@ class HardwareDescription:
     sfu_tops: Optional[float] = None
     hbm_tbs: Optional[float] = None
     freq_ghz: Optional[float] = None
+    num_sms: Optional[int] = None
     name: Optional[str] = None
     compute: Optional[ComputeClusterDescription] = None
     memory: Optional[MemoryHierarchyDescription] = None
@@ -291,6 +292,7 @@ class HardwareDescription:
             sfu_tops=None,
             hbm_tbs=(hbm_bandwidth_value / 1e12) if hbm_bandwidth_value else None,
             freq_ghz=(clock / 1e9) if clock else None,
+            num_sms=getattr(core, "count", None) if core else None,
             compute=compute_desc,
             memory=memory_desc,
             interconnect=interconnect_desc,
