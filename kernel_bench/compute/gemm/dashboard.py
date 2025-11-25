@@ -72,9 +72,9 @@ else:
     with col4:
         st.metric("Total Runs", len(filtered_df))
 
-    # TFLOPS Analysis
-    if 'TFLOPS' in filtered_df.columns:
-        st.subheader("TFLOPS Analysis")
+    # MFU Analysis
+    if 'MFU' in filtered_df.columns:
+        st.subheader("MFU Analysis")
         
         c1, c2 = st.columns(2)
         with c1:
@@ -91,43 +91,43 @@ else:
         if "SplitK" in filtered_df.columns: hover_cols.append("SplitK")
         if "Stage" in filtered_df.columns: hover_cols.append("Stage")
 
-        fig_tflops = px.scatter(
+        fig_mfu = px.scatter(
             filtered_df, 
             x=x_axis, 
-            y="TFLOPS", 
+            y="MFU", 
             color=color_by if color_by in filtered_df.columns else None,
             hover_data=hover_cols,
-            title=f"TFLOPS vs {x_axis}"
+            title=f"MFU vs {x_axis}"
         )
-        st.plotly_chart(fig_tflops, use_container_width=True)
+        st.plotly_chart(fig_mfu, use_container_width=True)
 
     # Stage Impact Analysis
-    if 'Stage' in filtered_df.columns and 'TFLOPS' in filtered_df.columns:
+    if 'Stage' in filtered_df.columns and 'MFU' in filtered_df.columns:
         st.subheader("Impact of Pipeline Stages")
         fig_stage = px.box(
             filtered_df,
             x="Stage",
-            y="TFLOPS",
+            y="MFU",
             color="Stage",
             points="all",
             hover_data=["M", "N", "K", "Tile"],
-            title="TFLOPS Distribution by Pipeline Stage"
+            title="MFU Distribution by Pipeline Stage"
         )
         st.plotly_chart(fig_stage, use_container_width=True)
 
     # Tile Impact Analysis
-    if 'Tile' in filtered_df.columns and 'TFLOPS' in filtered_df.columns:
+    if 'Tile' in filtered_df.columns and 'MFU' in filtered_df.columns:
         st.subheader("Impact of Tile Configuration")
-        st.markdown("Distribution of TFLOPS for each Tile configuration. Points represent individual benchmark runs.")
+        st.markdown("Distribution of MFU for each Tile configuration. Points represent individual benchmark runs.")
         
         fig_tile = px.box(
             filtered_df, 
             x="Tile", 
-            y="TFLOPS", 
+            y="MFU", 
             color="Tile", 
             points="all", # Show all points to reveal density and periodicity
             hover_data=["M", "N", "K"],
-            title="TFLOPS Distribution by Tile"
+            title="MFU Distribution by Tile"
         )
         st.plotly_chart(fig_tile, use_container_width=True)
 
@@ -144,22 +144,22 @@ else:
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    st.markdown(f"**Top 5 Configs for {dtype} (by TFLOPS)**")
+                    st.markdown(f"**Top 5 Configs for {dtype} (by MFU)**")
                     cols_to_show = ['M', 'N', 'K', 'Tile', 'TFLOPS', 'MFU']
                     if 'SplitK' in dtype_df.columns: cols_to_show.append('SplitK')
                     if 'Stage' in dtype_df.columns: cols_to_show.append('Stage')
                     
-                    top_configs = dtype_df.nlargest(5, 'TFLOPS')[cols_to_show]
+                    top_configs = dtype_df.nlargest(5, 'MFU')[cols_to_show]
                     st.dataframe(top_configs)
                 
                 with col2:
                     # Faceted view for this dtype
-                    st.markdown("**TFLOPS vs Index (Faceted by Stage)**")
+                    st.markdown("**MFU vs Index (Faceted by Stage)**")
                     if 'Stage' in dtype_df.columns:
                         fig_facet = px.scatter(
                             dtype_df,
                             x="Trial_Index",
-                            y="TFLOPS",
+                            y="MFU",
                             color="Tile",
                             facet_col="Stage",
                             title=f"Performance Trends per Stage ({dtype})"
@@ -168,19 +168,19 @@ else:
                     else:
                         st.info("Stage information not available.")
                 
-                # Heatmap of TFLOPS for M vs N (fixed K)
+                # Heatmap of MFU for M vs N (fixed K)
                 if 'K' in dtype_df.columns:
                     unique_ks = dtype_df['K'].unique()
                     selected_k = st.selectbox(f"Select K for Heatmap ({dtype})", unique_ks, key=f"k_{dtype}")
                     
                     heatmap_data = dtype_df[dtype_df['K'] == selected_k].pivot_table(
-                        index='M', columns='N', values='TFLOPS', aggfunc='max'
+                        index='M', columns='N', values='MFU', aggfunc='max'
                     )
                     
                     fig_heat = px.imshow(
                         heatmap_data, 
-                        labels=dict(x="N", y="M", color="TFLOPS"),
-                        title=f"TFLOPS Heatmap (K={selected_k})"
+                        labels=dict(x="N", y="M", color="MFU"),
+                        title=f"MFU Heatmap (K={selected_k})"
                     )
                     st.plotly_chart(fig_heat, use_container_width=True)
 
