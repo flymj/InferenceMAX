@@ -8,15 +8,15 @@ def run_benchmark(dtype="fp16", m_arg="256:16384:256", n_arg="256:16384:256", k_
     # 1. Build the ncu command
     # We filter by NVTX range "TensorCoreRange" to only profile the relevant loop
     # Metric: sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active
-    metric_name = "cu__we_pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active"
+    metric_name = "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active"
     
     cmd = [
-        "acu",
+        "ncu",
         "--csv",
         "--quiet",
         "--metrics", metric_name,
-        "--hgtx",
-        "--hgtx-include", "TensorCoreRange",
+        "--nvtx",
+        "--nvtx-include", "TensorCoreRange",
         "--clock-control", "none", # Optional: disable clock control for faster run if needed, but might affect consistency
         "./gemm",
         "--dtype", dtype,
