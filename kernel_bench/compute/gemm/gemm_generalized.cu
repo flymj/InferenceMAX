@@ -14,7 +14,34 @@
 #include "cutlass/gemm/device/gemm_splitk_parallel.h"
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
+#include <nvToolsExt.h>
 
+// =========================================================================
+// Error Handling Macros
+// =========================================================================
+// (No special macros needed for NVTX)
+
+// =========================================================================
+// TensorProfiler Class (NVTX Wrapper)
+// =========================================================================
+class TensorProfiler {
+public:
+  TensorProfiler(bool enable) : enabled_(enable) {
+    if (enabled_) {
+      range_id_ = nvtxRangeStart("TensorCoreRange");
+    }
+  }
+
+  ~TensorProfiler() {
+    if (enabled_) {
+      nvtxRangeEnd(range_id_);
+    }
+  }
+
+private:
+  bool enabled_;
+  nvtxRangeId_t range_id_
+};
 // =========================================================================
 // 0. Basic Definitions & Utils
 // =========================================================================
@@ -76,13 +103,12 @@ enum class RunStatus { Success, SMemExceeded, Unsupported, RuntimeError };
 
 struct RunResult {
   std::string name;
-  std::string dtype;
-  int stage;
   RunStatus status;
   double time_ms;
   double tflops;
   long long cycles;
   double mfu;
+  double measured_mfu;
   double hbm_eff;
 
   int grid_size;
@@ -92,8 +118,8 @@ struct RunResult {
 };
 
 struct CaseResult {
-  int m, n, k;
   std::string dtype;
+  int m, n, k;
   RunResult best_run;
   std::vector<RunResult> all_runs;
 };
@@ -119,41 +145,6 @@ struct ArgParser {
       }
     } else {
       values.push_back(std::stoi(input));
-    }
-    return values;
-  }
-
-  static std::vector<std::string> parse_dtypes(const std::string &input) {
-    std::vector<std::string> dtypes;
-    std::stringstream ss(input);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-      dtypes.push_back(item);
-    }
-    return dtypes;
-  }
-
-  static std::vector<int> parse_linear(const std::string &input) {
-    std::vector<int> values;
-    if (input.front() == '[' && input.back() == ']') {
-      std::string content = input.substr(1, input.size() - 2);
-      size_t sep = content.find(',');
-      if (sep == std::string::npos)
-        sep = content.find(':');
-      if (sep != std::string::npos) {
-        int start = std::stoi(content.substr(0, sep));
-        int end = std::stoi(content.substr(sep + 1));
-        for (int i = start; i <= end; i++)
-          values.push_back(i);
-      } else {
-        values.push_back(std::stoi(content));
-      }
-    } else {
-      std::stringstream ss(input);
-      std::string item;
-      while (std::getline(ss, item, ',')) {
-        values.push_back(std::stoi(item));
-      }
     }
     return values;
   }
@@ -195,12 +186,8 @@ template <typename ElementA, typename LayoutA, typename ElementB,
           typename LayoutB, typename ElementC, typename LayoutC,
           typename ElementAccumulator, typename ThreadblockShape,
           typename WarpShape, typename InstructionShape, int kStages,
-          int kAlignmentA, int kAlignmentB, bool SplitKSerial = false,
-          typename Operator = cutlass::arch::OpMultiplyAdd>
+          int kAlignmentA, int kAlignmentB>
 struct GemmImpl : public GemmRunner {
-  // Revert to vector width 1 for standard GEMM
-  // static constexpr int kEpilogueElementsPerAccess =
-  //     128 / cutlass::sizeof_bits<ElementC>::value;
 
   using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
       ElementC, 1, ElementAccumulator, ElementAccumulator>;
@@ -210,7 +197,7 @@ struct GemmImpl : public GemmRunner {
       ElementAccumulator, OpClass, ArchTag, ThreadblockShape, WarpShape,
       InstructionShape, EpilogueOp,
       cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, kStages,
-      kAlignmentA, kAlignmentB, SplitKSerial, Operator>;
+      kAlignmentA, kAlignmentB>;
 
   using DeviceKernel = typename GemmHandle::GemmKernel;
 
@@ -225,7 +212,6 @@ struct GemmImpl : public GemmRunner {
                 bool profile) override {
     RunResult res;
     res.name = name();
-    res.stage = kStages;
     res.split_k = 1;
     res.time_ms = 0;
     res.tflops = 0;
@@ -293,22 +279,27 @@ struct GemmImpl : public GemmRunner {
       return res;
     }
 
+    res.measured_mfu = -1.0;
     gemm(); // Warmup
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    if (profile)
-      cudaProfilerStart();
-
+    // Timing Run
     cudaEventRecord(start);
     for (int i = 0; i < 5; i++)
       gemm();
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
-    if (profile)
-      cudaProfilerStop();
+    // Profiling Run
+    if (profile) {
+      for (int i = 0; i < 5; i++) {
+        TensorProfiler profiler(true);
+        gemm();
+      }
+      cudaDeviceSynchronize();
+    }
 
     float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
@@ -341,26 +332,21 @@ template <typename ElementA, typename LayoutA, typename ElementB,
           typename LayoutB, typename ElementC, typename LayoutC,
           typename ElementAccumulator, typename ThreadblockShape,
           typename WarpShape, typename InstructionShape, int kStages,
-          int kSplitK, int kAlignmentA, int kAlignmentB,
-          typename Operator = cutlass::arch::OpMultiplyAdd>
+          int kSplitK, int kAlignmentA, int kAlignmentB>
 struct GemmSplitKImpl : public GemmRunner {
-  static constexpr int kEpilogueElementsPerAccess =
-      128 / cutlass::sizeof_bits<ElementC>::value;
-
   using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-      ElementC, kEpilogueElementsPerAccess, ElementAccumulator,
-      ElementAccumulator>;
+      ElementC, 1, ElementAccumulator, ElementAccumulator>;
 
   using GemmHandle = cutlass::gemm::device::GemmSplitKParallel<
       ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,
       ElementAccumulator, OpClass, ArchTag, ThreadblockShape, WarpShape,
       InstructionShape, EpilogueOp,
-      cutlass::epilogue::thread::Convert<
-          ElementAccumulator, kEpilogueElementsPerAccess, ElementAccumulator>,
-      cutlass::reduction::thread::ReduceAdd<
-          ElementAccumulator, ElementAccumulator, kEpilogueElementsPerAccess>,
+      cutlass::epilogue::thread::Convert<ElementAccumulator, 1,
+                                         ElementAccumulator>,
+      cutlass::reduction::thread::ReduceAdd<ElementAccumulator,
+                                            ElementAccumulator, 1>,
       cutlass::gemm::threadblock::GemmSplitKHorizontalThreadblockSwizzle,
-      kStages, kAlignmentA, kAlignmentB, Operator>;
+      kStages, kAlignmentA, kAlignmentB>;
 
   using DeviceKernel = typename GemmHandle::GemmKernel;
 
@@ -375,7 +361,6 @@ struct GemmSplitKImpl : public GemmRunner {
                 bool profile) override {
     RunResult res;
     res.name = name();
-    res.stage = kStages;
     res.split_k = kSplitK;
     res.time_ms = 0;
     res.tflops = 0;
@@ -443,22 +428,25 @@ struct GemmSplitKImpl : public GemmRunner {
       return res;
     }
 
+    res.measured_mfu = -1.0;
     gemm(); // Warmup
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    if (profile)
-      cudaProfilerStart();
-
+    // Timing Run
     cudaEventRecord(start);
     for (int i = 0; i < 5; i++)
       gemm();
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
-    if (profile)
-      cudaProfilerStop();
+    // Profiling Run
+    if (profile) {
+      TensorProfiler profiler(true);
+      gemm();
+      cudaDeviceSynchronize();
+    }
 
     float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
@@ -491,24 +479,9 @@ struct GemmSplitKImpl : public GemmRunner {
 // =========================================================================
 class GemmSweeper {
   std::vector<std::shared_ptr<GemmRunner>> configs;
-  std::string current_dtype;
-  std::vector<int> enabled_stages;
 
 public:
-  GemmSweeper() { enabled_stages = {2, 3, 4}; }
-
-  void set_stages(const std::vector<int> &stages) { enabled_stages = stages; }
-
-  bool is_stage_enabled(int s) {
-    for (int es : enabled_stages)
-      if (es == s)
-        return true;
-    return false;
-  }
-
-  void set_dtype(std::string dtype) {
-    current_dtype = dtype;
-    configs.clear();
+  GemmSweeper(std::string dtype) {
     if (dtype == "fp32") {
       setup_fp32();
     } else if (dtype == "fp16") {
@@ -517,53 +490,10 @@ public:
       setup_bf16();
     } else if (dtype == "int8") {
       setup_int8();
-    } else if (dtype == "tf32") {
-      setup_tf32();
     } else {
       std::cerr << "Unknown dtype: " << dtype << std::endl;
       exit(1);
     }
-  }
-
-  void setup_tf32() {
-    using ElementA = cutlass::tfloat32_t;
-    using ElementB = cutlass::tfloat32_t;
-    using ElementC = float;
-    using ElementAccum = float;
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::RowMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-    using Inst = cutlass::gemm::GemmShape<16, 8, 8>;
-
-#define REG_TF32(Tm, Tn, Wm, Wn, Stg)                                          \
-  if (is_stage_enabled(Stg))                                                   \
-  configs.push_back(                                                           \
-      std::make_shared<                                                        \
-          GemmImpl<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,    \
-                   ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, 64>,         \
-                   cutlass::gemm::GemmShape<Wm, Wn, 64>, Inst, Stg, 4, 4,      \
-                   false, cutlass::arch::OpMultiplyAdd>>())
-
-    // K is fixed at 64 for all configurations
-    REG_TF32(256, 256, 64, 64, 2);
-    REG_TF32(256, 128, 64, 64, 2);
-    REG_TF32(128, 256, 64, 64, 2);
-    REG_TF32(128, 128, 64, 64, 2);
-    REG_TF32(64, 64, 32, 32, 2);
-
-    REG_TF32(256, 256, 64, 64, 3);
-    REG_TF32(256, 128, 64, 64, 3);
-    REG_TF32(128, 256, 64, 64, 3);
-    REG_TF32(128, 128, 64, 64, 3);
-    REG_TF32(64, 64, 32, 32, 3);
-
-    REG_TF32(256, 256, 64, 64, 4);
-    REG_TF32(256, 128, 64, 64, 4);
-    REG_TF32(128, 256, 64, 64, 4);
-    REG_TF32(128, 128, 64, 64, 4);
-    REG_TF32(64, 64, 32, 32, 4);
-
-#undef REG_TF32
   }
 
   void setup_fp32() {
@@ -576,35 +506,27 @@ public:
     using LayoutC = cutlass::layout::RowMajor;
     using Inst = cutlass::gemm::GemmShape<16, 8, 8>;
 
-#define REG_FP32(Tm, Tn, Wm, Wn, Stg)                                          \
-  if (is_stage_enabled(Stg))                                                   \
+#define REG_FP32(Tm, Tn, Tk, Wm, Wn, Wk, Stg)                                  \
   configs.push_back(                                                           \
       std::make_shared<                                                        \
           GemmImpl<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,    \
-                   ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, 64>,         \
-                   cutlass::gemm::GemmShape<Wm, Wn, 64>, Inst, Stg, 4, 4,      \
-                   false, cutlass::arch::OpMultiplyAdd>>())
+                   ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, Tk>,         \
+                   cutlass::gemm::GemmShape<Wm, Wn, Wk>, Inst, Stg, 4, 4>>())
 
-    // K is fixed at 64 for all configurations
-    REG_FP32(256, 256, 64, 64, 2);
-    REG_FP32(256, 128, 64, 64, 2);
-    REG_FP32(128, 256, 64, 64, 2);
-    REG_FP32(128, 128, 64, 64, 2);
-    REG_FP32(64, 64, 32, 32, 2);
+#define REG_SK_FP32(Tm, Tn, Tk, Wm, Wn, Wk, Stg, SK)                           \
+  configs.push_back(                                                           \
+      std::make_shared<GemmSplitKImpl<                                         \
+          ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,             \
+          ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, Tk>,                  \
+          cutlass::gemm::GemmShape<Wm, Wn, Wk>, Inst, Stg, SK, 4, 4>>())
 
-    REG_FP32(256, 256, 64, 64, 3);
-    REG_FP32(256, 128, 64, 64, 3);
-    REG_FP32(128, 256, 64, 64, 3);
-    REG_FP32(128, 128, 64, 64, 3);
-    REG_FP32(64, 64, 32, 32, 3);
-
-    REG_FP32(256, 256, 64, 64, 4);
-    REG_FP32(256, 128, 64, 64, 4);
-    REG_FP32(128, 256, 64, 64, 4);
-    REG_FP32(128, 128, 64, 64, 4);
-    REG_FP32(64, 64, 32, 32, 4);
-
-#undef REG_FP32
+    REG_FP32(128, 128, 32, 64, 64, 32, 3);
+    REG_FP32(128, 256, 32, 64, 64, 32, 3);
+    REG_FP32(256, 256, 32, 64, 64, 32, 3);
+    REG_FP32(128, 64, 32, 64, 32, 32, 3);
+    REG_FP32(64, 64, 32, 32, 32, 32, 3);
+    REG_SK_FP32(128, 128, 32, 64, 64, 32, 3, 2);
+    REG_SK_FP32(64, 64, 32, 32, 32, 32, 3, 4);
   }
 
   void setup_fp16() {
@@ -617,35 +539,28 @@ public:
     using LayoutC = cutlass::layout::RowMajor;
     using Inst = cutlass::gemm::GemmShape<16, 8, 16>;
 
-#define REG_FP16(Tm, Tn, Wm, Wn, Stg)                                          \
-  if (is_stage_enabled(Stg))                                                   \
-  \\\n configs.push_back(                                                      \
+#define REG_FP16(Tm, Tn, Tk, Wm, Wn, Wk, Stg)                                  \
+  configs.push_back(                                                           \
       std::make_shared<                                                        \
           GemmImpl<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,    \
-                   ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, 64>,         \
-                   cutlass::gemm::GemmShape<Wm, Wn, 64>, Inst, Stg, 8, 8,      \
-                   false, cutlass::arch::OpMultiplyAdd>>())
+                   ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, Tk>,         \
+                   cutlass::gemm::GemmShape<Wm, Wn, Wk>, Inst, Stg, 8, 8>>())
 
-    // K is fixed at 64 for all configurations
-    REG_FP16(256, 256, 64, 64, 2);
-    REG_FP16(256, 128, 64, 64, 2);
-    REG_FP16(128, 256, 64, 64, 2);
-    REG_FP16(128, 128, 64, 64, 2);
-    REG_FP16(64, 64, 32, 32, 2);
+#define REG_SK_FP16(Tm, Tn, Tk, Wm, Wn, Wk, Stg, SK)                           \
+  configs.push_back(                                                           \
+      std::make_shared<GemmSplitKImpl<                                         \
+          ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,             \
+          ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, Tk>,                  \
+          cutlass::gemm::GemmShape<Wm, Wn, Wk>, Inst, Stg, SK, 8, 8>>())
 
-    REG_FP16(256, 256, 64, 64, 3);
-    REG_FP16(256, 128, 64, 64, 3);
-    REG_FP16(128, 256, 64, 64, 3);
-    REG_FP16(128, 128, 64, 64, 3);
-    REG_FP16(64, 64, 32, 32, 3);
-
-    REG_FP16(256, 256, 64, 64, 4);
-    REG_FP16(256, 128, 64, 64, 4);
-    REG_FP16(128, 256, 64, 64, 4);
-    REG_FP16(128, 128, 64, 64, 4);
-    REG_FP16(64, 64, 32, 32, 4);
-
-#undef REG_FP16
+    REG_FP16(256, 128, 32, 64, 64, 32, 3);
+    REG_FP16(128, 256, 64, 64, 64, 64, 3);
+    REG_FP16(256, 256, 64, 64, 64, 64, 3);
+    REG_FP16(128, 256, 32, 64, 64, 32, 3);
+    REG_FP16(128, 128, 32, 64, 64, 32, 3);
+    REG_FP16(64, 64, 32, 32, 32, 32, 3);
+    REG_SK_FP16(128, 128, 32, 64, 64, 32, 3, 2);
+    REG_SK_FP16(64, 64, 32, 32, 32, 32, 3, 4);
   }
 
   void setup_bf16() {
@@ -658,35 +573,25 @@ public:
     using LayoutC = cutlass::layout::RowMajor;
     using Inst = cutlass::gemm::GemmShape<16, 8, 16>;
 
-#define REG_BF16(Tm, Tn, Wm, Wn, Stg)                                          \
-  if (is_stage_enabled(Stg))                                                   \
+#define REG_BF16(Tm, Tn, Tk, Wm, Wn, Wk, Stg)                                  \
   configs.push_back(                                                           \
       std::make_shared<                                                        \
           GemmImpl<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,    \
-                   ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, 64>,         \
-                   cutlass::gemm::GemmShape<Wm, Wn, 64>, Inst, Stg, 8, 8,      \
-                   false, cutlass::arch::OpMultiplyAdd>>())
+                   ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, Tk>,         \
+                   cutlass::gemm::GemmShape<Wm, Wn, Wk>, Inst, Stg, 8, 8>>())
 
-    // K is fixed at 64 for all configurations
-    REG_BF16(256, 256, 64, 64, 2);
-    REG_BF16(256, 128, 64, 64, 2);
-    REG_BF16(128, 256, 64, 64, 2);
-    REG_BF16(128, 128, 64, 64, 2);
-    REG_BF16(64, 64, 32, 32, 2);
+#define REG_SK_BF16(Tm, Tn, Tk, Wm, Wn, Wk, Stg, SK)                           \
+  configs.push_back(                                                           \
+      std::make_shared<GemmSplitKImpl<                                         \
+          ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,             \
+          ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, Tk>,                  \
+          cutlass::gemm::GemmShape<Wm, Wn, Wk>, Inst, Stg, SK, 8, 8>>())
 
-    REG_BF16(256, 256, 64, 64, 3);
-    REG_BF16(256, 128, 64, 64, 3);
-    REG_BF16(128, 256, 64, 64, 3);
-    REG_BF16(128, 128, 64, 64, 3);
-    REG_BF16(64, 64, 32, 32, 3);
-
-    REG_BF16(256, 256, 64, 64, 4);
-    REG_BF16(256, 128, 64, 64, 4);
-    REG_BF16(128, 256, 64, 64, 4);
-    REG_BF16(128, 128, 64, 64, 4);
-    REG_BF16(64, 64, 32, 32, 4);
-
-#undef REG_BF16
+    REG_BF16(256, 128, 32, 64, 64, 32, 3);
+    REG_BF16(128, 256, 64, 64, 64, 64, 3);
+    REG_BF16(256, 256, 64, 64, 64, 64, 3);
+    REG_BF16(128, 128, 32, 64, 64, 32, 3);
+    REG_SK_BF16(128, 128, 32, 64, 64, 32, 3, 2);
   }
 
   void setup_int8() {
@@ -694,37 +599,31 @@ public:
     using ElementB = int8_t;
     using ElementC = int32_t;
     using ElementAccum = int32_t;
+    // INT8 Tensor Core typically prefers ColumnMajor B
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutC = cutlass::layout::RowMajor;
     using Inst = cutlass::gemm::GemmShape<16, 8, 32>;
 
-#define REG_INT8(Tm, Tn, Wm, Wn, Stg)                                          \
-  if (is_stage_enabled(Stg))                                                   \
+#define REG_INT8(Tm, Tn, Tk, Wm, Wn, Wk, Stg)                                  \
   configs.push_back(                                                           \
-      std::make_shared<                                                        \
-          GemmImpl<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,    \
-                   ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, 64>,         \
-                   cutlass::gemm::GemmShape<Wm, Wn, 64>, Inst, Stg, 16, 16,    \
-                   false, cutlass::arch::OpMultiplyAddSaturate>>())
+      std::make_shared<GemmImpl<                                               \
+          ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,             \
+          ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, Tk>,                  \
+          cutlass::gemm::GemmShape<Wm, Wn, Wk>, Inst, Stg, 16, 16>>())
 
-    // K is fixed at 64 for all configurations
-    REG_INT8(256, 256, 64, 64, 2);
-    REG_INT8(256, 128, 64, 64, 2);
-    REG_INT8(128, 256, 64, 64, 2);
-    REG_INT8(128, 128, 64, 64, 2);
+#define REG_SK_INT8(Tm, Tn, Tk, Wm, Wn, Wk, Stg, SK)                           \
+  configs.push_back(                                                           \
+      std::make_shared<GemmSplitKImpl<                                         \
+          ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,             \
+          ElementAccum, cutlass::gemm::GemmShape<Tm, Tn, Tk>,                  \
+          cutlass::gemm::GemmShape<Wm, Wn, Wk>, Inst, Stg, SK, 16, 16>>())
 
-    REG_INT8(256, 256, 64, 64, 3);
-    REG_INT8(256, 128, 64, 64, 3);
-    REG_INT8(128, 256, 64, 64, 3);
-    REG_INT8(128, 128, 64, 64, 3);
-
-    REG_INT8(256, 256, 64, 64, 4);
-    REG_INT8(256, 128, 64, 64, 4);
-    REG_INT8(128, 256, 64, 64, 4);
-    REG_INT8(128, 128, 64, 64, 4);
-
-#undef REG_INT8
+    REG_INT8(256, 128, 64, 64, 64, 64, 3);
+    REG_INT8(128, 256, 64, 64, 64, 64, 3);
+    REG_INT8(256, 256, 64, 64, 64, 64, 3);
+    REG_INT8(128, 128, 64, 64, 64, 64, 3);
+    REG_SK_INT8(128, 128, 64, 64, 64, 64, 3, 2);
   }
 
   CaseResult find_best(int M, int N, int K, void *d_A, void *d_B, void *d_C,
@@ -733,12 +632,10 @@ public:
     result.m = M;
     result.n = N;
     result.k = K;
-    result.dtype = current_dtype;
     result.best_run.tflops = -1.0;
 
     for (auto &cfg : configs) {
       RunResult res = cfg->run(M, N, K, d_A, d_B, d_C, profile);
-      res.dtype = current_dtype;
       result.all_runs.push_back(res);
 
       if (res.status == RunStatus::Success &&
@@ -757,8 +654,7 @@ int main(int argc, char **argv) {
   std::string m_str, n_str, k_str;
   bool profile = false;
   std::string csv_path = "gemm_results.csv";
-  std::vector<std::string> dtypes = {"fp32"};
-  std::vector<int> stages = {2, 3, 4};
+  std::string dtype_arg = "fp32";
 
   double override_peak_tflops = 0.0;
   double override_peak_bw = 0.0;
@@ -775,9 +671,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc)
       csv_path = argv[++i];
     else if (strcmp(argv[i], "--dtype") == 0 && i + 1 < argc)
-      dtypes = ArgParser::parse_dtypes(argv[++i]);
-    else if (strcmp(argv[i], "--stage") == 0 && i + 1 < argc)
-      stages = ArgParser::parse_linear(argv[++i]);
+      dtype_arg = argv[++i];
     else if (strcmp(argv[i], "--peak_tflops") == 0 && i + 1 < argc)
       override_peak_tflops = std::stod(argv[++i]);
     else if (strcmp(argv[i], "--peak_bw") == 0 && i + 1 < argc)
@@ -802,10 +696,14 @@ int main(int argc, char **argv) {
             << std::endl;
   std::cout << ">>> Peak TFLOPS: " << specs.peak_tflops
             << " | Peak BW: " << specs.peak_bw << " GB/s" << std::endl;
-  std::cout << ">>> Data Types: ";
-  for (const auto &d : dtypes)
-    std::cout << d << " ";
-  std::cout << std::endl;
+
+  // Parse dtypes
+  std::vector<std::string> dtypes;
+  std::stringstream ss(dtype_arg);
+  std::string segment;
+  while (std::getline(ss, segment, ',')) {
+    dtypes.push_back(segment);
+  }
 
   auto ms = ArgParser::parse(m_str);
   auto ns = ArgParser::parse(n_str);
@@ -815,23 +713,11 @@ int main(int argc, char **argv) {
   int max_n = *std::max_element(ns.begin(), ns.end());
   int max_k = *std::max_element(ks.begin(), ks.end());
 
-  // Determine max element size for allocation
-  size_t max_element_size_a = 4;
-  size_t max_element_size_b = 4;
-  size_t max_element_size_c = 4;
-
-  for (const auto &dtype : dtypes) {
-    if (dtype == "fp16" || dtype == "bf16") {
-      // 2 bytes
-    } else if (dtype == "int8") {
-      // 1 byte, but we allocate max so 4 is fine
-    }
-    // fp32 is 4 bytes, so default 4 covers all.
-  }
-
-  size_t bytes_A = (size_t)max_m * max_k * max_element_size_a;
-  size_t bytes_B = (size_t)max_k * max_n * max_element_size_b;
-  size_t bytes_C = (size_t)max_m * max_n * max_element_size_c;
+  // Allocate for largest possible element size (4 bytes for FP32/INT32)
+  size_t element_size = 4;
+  size_t bytes_A = (size_t)max_m * max_k * element_size;
+  size_t bytes_B = (size_t)max_k * max_n * element_size;
+  size_t bytes_C = (size_t)max_m * max_n * element_size;
 
   void *d_A, *d_B, *d_C;
   CUDA_CHECK(cudaMalloc(&d_A, bytes_A));
@@ -841,62 +727,60 @@ int main(int argc, char **argv) {
   cudaMemset(d_B, 0, bytes_B);
   cudaMemset(d_C, 0, bytes_C);
 
-  GemmSweeper sweeper;
-  sweeper.set_stages(stages);
   std::vector<CaseResult> summary;
 
   std::cout << ">>> Starting Scan... Output CSV: " << csv_path << std::endl;
-
-  // CSV Header
-  std::ofstream csv(csv_path);
-  csv << "dtype,M,N,K,Tile,Stage,Status,Time_ms,Cycles,TFLOPS,MFU,HBM_Eff,"
-         "GridSize,"
-         "ActiveBlocksPerSM,Waves,SplitK\n";
-  csv.close(); // Close to append later or keep open? Better to append in loop.
+  std::cout << std::left << std::setw(8) << "Type" << std::setw(8) << "M"
+            << std::setw(8) << "N" << std::setw(8) << "K"
+            << "| " << std::setw(20) << "Best Tile"
+            << " | " << std::setw(8) << "TFLOPS"
+            << " | " << std::setw(8) << "MFU(%)"
+            << " | " << std::setw(8) << "Waves" << std::endl;
+  std::cout << "---------------------------------------------------------------"
+               "-----------------"
+            << std::endl;
 
   for (const auto &dtype : dtypes) {
-    sweeper.set_dtype(dtype);
-
-    std::cout << "\n>>> Benchmarking " << dtype << "..." << std::endl;
-    std::cout << std::left << std::setw(8) << "M" << std::setw(8) << "N"
-              << std::setw(8) << "K"
-              << "| " << std::setw(20) << "Best Tile"
-              << " | " << std::setw(8) << "TFLOPS"
-              << " | " << std::setw(8) << "MFU(%)"
-              << " | " << std::setw(8) << "Waves" << std::endl;
-    std::cout
-        << "---------------------------------------------------------------"
-           "---------"
-        << std::endl;
+    std::cout << ">>> Data Type: " << dtype << std::endl;
+    GemmSweeper sweeper(dtype);
 
     for (int m : ms) {
       for (int n : ns) {
         for (int k : ks) {
           CaseResult res = sweeper.find_best(m, n, k, d_A, d_B, d_C, profile);
+          res.dtype = dtype; // Set dtype in result
           summary.push_back(res);
 
-          std::cout << std::left << std::setw(8) << m << std::setw(8) << n
-                    << std::setw(8) << k << "| " << std::setw(20)
-                    << res.best_run.name << " | " << std::fixed
-                    << std::setprecision(2) << res.best_run.tflops << " | "
-                    << std::setw(8) << res.best_run.mfu << " | "
-                    << res.best_run.grid_util << std::endl;
-
-          // Append to CSV immediately
-          std::ofstream csv_append(csv_path, std::ios::app);
-          for (const auto &run : res.all_runs) {
-            csv_append << run.dtype << "," << m << "," << n << "," << k << ","
-                       << run.name << "," << run.stage << "," << (int)run.status
-                       << "," << run.time_ms << "," << run.cycles << ","
-                       << run.tflops << "," << run.mfu << "," << run.hbm_eff
-                       << "," << run.grid_size << "," << run.active_blocks
-                       << "," << run.grid_util << "," << run.split_k << "\n";
-          }
-          csv_append.close();
+          std::cout << std::left << std::setw(8) << dtype << std::setw(8) << m
+                    << std::setw(8) << n << std::setw(8) << k << "| "
+                    << std::setw(20) << res.best_run.name << " | "
+                    << std::setw(8) << std::fixed << std::setprecision(2)
+                    << res.best_run.tflops << " | " << std::setw(8)
+                    << res.best_run.mfu << " | " << std::setw(8)
+                    << std::setprecision(2) << res.best_run.grid_util
+                    << std::endl;
         }
       }
     }
   }
+
+  // Write CSV
+  std::ofstream csv(csv_path);
+  csv << "dtype,M,N,K,Tile,Status,Time_ms,Cycles,TFLOPS,MFU,measured_mfu,HBM_"
+         "Eff,GridSize,"
+         "ActiveBlocks,"
+         "Waves,SplitK\n";
+  for (const auto &case_res : summary) {
+    for (const auto &run : case_res.all_runs) {
+      csv << case_res.dtype << "," << case_res.m << "," << case_res.n << ","
+          << case_res.k << "," << run.name << "," << (int)run.status << ","
+          << run.time_ms << "," << run.cycles << "," << run.tflops << ","
+          << run.mfu << "," << run.measured_mfu << "," << run.hbm_eff << ","
+          << run.grid_size << "," << run.active_blocks << "," << run.grid_util
+          << "," << run.split_k << "\n";
+    }
+  }
+  csv.close();
 
   // Final Report
   std::cout << "\n============================================================="
@@ -908,8 +792,7 @@ int main(int argc, char **argv) {
   std::cout << "==============================================================="
                "==================================================="
             << std::endl;
-  std::cout << "| " << std::left << std::setw(6) << "Dtype"
-            << "| " << std::setw(6) << "M"
+  std::cout << "| " << std::left << std::setw(6) << "M"
             << "| " << std::setw(6) << "N"
             << "| " << std::setw(6) << "K"
             << "| " << std::setw(18) << "Winner Config"
@@ -920,16 +803,14 @@ int main(int argc, char **argv) {
             << "| " << std::setw(8) << "HBM(%)"
             << "| " << std::setw(8) << "Waves"
             << " |" << std::endl;
-  std::cout << "|-------+-------+-------+-------+-------------------+----------"
-               "+-------"
+  std::cout << "|-------+-------+-------+-------------------+----------+-------"
                "---+--------+--------+--------+--------|"
             << std::endl;
 
   for (const auto &r : summary) {
-    std::cout << "| " << std::left << std::setw(6) << r.dtype << "| "
-              << std::setw(6) << r.m << "| " << std::setw(6) << r.n << "| "
-              << std::setw(6) << r.k << "| \033[32m" << std::setw(18)
-              << r.best_run.name << "\033[0m"
+    std::cout << "| " << std::left << std::setw(6) << r.m << "| "
+              << std::setw(6) << r.n << "| " << std::setw(6) << r.k
+              << "| \033[32m" << std::setw(18) << r.best_run.name << "\033[0m"
               << "| " << std::setw(8) << std::fixed << std::setprecision(3)
               << r.best_run.time_ms << "| " << std::setw(10)
               << r.best_run.cycles << "| " << std::setw(8)
