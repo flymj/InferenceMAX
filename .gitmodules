@@ -1,3 +1,3 @@
-[submodule "gemm_comm_bench/third_party/cutlass"]
-	path = gemm_comm_bench/third_party/cutlass
+[submodule "kernel_bench/third_party/cutlass"]
+	path = kernel_bench/third_party/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
